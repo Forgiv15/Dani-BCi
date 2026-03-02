@@ -56,7 +56,6 @@ private:
     void csHigh();
     uint8_t transfer(uint8_t data);
 
-    SPIClass spi;
     SPISettings spiSettings;
 
     int8_t pinDRDY;
@@ -68,6 +67,7 @@ private:
     float vref;
     uint8_t gain;
     uint8_t activeChannels;
+    int lastDrdyLevel;
 };
 
 #endif

@@ -4,9 +4,13 @@
 
 #include "ADS1299.h"
 
+namespace {
+SPIClass sharedSpi(VSPI);
+bool sharedSpiInitialized = false;
+}
+
 ADS1299::ADS1299()
-    : spi(VSPI),
-      spiSettings(1000000, MSBFIRST, SPI_MODE1),
+    : spiSettings(1000000, MSBFIRST, SPI_MODE1),
       pinDRDY(-1),
       pinCS(-1),
       pinSTART(-1),
@@ -14,7 +18,8 @@ ADS1299::ADS1299()
       pinPWDN(-1),
       vref(4.5f),
     gain(24),
-    activeChannels(8) {}
+        activeChannels(8),
+        lastDrdyLevel(HIGH) {}
 
 bool ADS1299::begin(
     int8_t drdyPin,
@@ -38,7 +43,7 @@ bool ADS1299::begin(
     if (activeChannels > 8) activeChannels = 8;
     spiSettings = SPISettings(spiClockHz, MSBFIRST, SPI_MODE1);
 
-    pinMode(pinDRDY, INPUT);
+    pinMode(pinDRDY, INPUT_PULLUP);
     pinMode(pinCS, OUTPUT);
     pinMode(pinSTART, OUTPUT);
     pinMode(pinRESET, OUTPUT);
@@ -48,8 +53,6 @@ bool ADS1299::begin(
     digitalWrite(pinSTART, LOW);
     digitalWrite(pinPWDN, HIGH);
     digitalWrite(pinRESET, HIGH);
-
-    spi.begin(sclkPin, misoPin, mosiPin, pinCS);
 
     delay(10);
 
@@ -63,8 +66,15 @@ bool ADS1299::begin(
     digitalWrite(pinRESET, HIGH);
     delay(20);
 
+    if (!sharedSpiInitialized) {
+        sharedSpi.begin(sclkPin, misoPin, mosiPin, pinCS);
+        sharedSpiInitialized = true;
+    }
+
     SDATAC();
     delay(1);
+
+    lastDrdyLevel = digitalRead(pinDRDY);
 
     uint8_t id = readRegister(ID);
     return (id != 0x00) && (id != 0xFF);
@@ -79,15 +89,15 @@ void ADS1299::csHigh() {
 }
 
 uint8_t ADS1299::transfer(uint8_t data) {
-    return spi.transfer(data);
+    return sharedSpi.transfer(data);
 }
 
 void ADS1299::sendCommand(uint8_t command) {
-    spi.beginTransaction(spiSettings);
+    sharedSpi.beginTransaction(spiSettings);
     csLow();
     transfer(command);
     csHigh();
-    spi.endTransaction();
+    sharedSpi.endTransaction();
     delayMicroseconds(4);
 }
 
@@ -102,7 +112,7 @@ void ADS1299::RDATA() { sendCommand(_RDATA); }
 
 uint8_t ADS1299::readRegister(uint8_t address) {
     uint8_t value = 0;
-    spi.beginTransaction(spiSettings);
+    sharedSpi.beginTransaction(spiSettings);
     csLow();
     transfer(_RREG | (address & 0x1F));
     delayMicroseconds(2);
@@ -110,7 +120,7 @@ uint8_t ADS1299::readRegister(uint8_t address) {
     delayMicroseconds(2);
     value = transfer(0x00);
     csHigh();
-    spi.endTransaction();
+    sharedSpi.endTransaction();
     return value;
 }
 
@@ -119,7 +129,7 @@ void ADS1299::readRegisters(uint8_t startAddress, uint8_t count, uint8_t* data) 
         return;
     }
 
-    spi.beginTransaction(spiSettings);
+    sharedSpi.beginTransaction(spiSettings);
     csLow();
     transfer(_RREG | (startAddress & 0x1F));
     delayMicroseconds(2);
@@ -129,11 +139,11 @@ void ADS1299::readRegisters(uint8_t startAddress, uint8_t count, uint8_t* data) 
         data[i] = transfer(0x00);
     }
     csHigh();
-    spi.endTransaction();
+    sharedSpi.endTransaction();
 }
 
 void ADS1299::writeRegister(uint8_t address, uint8_t value) {
-    spi.beginTransaction(spiSettings);
+    sharedSpi.beginTransaction(spiSettings);
     csLow();
     transfer(_WREG | (address & 0x1F));
     delayMicroseconds(2);
@@ -141,7 +151,7 @@ void ADS1299::writeRegister(uint8_t address, uint8_t value) {
     delayMicroseconds(2);
     transfer(value);
     csHigh();
-    spi.endTransaction();
+    sharedSpi.endTransaction();
     delayMicroseconds(3);
 }
 
@@ -195,21 +205,19 @@ bool ADS1299::stopContinuousConversion() {
 bool ADS1299::waitForDRDY(uint32_t timeoutMs) {
     uint32_t startMs = millis();
 
-    while (digitalRead(pinDRDY) == LOW) {
+    while (true) {
+        int currentLevel = digitalRead(pinDRDY);
+        if (lastDrdyLevel == HIGH && currentLevel == LOW) {
+            lastDrdyLevel = currentLevel;
+            return true;
+        }
+        lastDrdyLevel = currentLevel;
+
         if ((millis() - startMs) >= timeoutMs) {
             return false;
         }
         delayMicroseconds(20);
     }
-
-    while (digitalRead(pinDRDY) != LOW) {
-        if ((millis() - startMs) >= timeoutMs) {
-            return false;
-        }
-        delayMicroseconds(20);
-    }
-
-    return true;
 }
 
 bool ADS1299::readDataFrame(int32_t channels[8], uint32_t& status) {
@@ -217,7 +225,7 @@ bool ADS1299::readDataFrame(int32_t channels[8], uint32_t& status) {
         return false;
     }
 
-    spi.beginTransaction(spiSettings);
+    sharedSpi.beginTransaction(spiSettings);
     csLow();
 
     status = 0;
@@ -242,7 +250,7 @@ bool ADS1299::readDataFrame(int32_t channels[8], uint32_t& status) {
     }
 
     csHigh();
-    spi.endTransaction();
+    sharedSpi.endTransaction();
 
     return true;
 }

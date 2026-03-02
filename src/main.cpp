@@ -1,10 +1,11 @@
 #include <Arduino.h>
+#include <math.h>
 #include "ADS1299.h"
 
 static constexpr int PIN_ADS1_DRDY = 34;
-static constexpr int PIN_ADS1_CS = 4;
+static constexpr int PIN_ADS1_CS = 5;
 static constexpr int PIN_ADS2_DRDY = 16;
-static constexpr int PIN_ADS2_CS = 5;
+static constexpr int PIN_ADS2_CS = 4;
 static constexpr int PIN_ADS1_START = 25;
 static constexpr int PIN_ADS1_RESET = 17;
 static constexpr int PIN_ADS1_PWDN = 2;
@@ -17,16 +18,37 @@ static constexpr uint8_t ADS_CHANNEL_COUNT = 4;
 
 ADS1299 ads1;
 ADS1299 ads2;
-static bool ads1Online = false;
-static bool ads2Online = false;
 static constexpr uint32_t REPORT_INTERVAL_MS = 200;
+static constexpr uint32_t DRDY_TIMEOUT_MS = 12;
+static constexpr uint32_t DRDY_WARN_PRINT_EVERY = 50;
+static constexpr uint32_t ADS_SAMPLE_PERIOD_US = 4000;
+static constexpr uint32_t ANALOG_TEST_DRDY_TIMEOUT_MS = 30;
+static constexpr int ANALOG_TEST_SETTLE_SAMPLES = 200;
+static constexpr int ANALOG_TEST_SAMPLE_COUNT = 1000;
+static constexpr float ANALOG_TEST_RMS_AC_PASS_COUNTS = 8000.0f;
 static uint32_t windowSampleCount = 0;
 static uint32_t lastReportMs = 0;
-static uint32_t lastStatusA = 0;
-static uint32_t lastStatusB = 0;
 static float chSumUv[8];
 static float chMinUv[8];
 static float chMaxUv[8];
+
+struct AdsDeviceContext {
+  ADS1299* ads;
+  const char* label;
+  int drdyPin;
+  int csPin;
+  uint8_t mergedOffset;
+  bool linkOk;
+  bool online;
+  uint32_t lastStatus;
+  uint32_t drdyTimeoutCount;
+};
+
+static AdsDeviceContext devices[] = {
+    {&ads1, "ADS1", PIN_ADS1_DRDY, PIN_ADS1_CS, 0, false, false, 0, 0},
+    {&ads2, "ADS2", PIN_ADS2_DRDY, PIN_ADS2_CS, 4, false, false, 0, 0},
+};
+static constexpr size_t DEVICE_COUNT = sizeof(devices) / sizeof(devices[0]);
 
 bool runDigitalDiagnostics(ADS1299& ads, const char* label) {
   ads.SDATAC();
@@ -61,81 +83,201 @@ bool runDigitalDiagnostics(ADS1299& ads, const char* label) {
   return true;
 }
 
-bool runAnalogInternalTest(ADS1299& ads, const char* label) {
-  if (!ads.configureInternalTestSignal()) {
-    Serial.printf("[ANALOG-%s] FAIL: Could not configure internal test signal mode.\n", label);
-    return false;
+void bringUpDevice(AdsDeviceContext& dev) {
+  dev.linkOk = dev.ads->begin(
+      dev.drdyPin,
+      dev.csPin,
+      PIN_ADS1_START,
+      PIN_ADS1_RESET,
+      PIN_ADS1_PWDN,
+      PIN_SPI_SCLK,
+      PIN_SPI_MISO,
+      PIN_SPI_MOSI,
+      1000000,
+      ADS_CHANNEL_COUNT
+  );
+
+  if (!dev.linkOk) {
+    Serial.printf("[BOOT] WARN: %s not responding. Corresponding channels will be zero.\n", dev.label);
+    dev.online = false;
+    return;
   }
 
-  ads.startContinuousConversion();
+  bool digitalOk = runDigitalDiagnostics(*dev.ads, dev.label);
+  if (!digitalOk) Serial.printf("[BOOT] WARN: %s digital test failed; continuing.\n", dev.label);
+  dev.online = false;
+}
 
-  int32_t minVal[4] = {INT32_MAX, INT32_MAX, INT32_MAX, INT32_MAX};
-  int32_t maxVal[4] = {INT32_MIN, INT32_MIN, INT32_MIN, INT32_MIN};
-  int signChanges[4] = {0, 0, 0, 0};
-  int32_t prev[4] = {0, 0, 0, 0};
-  bool havePrev[4] = {false, false, false, false};
+void runSynchronizedAnalogInternalTests(bool analogPass[DEVICE_COUNT]) {
+  bool testEnabled[DEVICE_COUNT] = {false};
+  int32_t minVal[DEVICE_COUNT][4];
+  int32_t maxVal[DEVICE_COUNT][4];
+  int signChanges[DEVICE_COUNT][4];
+  int32_t prev[DEVICE_COUNT][4];
+  bool havePrev[DEVICE_COUNT][4];
+  double sum[DEVICE_COUNT][4];
+  double sumSquares[DEVICE_COUNT][4];
+  uint32_t strictDrdyTimeouts[DEVICE_COUNT] = {0};
+  int sampleCount[DEVICE_COUNT] = {0};
 
-  for (int i = 0; i < 500; ++i) {
-    if (!ads.waitForDRDY(100)) {
-      Serial.printf("[ANALOG-%s] FAIL: DRDY timeout while reading internal test signal.\n", label);
-      ads.stopContinuousConversion();
-      return false;
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    for (int channel = 0; channel < 4; ++channel) {
+      minVal[i][channel] = INT32_MAX;
+      maxVal[i][channel] = INT32_MIN;
+      signChanges[i][channel] = 0;
+      prev[i][channel] = 0;
+      havePrev[i][channel] = false;
+      sum[i][channel] = 0.0;
+      sumSquares[i][channel] = 0.0;
     }
 
-    int32_t ch[8] = {0};
-    uint32_t status = 0;
-    ads.readDataFrame(ch, status);
+    if (!devices[i].linkOk) {
+      analogPass[i] = false;
+      continue;
+    }
 
+    if (!devices[i].ads->configureInternalTestSignal()) {
+      Serial.printf("[ANALOG-%s] FAIL: Could not configure internal test signal mode.\n", devices[i].label);
+      analogPass[i] = false;
+      continue;
+    }
+
+    testEnabled[i] = true;
+    analogPass[i] = false;
+  }
+
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    if (testEnabled[i]) {
+      devices[i].ads->startContinuousConversion();
+    }
+  }
+
+  for (int settleIndex = 0; settleIndex < ANALOG_TEST_SETTLE_SAMPLES; ++settleIndex) {
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+      if (!testEnabled[i]) {
+        continue;
+      }
+
+      int32_t chDiscard[8] = {0};
+      uint32_t statusDiscard = 0;
+      if (devices[i].ads->waitForDRDY(ANALOG_TEST_DRDY_TIMEOUT_MS)) {
+        devices[i].ads->readDataFrame(chDiscard, statusDiscard);
+      } else {
+        strictDrdyTimeouts[i]++;
+        testEnabled[i] = false;
+      }
+    }
+  }
+
+  for (int sampleIndex = 0; sampleIndex < ANALOG_TEST_SAMPLE_COUNT; ++sampleIndex) {
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+      if (!testEnabled[i]) {
+        continue;
+      }
+
+      int32_t ch[8] = {0};
+      uint32_t status = 0;
+      if (devices[i].ads->waitForDRDY(ANALOG_TEST_DRDY_TIMEOUT_MS)) {
+        devices[i].ads->readDataFrame(ch, status);
+      } else {
+        strictDrdyTimeouts[i]++;
+        testEnabled[i] = false;
+        continue;
+      }
+
+      sampleCount[i]++;
+
+      for (int channel = 0; channel < 4; ++channel) {
+        int32_t sample = ch[channel];
+        if (sample < minVal[i][channel]) minVal[i][channel] = sample;
+        if (sample > maxVal[i][channel]) maxVal[i][channel] = sample;
+        sum[i][channel] += static_cast<double>(sample);
+        sumSquares[i][channel] += static_cast<double>(sample) * static_cast<double>(sample);
+
+        if (havePrev[i][channel]) {
+          if ((prev[i][channel] < 0 && sample >= 0) || (prev[i][channel] >= 0 && sample < 0)) {
+            signChanges[i][channel]++;
+          }
+        }
+        prev[i][channel] = sample;
+        havePrev[i][channel] = true;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    if (testEnabled[i]) {
+      devices[i].ads->stopContinuousConversion();
+    }
+  }
+
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    if (!devices[i].linkOk) {
+      continue;
+    }
+
+    if (strictDrdyTimeouts[i] > 0) {
+      Serial.printf("[ANALOG-%s] FAIL: Strict DRDY timeout occurred %lu times during analog test.\n",
+                    devices[i].label,
+                    strictDrdyTimeouts[i]);
+      analogPass[i] = false;
+      continue;
+    }
+
+    if (sampleCount[i] < ANALOG_TEST_SAMPLE_COUNT) {
+      Serial.printf("[ANALOG-%s] FAIL: Incomplete sample window (%d/%d).\n",
+                    devices[i].label,
+                    sampleCount[i],
+                    ANALOG_TEST_SAMPLE_COUNT);
+      analogPass[i] = false;
+      continue;
+    }
+
+    int passCount = 0;
     for (int channel = 0; channel < 4; ++channel) {
-      int32_t sample = ch[channel];
-      if (sample < minVal[channel]) minVal[channel] = sample;
-      if (sample > maxVal[channel]) maxVal[channel] = sample;
+      int32_t peakToPeak = maxVal[i][channel] - minVal[i][channel];
+      float p2pUv = devices[i].ads->countsToVolts(peakToPeak) * 1e6f;
+      double meanCounts = sum[i][channel] / static_cast<double>(ANALOG_TEST_SAMPLE_COUNT);
+      double meanSquare = sumSquares[i][channel] / static_cast<double>(ANALOG_TEST_SAMPLE_COUNT);
+      double variance = meanSquare - (meanCounts * meanCounts);
+      if (variance < 0.0) {
+        variance = 0.0;
+      }
+      float rmsAcCounts = sqrtf(static_cast<float>(variance));
+      float rmsAcUv = devices[i].ads->countsToVolts(static_cast<int32_t>(rmsAcCounts)) * 1e6f;
+      bool channelPass = rmsAcCounts >= ANALOG_TEST_RMS_AC_PASS_COUNTS;
 
-      if (havePrev[channel]) {
-        if ((prev[channel] < 0 && sample >= 0) || (prev[channel] >= 0 && sample < 0)) {
-          signChanges[channel]++;
+      Serial.printf("[ANALOG-%s] CH%d p2p=%ld counts (%.2f uV), rms(ac)=%.0f counts (%.2f uV), mean=%.0f counts, sign changes=%d -> %s\n",
+                    devices[i].label,
+                    channel + 1,
+                    peakToPeak,
+                    p2pUv,
+                    rmsAcCounts,
+                    rmsAcUv,
+                    static_cast<float>(meanCounts),
+                    signChanges[i][channel],
+                    channelPass ? "PASS" : "FAIL");
+
+      if (channelPass) {
+        passCount++;
+        if (signChanges[i][channel] < 1) {
+          Serial.printf("[ANALOG-%s] CH%d WARN: Low sign-change count; amplitude still healthy.\n", devices[i].label, channel + 1);
         }
       }
-      prev[channel] = sample;
-      havePrev[channel] = true;
     }
-  }
 
-  ads.stopContinuousConversion();
-
-  int passCount = 0;
-  for (int channel = 0; channel < 4; ++channel) {
-    int32_t peakToPeak = maxVal[channel] - minVal[channel];
-    float p2pUv = ads.countsToVolts(peakToPeak) * 1e6f;
-    bool channelPass = peakToPeak >= 50000;
-
-    Serial.printf("[ANALOG-%s] CH%d p2p=%ld counts (%.2f uV), sign changes=%d -> %s\n",
-                  label,
-                  channel + 1,
-                  peakToPeak,
-                  p2pUv,
-                  signChanges[channel],
-                  channelPass ? "PASS" : "FAIL");
-
-    if (channelPass) {
-      passCount++;
-      if (signChanges[channel] < 1) {
-        Serial.printf("[ANALOG-%s] CH%d WARN: Low sign-change count; amplitude still healthy.\n", label, channel + 1);
+    if (passCount == 0) {
+      Serial.printf("[ANALOG-%s] FAIL: No channels passed internal analog amplitude test.\n", devices[i].label);
+      analogPass[i] = false;
+    } else {
+      if (passCount < 4) {
+        Serial.printf("[ANALOG-%s] WARN: %d/4 channels passed internal analog amplitude test.\n", devices[i].label, passCount);
+      } else {
+        Serial.printf("[ANALOG-%s] PASS: 4/4 channels passed internal analog amplitude test.\n", devices[i].label);
       }
+      analogPass[i] = true;
     }
   }
-
-  if (passCount == 0) {
-    Serial.printf("[ANALOG-%s] FAIL: No channels passed internal analog amplitude test.\n", label);
-    return false;
-  }
-
-  if (passCount < 4) {
-    Serial.printf("[ANALOG-%s] WARN: %d/4 channels passed internal analog amplitude test.\n", label, passCount);
-  } else {
-    Serial.printf("[ANALOG-%s] PASS: 4/4 channels passed internal analog amplitude test.\n", label);
-  }
-  return true;
 }
 
 void setup() {
@@ -155,73 +297,53 @@ void setup() {
                 digitalRead(PIN_ADS2_CS),
                 digitalRead(PIN_AUX_CS3));
 
-  bool linkOk1 = ads1.begin(
-      PIN_ADS1_DRDY,
-      PIN_ADS1_CS,
-      PIN_ADS1_START,
-      PIN_ADS1_RESET,
-      PIN_ADS1_PWDN,
-      PIN_SPI_SCLK,
-      PIN_SPI_MISO,
-      PIN_SPI_MOSI,
-        1000000,
-        ADS_CHANNEL_COUNT
-  );
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    bringUpDevice(devices[i]);
+  }
 
-  bool linkOk2 = ads2.begin(
-      PIN_ADS2_DRDY,
-      PIN_ADS2_CS,
-      PIN_ADS1_START,
-      PIN_ADS1_RESET,
-      PIN_ADS1_PWDN,
-      PIN_SPI_SCLK,
-      PIN_SPI_MISO,
-      PIN_SPI_MOSI,
-        1000000,
-        ADS_CHANNEL_COUNT
-  );
+  bool analogPass[DEVICE_COUNT] = {false};
+  runSynchronizedAnalogInternalTests(analogPass);
+
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    if (!devices[i].linkOk) {
+      continue;
+    }
+
+    if (!analogPass[i]) {
+      Serial.printf("[BOOT] WARN: %s analog internal test failed; continuing.\n", devices[i].label);
+    }
+
+    bool configOk = devices[i].ads->configureBasicEEG();
+    if (!configOk) {
+      Serial.printf("[BOOT] WARN: %s normal EEG configuration failed; continuing.\n", devices[i].label);
+    }
+    devices[i].online = configOk;
+  }
 
       Serial.printf("[BOOT] CS post-init states: CS1=%d CS2=%d\n",
             digitalRead(PIN_ADS1_CS),
             digitalRead(PIN_ADS2_CS));
 
-  if (!linkOk1) {
-    Serial.println("[BOOT] WARN: ADS1299 #1 not responding. Channels 1-4 will be zero.");
-  } else {
-    bool d1 = runDigitalDiagnostics(ads1, "ADS1");
-    bool a1 = runAnalogInternalTest(ads1, "ADS1");
-    bool c1 = ads1.configureBasicEEG();
-    if (!d1) Serial.println("[BOOT] WARN: ADS1 digital test failed; continuing.");
-    if (!a1) Serial.println("[BOOT] WARN: ADS1 analog internal test failed; continuing.");
-    if (!c1) Serial.println("[BOOT] WARN: ADS1 normal EEG configuration failed; continuing.");
-    ads1Online = c1;
-    if (ads1Online) {
-      ads1.startContinuousConversion();
-    }
+  bool anyOnline = false;
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    anyOnline = anyOnline || devices[i].online;
   }
 
-  if (!linkOk2) {
-    Serial.println("[BOOT] WARN: ADS1299 #2 not responding. Channels 5-8 will be zero.");
-  } else {
-    bool d2 = runDigitalDiagnostics(ads2, "ADS2");
-    bool a2 = runAnalogInternalTest(ads2, "ADS2");
-    bool c2 = ads2.configureBasicEEG();
-    if (!d2) Serial.println("[BOOT] WARN: ADS2 digital test failed; continuing.");
-    if (!a2) Serial.println("[BOOT] WARN: ADS2 analog internal test failed; continuing.");
-    if (!c2) Serial.println("[BOOT] WARN: ADS2 normal EEG configuration failed; continuing.");
-    ads2Online = c2;
-    if (ads2Online) {
-      ads2.startContinuousConversion();
-    }
-  }
-
-  if (!ads1Online && !ads2Online) {
+  if (!anyOnline) {
     Serial.println("[BOOT] WARN: No ADS1299 configured for live conversion. Streaming zeros for debug.");
   }
 
-  Serial.printf("[BOOT] Live stream mode: ADS1=%s ADS2=%s\n", ads1Online ? "ON" : "OFF", ads2Online ? "ON" : "OFF");
-  Serial.println("Waiting 3 seconds before live stream...");
-  delay(3000);
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    if (devices[i].online) {
+      devices[i].ads->startContinuousConversion();
+    }
+  }
+
+  Serial.printf("[BOOT] Live stream mode: ADS1=%s ADS2=%s\n",
+                devices[0].online ? "ON" : "OFF",
+                devices[1].online ? "ON" : "OFF");
+  Serial.println("Waiting 5 seconds before live stream...");
+  delay(5000);
   Serial.println("Live summary at 5 Hz: avg/min/max uV for ch1..ch8");
 
   for (int i = 0; i < 8; ++i) {
@@ -233,54 +355,51 @@ void setup() {
 }
 
 void loop() {
-  int32_t chA[8] = {0};
-  int32_t chB[8] = {0};
   int32_t ch[8] = {0};
-  uint32_t statusA = 0;
-  uint32_t statusB = 0;
 
-  if (ads1Online) {
-    if (ads1.waitForDRDY(100)) {
-      ads1.readDataFrame(chA, statusA);
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    AdsDeviceContext& dev = devices[i];
+    if (!dev.online) {
+      continue;
+    }
+
+    int32_t frame[8] = {0};
+    uint32_t status = 0;
+    if (dev.ads->waitForDRDY(DRDY_TIMEOUT_MS)) {
+      dev.ads->readDataFrame(frame, status);
+      dev.lastStatus = status;
     } else {
-      Serial.println("[RUN] Warning: ADS1 DRDY timeout, using zeros for ch1-ch4 this frame.");
+      dev.drdyTimeoutCount++;
+      delayMicroseconds(ADS_SAMPLE_PERIOD_US);
+      dev.ads->readDataFrame(frame, status);
+      dev.lastStatus = status;
+      if ((dev.drdyTimeoutCount % DRDY_WARN_PRINT_EVERY) == 1) {
+        Serial.printf("[RUN] Warning: %s DRDY timeout (%lu total), using timed fallback read.\n",
+                      dev.label,
+                      dev.drdyTimeoutCount);
+      }
+    }
+
+    for (uint8_t channel = 0; channel < ADS_CHANNEL_COUNT; ++channel) {
+      ch[dev.mergedOffset + channel] = frame[channel];
     }
   }
-
-  if (ads2Online) {
-    if (ads2.waitForDRDY(100)) {
-      ads2.readDataFrame(chB, statusB);
-    } else {
-      Serial.println("[RUN] Warning: ADS2 DRDY timeout, using zeros for ch5-ch8 this frame.");
-    }
-  }
-
-  ch[0] = chA[0];
-  ch[1] = chA[1];
-  ch[2] = chA[2];
-  ch[3] = chA[3];
-  ch[4] = chB[0];
-  ch[5] = chB[1];
-  ch[6] = chB[2];
-  ch[7] = chB[3];
 
   float uV[8];
   for (int i = 0; i < 8; ++i) {
-    uV[i] = ads1.countsToVolts(ch[i]) * 1e6f;
+    uV[i] = devices[0].ads->countsToVolts(ch[i]) * 1e6f;
     chSumUv[i] += uV[i];
     if (uV[i] < chMinUv[i]) chMinUv[i] = uV[i];
     if (uV[i] > chMaxUv[i]) chMaxUv[i] = uV[i];
   }
   windowSampleCount++;
-  lastStatusA = statusA;
-  lastStatusB = statusB;
 
   uint32_t now = millis();
   if ((now - lastReportMs) >= REPORT_INTERVAL_MS && windowSampleCount > 0) {
     Serial.printf("[5Hz] t=%lu ms s1=0x%06lX s2=0x%06lX n=%lu\n",
                   now,
-                  lastStatusA & 0xFFFFFF,
-                  lastStatusB & 0xFFFFFF,
+                  devices[0].lastStatus & 0xFFFFFF,
+                  devices[1].lastStatus & 0xFFFFFF,
                   windowSampleCount);
 
     for (int i = 0; i < 8; ++i) {
