@@ -41,6 +41,17 @@ public:
 
     bool configureBasicEEG();
     bool configureInternalTestSignal();
+    bool applyCytonDefaults(uint8_t dataRateBits = 0x06);
+    bool setDataRateBits(uint8_t dataRateBits);
+    bool configureChannel(
+        uint8_t channelIndex,
+        bool active,
+        uint8_t gainOrdinal,
+        uint8_t inputTypeOrdinal,
+        bool biasInclude,
+        bool srb2Connect,
+        bool srb1Connect
+    );
     bool startContinuousConversion();
     bool stopContinuousConversion();
 
@@ -67,6 +78,11 @@ private:
     float vref;
     uint8_t gain;
     uint8_t activeChannels;
+    uint8_t config1Cache;
+    uint8_t channelSettings[8];
+    uint8_t biasSenseP;
+    uint8_t biasSenseN;
+    uint8_t srb1Mask;
     int lastDrdyLevel;
 };
 

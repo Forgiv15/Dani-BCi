@@ -17,9 +17,17 @@ ADS1299::ADS1299()
       pinRESET(-1),
       pinPWDN(-1),
       vref(4.5f),
-    gain(24),
-        activeChannels(8),
-        lastDrdyLevel(HIGH) {}
+            gain(24),
+            activeChannels(8),
+            config1Cache(0x96),
+            biasSenseP(0x00),
+            biasSenseN(0x00),
+            srb1Mask(0x00),
+            lastDrdyLevel(HIGH) {
+        for (uint8_t i = 0; i < 8; ++i) {
+                channelSettings[i] = 0x61;
+        }
+}
 
 bool ADS1299::begin(
     int8_t drdyPin,
@@ -156,19 +164,7 @@ void ADS1299::writeRegister(uint8_t address, uint8_t value) {
 }
 
 bool ADS1299::configureBasicEEG() {
-    SDATAC();
-    STOP();
-
-    writeRegister(CONFIG1, 0x96);
-    writeRegister(CONFIG2, 0xC0);
-    writeRegister(CONFIG3, 0xEC);
-
-    for (uint8_t ch = 0; ch < activeChannels; ++ch) {
-        writeRegister(CH1SET + ch, 0x60);
-    }
-
-    gain = 24;
-    return (readRegister(CONFIG1) == 0x96) && ((readRegister(CONFIG3) & 0xE0) == 0xE0);
+    return applyCytonDefaults(0x06);
 }
 
 bool ADS1299::configureInternalTestSignal() {
@@ -185,6 +181,106 @@ bool ADS1299::configureInternalTestSignal() {
 
     gain = 24;
     return (readRegister(CONFIG2) == 0xD3) && (readRegister(CH1SET) == 0x65);
+}
+
+bool ADS1299::applyCytonDefaults(uint8_t dataRateBits) {
+    SDATAC();
+    STOP();
+
+    config1Cache = static_cast<uint8_t>(0x90 | (dataRateBits & 0x07));
+    writeRegister(CONFIG1, config1Cache);
+    writeRegister(CONFIG2, 0xC0);
+    writeRegister(CONFIG3, 0xEC);
+
+    biasSenseP = 0;
+    biasSenseN = 0;
+    srb1Mask = 0;
+
+    for (uint8_t ch = 0; ch < activeChannels; ++ch) {
+        channelSettings[ch] = 0x60;
+        writeRegister(CH1SET + ch, channelSettings[ch]);
+        biasSenseP |= static_cast<uint8_t>(1U << ch);
+        biasSenseN |= static_cast<uint8_t>(1U << ch);
+    }
+
+    writeRegister(BIAS_SENSP, biasSenseP);
+    writeRegister(BIAS_SENSN, biasSenseN);
+    writeRegister(MISC1, 0x00);
+
+    gain = 24;
+    return (readRegister(CONFIG1) == config1Cache) && ((readRegister(CONFIG3) & 0xE0) == 0xE0);
+}
+
+bool ADS1299::setDataRateBits(uint8_t dataRateBits) {
+    SDATAC();
+    STOP();
+    config1Cache = static_cast<uint8_t>((config1Cache & 0xF8) | (dataRateBits & 0x07));
+    writeRegister(CONFIG1, config1Cache);
+    return (readRegister(CONFIG1) & 0x07) == (config1Cache & 0x07);
+}
+
+bool ADS1299::configureChannel(
+    uint8_t channelIndex,
+    bool active,
+    uint8_t gainOrdinal,
+    uint8_t inputTypeOrdinal,
+    bool biasInclude,
+    bool srb2Connect,
+    bool srb1Connect
+) {
+    if (channelIndex >= activeChannels) {
+        return false;
+    }
+
+    static const uint8_t gainLut[7] = {0, 1, 2, 3, 4, 5, 6};
+    static const uint8_t gainScalarLut[7] = {1, 2, 4, 6, 8, 12, 24};
+    if (gainOrdinal > 6) {
+        gainOrdinal = 6;
+    }
+    if (inputTypeOrdinal > 7) {
+        inputTypeOrdinal = 0;
+    }
+
+    uint8_t chset = 0;
+    if (!active) {
+        chset |= 0x80;
+        inputTypeOrdinal = 1;
+        biasInclude = false;
+        srb2Connect = false;
+        srb1Connect = false;
+    }
+
+    chset |= static_cast<uint8_t>((gainLut[gainOrdinal] & 0x07) << 4);
+    if (srb2Connect) {
+        chset |= 0x08;
+    }
+    chset |= static_cast<uint8_t>(inputTypeOrdinal & 0x07);
+
+    channelSettings[channelIndex] = chset;
+    writeRegister(CH1SET + channelIndex, chset);
+
+    uint8_t mask = static_cast<uint8_t>(1U << channelIndex);
+    if (biasInclude) {
+        biasSenseP |= mask;
+        biasSenseN |= mask;
+    } else {
+        biasSenseP &= static_cast<uint8_t>(~mask);
+        biasSenseN &= static_cast<uint8_t>(~mask);
+    }
+
+    if (srb1Connect) {
+        srb1Mask |= mask;
+    } else {
+        srb1Mask &= static_cast<uint8_t>(~mask);
+    }
+
+    writeRegister(BIAS_SENSP, biasSenseP);
+    writeRegister(BIAS_SENSN, biasSenseN);
+    writeRegister(MISC1, (srb1Mask != 0) ? 0x20 : 0x00);
+
+    gain = gainScalarLut[gainOrdinal];
+    uint8_t readBack = readRegister(CH1SET + channelIndex);
+    return readBack == chset;
 }
 
 bool ADS1299::startContinuousConversion() {
@@ -207,7 +303,7 @@ bool ADS1299::waitForDRDY(uint32_t timeoutMs) {
 
     while (true) {
         int currentLevel = digitalRead(pinDRDY);
-        if (lastDrdyLevel == HIGH && currentLevel == LOW) {
+        if (currentLevel == LOW) {
             lastDrdyLevel = currentLevel;
             return true;
         }
@@ -216,7 +312,7 @@ bool ADS1299::waitForDRDY(uint32_t timeoutMs) {
         if ((millis() - startMs) >= timeoutMs) {
             return false;
         }
-        delayMicroseconds(20);
+        delayMicroseconds(10);
     }
 }
 
