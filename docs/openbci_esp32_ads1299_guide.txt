@@ -1,0 +1,481 @@
+OPENBCI GUI COMPATIBLE EEG SOURCE IMPLEMENTATION GUIDE Target: ESP32 +
+ADS1299 (8 channels) Goal: Stream data into OpenBCI GUI using custom
+firmware.
+
+==================================================== 1. SYSTEM
+ARCHITECTURE OVERVIEW
+====================================================
+
+Typical OpenBCI-compatible pipeline:
+
+Electrodes ↓ ADS1299 (24‑bit EEG ADC) ↓ SPI ESP32 MCU ↓ (Serial / WiFi /
+TCP / UDP / BLE) OpenBCI GUI ↓ Visualization / Filtering / Recording
+
+Key rule: The OpenBCI GUI expects a very specific packet format and
+streaming behavior.
+
+The easiest compatibility approach: Emulate the OpenBCI Cyton serial
+protocol.
+
+==================================================== 2. ADS1299 BASIC
+CONFIGURATION (EEG MODE)
+====================================================
+
+ADS1299 characteristics:
+
+Resolution: 24 bit delta‑sigma ADC Channels: 8 simultaneous Input noise:
+~1 µVpp Input impedance: >1 GΩ Reference: internal or external
+
+Typical EEG settings used by OpenBCI:
+
+Sampling rate: 250 Hz Gain: 24 Reference: internal
+
+LSB voltage conversion:
+
+LSB = (Vref / Gain) / (2^23)
+
+With OpenBCI configuration:
+
+Vref = 4.5V Gain = 24
+
+1 LSB ≈ 0.02235 µV
+
+Raw samples are transmitted as 24‑bit signed integers.
+
+==================================================== 3. ADS1299 SPI
+COMMUNICATION ====================================================
+
+SPI mode:
+
+Clock polarity: CPOL=0 Clock phase: CPHA=1 (SPI MODE1)
+
+Typical SPI clock: 2–8 MHz
+
+Important pins:
+
+DRDY – Data ready interrupt CS – Chip select START – Start conversions
+RESET – Reset chip
+
+Sampling flow:
+
+1.  DRDY goes low
+2.  MCU reads 27 bytes from ADS1299
+3.  3 status bytes
+4.  8 channels × 3 bytes
+
+Total = 27 bytes per sample.
+
+==================================================== 4. SAMPLE
+ACQUISITION FLOW ====================================================
+
+Loop:
+
+wait_for_DRDY() SPI_read_frame()
+
+Frame structure:
+
+Status[3] CH1[3] CH2[3] CH3[3] CH4[3] CH5[3] CH6[3] CH7[3] CH8[3]
+
+Each channel = 24 bit signed two’s complement.
+
+==================================================== 5. OPENBCI SERIAL
+DATA PACKET FORMAT ====================================================
+
+The GUI expects packets structured exactly like OpenBCI Cyton.
+
+Packet length = 33 bytes.
+
+Byte layout:
+
+Byte 0 : Start byte (0xA0) Byte 1 : Packet counter (0‑255)
+
+Bytes 2‑25 : EEG channels
+
+Each channel = 3 bytes (24 bit)
+
+CH1: Byte2 Byte3 Byte4
+
+CH2: Byte5 Byte6 Byte7
+
+… CH8: Byte23 Byte24 Byte25
+
+Bytes 26‑31 : AUX data (accelerometer or unused)
+
+Byte 32 : End byte (0xC0)
+
+Important: packets missing end byte are discarded.
+
+==================================================== 6. SERIAL STREAM
+PARAMETERS ====================================================
+
+Default OpenBCI settings:
+
+Baud rate: 115200 bps
+
+Serial configuration:
+
+8 data bits 1 stop bit No parity
+
+Bandwidth estimation:
+
+8 channels × 3 bytes = 24 bytes Header/footer ≈ 9 bytes
+
+Total ≈ 33 bytes/sample
+
+At 250 Hz:
+
+33 × 250 = 8250 bytes/sec ≈ 66 kbps
+
+115200 baud is sufficient.
+
+==================================================== 7. PACKET COUNTER
+====================================================
+
+Byte1 = incrementing counter
+
+Range:
+
+0 → 255 → wrap
+
+Purpose:
+
+Detect dropped packets in GUI.
+
+==================================================== 8. AUX DATA BYTES
+====================================================
+
+6 bytes reserved.
+
+OpenBCI uses these for accelerometer.
+
+If unused:
+
+Set to 0.
+
+==================================================== 9. OPENBCI COMMAND
+PROTOCOL ====================================================
+
+OpenBCI GUI sends ASCII commands to control board.
+
+Common commands:
+
+b – start streaming s – stop streaming v – board version ? – print
+register settings
+
+Minimal implementation for compatibility:
+
+if(serial == ‘b’) start_stream() if(serial == ‘s’) stop_stream()
+
+==================================================== 10. DATA STREAM
+STATE MACHINE ====================================================
+
+IDLE state
+
+Wait for ‘b’
+
+STREAMING state
+
+repeat:
+
+read ADS1299 build packet send packet
+
+stop when ‘s’
+
+==================================================== 11. WIFI STREAMING
+OPTION ====================================================
+
+OpenBCI WiFi shield uses TCP socket streaming.
+
+Typical setup:
+
+ESP32 acts as TCP server
+
+GUI connects to:
+
+port 6677
+
+Stream raw binary packets.
+
+Latency requirements:
+
+<20 ms preferred.
+
+==================================================== 12. UDP STREAMING
+(OPTIONAL) ====================================================
+
+Possible but less reliable.
+
+If implemented:
+
+send 33‑byte packets
+
+UDP port example:
+
+6677
+
+==================================================== 13. BLUETOOTH
+STREAMING ====================================================
+
+BLE bandwidth is limited.
+
+Typical limit:
+
+~6–8 kB/s
+
+250 Hz × 8ch nearly saturates BLE.
+
+Classic Bluetooth recommended.
+
+==================================================== 14. TIMING
+REQUIREMENTS ====================================================
+
+Sample period at 250 Hz:
+
+4 ms
+
+Firmware must complete:
+
+SPI read packet build transmit
+
+within this window.
+
+Use interrupt triggered acquisition.
+
+==================================================== 15. 24‑BIT SIGN
+EXTENSION ====================================================
+
+ADS1299 output is signed 24 bit.
+
+To convert to 32 bit:
+
+if (value & 0x800000) value |= 0xFF000000
+
+==================================================== 16. ESP32 FIRMWARE
+STRUCTURE ====================================================
+
+Tasks:
+
+ADS1299 task Packet builder Transport layer
+
+Example pipeline:
+
+DRDY interrupt ↓ SPI read ↓ queue buffer ↓ packet builder ↓ serial/WiFi
+send
+
+==================================================== 17. LATENCY
+CONSIDERATIONS ====================================================
+
+EEG real‑time systems require:
+
+Latency <50 ms
+
+Use:
+
+DMA SPI ring buffers non‑blocking sockets
+
+==================================================== 18. TESTING WITH
+OPENBCI GUI ====================================================
+
+Steps:
+
+1 connect serial port 2 select “OpenBCI Cyton” 3 press start stream
+
+If packets correct:
+
+signals appear immediately.
+
+==================================================== 19. DEBUGGING
+METHODS ====================================================
+
+Recommended tests:
+
+1 dummy sine wave generator 2 ADS1299 internal test signal 3 packet
+counter monitor
+
+==================================================== 20. MINIMAL PACKET
+EXAMPLE ====================================================
+
+Example:
+
+A0 01 12 34 56 … 00 00 00 C0
+
+==================================================== 21. PERFORMANCE
+TARGETS ====================================================
+
+Recommended:
+
+Sample rate: 250 Hz Channels: 8 Resolution: 24 bit Latency: <20 ms
+
+==================================================== 22. IMPORTANT
+OPENBCI DESIGN ASSUMPTIONS
+====================================================
+
+GUI assumes:
+
+fixed packet size constant sampling monotonic packet counter signed 24
+bit EEG samples
+
+Any violation → packet rejected.
+
+==================================================== 23. RECOMMENDED
+DEVELOPMENT STEPS ====================================================
+
+1 bring up ADS1299 SPI 2 verify DRDY timing 3 capture test signal 4
+build packet formatter 5 stream via serial 6 test GUI 7 add WiFi
+transport
+
+==================================================== 24. BANDWIDTH
+SUMMARY ====================================================
+
+250 Hz × 8ch:
+
+≈66 kbps raw
+
+Serial 115200 OK WiFi trivial BLE borderline.
+
+==================================================== END OF DOCUMENT
+================================================================================
+          OPENBCI GUI + ESP32 + ADS1299 FIRMWARE IMPLEMENTATION GUIDE
+================================================================================
+
+1. THE GOLDEN RULE: EMULATE THE CYTON BOARD
+--------------------------------------------------------------------------------
+The OpenBCI GUI expects data from specific, pre-defined hardware (Cyton, Ganglion, 
+WiFi Shield). To avoid rewriting the GUI's Java/Processing code, your ESP32 
+must "pretend" to be an 8-channel Cyton board. 
+
+The GUI communicates via Serial (or Virtual Serial over Bluetooth) by sending 
+single-character ASCII commands. Your ESP32 must listen for these commands and 
+respond exactly how a real Cyton board would.
+
+2. THE COMMAND HANDSHAKE (CRITICAL FOR CONNECTION)
+--------------------------------------------------------------------------------
+When you click "Start Session" in the OpenBCI GUI using the Cyton Serial option, 
+the GUI sends specific characters to the board to configure it. Your ESP32 MUST 
+listen to the RX pin and execute/respond to these commands:
+
+* 'v' (Soft Reset): The GUI wants to know what board is connected. 
+  -> Your ESP32 MUST reply with: "OpenBCI V3 8-16 channel\n$$$" 
+  (The $$$ is the strict end-of-message delimiter).
+* 'b' (Begin Stream): The GUI is telling the board to start sending data.
+  -> Your ESP32 should set a boolean flag (e.g., `isStreaming = true`) and 
+  start pushing the 33-byte data packets.
+* 's' (Stop Stream): The GUI is telling the board to stop sending data.
+  -> Your ESP32 should set `isStreaming = false` and stop sending packets.
+* '1' to '8': Power down specific channels. (Optional but good to implement).
+* '!' to '*': Power up specific channels. (Optional).
+* 'x', 'X': Channel settings commands. (You can ignore these for a basic 
+  implementation, but you must read them out of the serial buffer).
+
+3. THE 33-BYTE CYTON DATA PACKET FORMAT
+--------------------------------------------------------------------------------
+When `isStreaming` is true, your ESP32 must construct and send exactly 33 bytes 
+for every single sample at a rate of 250 Hz (the default Cyton sample rate).
+
+
+
+Packet Breakdown (33 Bytes Total):
+* Byte 0:    Header (Always 0xA0)
+* Byte 1:    Sample Number (0x00 to 0xFF, rolls over back to 0x00)
+* Byte 2-4:  Channel 1 Data (24-bit signed, Two's Complement, Big Endian)
+* Byte 5-7:  Channel 2 Data 
+* Byte 8-10: Channel 3 Data 
+* Byte 11-13: Channel 4 Data 
+* Byte 14-16: Channel 5 Data 
+* Byte 17-19: Channel 6 Data 
+* Byte 20-22: Channel 7 Data 
+* Byte 23-25: Channel 8 Data 
+* Byte 26-31: Auxiliary Data (6 bytes). Usually 3x 16-bit accelerometer axes. 
+              If you don't have an accelerometer, send 0x00 for all 6 bytes.
+* Byte 32:   Footer (Always 0xC0 for standard 8-channel streaming).
+
+Data Conversion Note:
+The ADS1299 outputs 24-bit data. You must slice this into 3 separate bytes to 
+place in the packet. Ensure you send the Most Significant Byte (MSB) first.
+
+4. ESP32 AND ADS1299 FIRMWARE SPECIFICATIONS
+--------------------------------------------------------------------------------
+To get the data from the ADS1299 into the ESP32, you will use the SPI bus.
+
+* SPI Settings: The ADS1299 requires SPI Mode 1 (CPOL = 0, CPHA = 1).
+* SPI Speed: 1 MHz to 4 MHz is safe and reliable.
+* DRDY Pin (Data Ready): This is the most important pin. Do NOT poll the ADS1299 
+  via SPI to see if data is ready. Connect the ADS1299 DRDY pin to an ESP32 
+  interrupt pin. 
+* Interrupt Logic: When DRDY goes LOW, new data is ready. Your ESP32 interrupt 
+  Service Routine (ISR) should trigger the SPI read sequence.
+* Sample Rate: Configure the ADS1299 internal registers for 250 SPS (Samples 
+  Per Second) to perfectly match the OpenBCI GUI's expectations for Cyton.
+
+
+
+5. CONNECTIVITY OPTIONS EXPLAINED
+--------------------------------------------------------------------------------
+A. Serial (Wired USB)
+   - Easiest method.
+   - Baud Rate: MUST be 115200.
+   - How to use in GUI: Select "Serial (from Dongle)", pick the ESP32's COM port.
+
+B. Bluetooth Classic (Virtual COM Port)
+   - Very easy on ESP32. Use the `BluetoothSerial.h` library.
+   - It creates a virtual COM port on your PC.
+   - How to use in GUI: Pair the ESP32 to your PC. It will show up as a COM port. 
+     Select "Serial (from Dongle)" and pick the Bluetooth COM port.
+
+C. WiFi (OpenBCI WiFi Shield Emulation)
+   - Harder to implement. The GUI expects an HTTP webserver to configure settings 
+     and a UDP or TCP stream for the data.
+   - If you want wireless, Bluetooth Classic (Option B) is 100x easier to code 
+     and is perfectly sufficient for an 8-channel, 250Hz stream.
+   - If you insist on WiFi, use standard UDP. Send an array of multiple 33-byte 
+     packets (e.g., chunked into groups of 10 or 20) over WiFi. You would select 
+     the "WiFi" option in the GUI and point it to the ESP32's IP address.
+
+6. STEP-BY-STEP FIRMWARE LOOP SUMMARY
+--------------------------------------------------------------------------------
+1. Setup():
+   - Initialize Serial at 115200 (or Bluetooth Serial).
+   - Initialize SPI Mode 1.
+   - Send reset commands to ADS1299, configure registers (250 SPS, power up 
+     channels, set gain to 24x).
+   - Attach Interrupt to DRDY pin.
+
+2. Loop():
+   - Check `Serial.available()`. If a command arrived (like 'v', 'b', 's'), 
+     handle it.
+   - If `isStreaming == true` AND `newDataFlag == true` (set by DRDY ISR):
+     - Pull CS (Chip Select) LOW.
+     - Send RDATA command (0x12) over SPI.
+     - Read 3 bytes of status (discard or check).
+     - Read 24 bytes of channel data (8 channels * 3 bytes).
+     - Pull CS HIGH.
+     - Construct the 33-byte array.
+     - Increment the sample counter (Byte 1).
+     - `Serial.write(packet, 33);`
+     - Set `newDataFlag = false`.
+
+
+
+
+ private LinkedList<String> getCytonComPorts() {
+        final String[] names = {"FT231X USB UART", "VCP"};
+        final SerialPort[] comPorts = SerialPort.getCommPorts();
+        LinkedList<String> results = new LinkedList<String>();
+        for (SerialPort comPort : comPorts) {
+            for (String name : names) {
+                if (comPort.toString().startsWith(name)) {
+                    // on macos need to drop tty ports
+                    if (isMac() && comPort.getSystemPortName().startsWith("tty")) {
+                        continue;
+                    }
+                    String found = "";
+                    if (isMac() || isLinux()) found += "/dev/";
+                    found += comPort.getSystemPortName();
+                    println("ControlPanel: Found Cyton Dongle on COM port: " + found);
+                    results.add(found);
+                }
+            }
+        }
+
+        return results;
+    }

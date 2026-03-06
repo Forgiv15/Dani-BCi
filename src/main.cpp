@@ -63,6 +63,50 @@ static uint8_t xLen = 0;
 static bool parsingZ = false;
 static char zPayload[8];
 static uint8_t zLen = 0;
+static bool awaitingRadioCommand = false;
+static uint8_t radioCommand = 0;
+static bool awaitingRadioChannelValue = false;
+
+static void emitRadioResponse(const char* msg) {
+  Serial.println(msg);
+}
+
+static void handleRadioCommandByte(uint8_t cmd) {
+  radioCommand = cmd;
+  if (cmd == 0x01 || cmd == 0x02) {
+    awaitingRadioChannelValue = true;
+    return;
+  }
+
+  switch (cmd) {
+    case 0x00:
+      emitRadioResponse("Success: Host and Device on Channel Number 1");
+      break;
+    case 0x07:
+      emitRadioResponse("Success: System is Up");
+      break;
+    default:
+      emitRadioResponse("Failure: Unsupported radio command");
+      break;
+  }
+}
+
+static void handleRadioChannelByte(uint8_t channel) {
+  awaitingRadioChannelValue = false;
+
+  if (channel == 0 || channel > 25) {
+    emitRadioResponse("Failure: Invalid channel");
+    return;
+  }
+
+  if (radioCommand == 0x01) {
+    emitRadioResponse("Success: Channel set");
+  } else if (radioCommand == 0x02) {
+    emitRadioResponse("Success: Host override");
+  } else {
+    emitRadioResponse("Failure: Unexpected channel byte");
+  }
+}
 
 static int channelSelectorToIndex(char selector) {
   if (selector >= '1' && selector <= '8') {
@@ -420,7 +464,25 @@ static void handleCommandChar(char cmd) {
 
 static void pollSerialCommands() {
   while (Serial.available() > 0) {
-    char cmd = static_cast<char>(Serial.read());
+    uint8_t raw = static_cast<uint8_t>(Serial.read());
+
+    if (awaitingRadioCommand) {
+      awaitingRadioCommand = false;
+      handleRadioCommandByte(raw);
+      continue;
+    }
+
+    if (awaitingRadioChannelValue) {
+      handleRadioChannelByte(raw);
+      continue;
+    }
+
+    if (raw == 0xF0) {
+      awaitingRadioCommand = true;
+      continue;
+    }
+
+    char cmd = static_cast<char>(raw);
     handleCommandChar(cmd);
   }
 }
