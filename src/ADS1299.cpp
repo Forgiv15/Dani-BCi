@@ -7,6 +7,13 @@
 namespace {
 SPIClass sharedSpi(VSPI);
 bool sharedSpiInitialized = false;
+
+constexpr uint8_t kGainMask = 0x70;
+constexpr uint8_t kInputMask = 0x07;
+constexpr uint8_t kSrb2Mask = 0x08;
+constexpr uint8_t kPowerDownMask = 0x80;
+
+constexpr uint8_t kLeadOffFreq31Hz = 0x02;
 }
 
 ADS1299::ADS1299()
@@ -23,9 +30,13 @@ ADS1299::ADS1299()
             biasSenseP(0x00),
             biasSenseN(0x00),
             srb1Mask(0x00),
-            lastDrdyLevel(HIGH) {
+            leadOffConfig(kLeadOffFreq31Hz),
+            leadOffSenseP(0x00),
+            leadOffSenseN(0x00),
+            lastDrdyLevel(HIGH),
+            running(false) {
         for (uint8_t i = 0; i < 8; ++i) {
-                channelSettings[i] = 0x61;
+                channelSettings[i] = 0x68;
         }
 }
 
@@ -83,9 +94,26 @@ bool ADS1299::begin(
     delay(1);
 
     lastDrdyLevel = digitalRead(pinDRDY);
+    running = false;
 
     uint8_t id = readRegister(ID);
     return (id != 0x00) && (id != 0xFF);
+}
+
+void ADS1299::beginConfigTransaction(bool& wasRunning) {
+    wasRunning = running;
+    if (wasRunning) {
+        stopContinuousConversion();
+    } else {
+        SDATAC();
+        STOP();
+    }
+}
+
+void ADS1299::endConfigTransaction(bool wasRunning) {
+    if (wasRunning) {
+        startContinuousConversion();
+    }
 }
 
 void ADS1299::csLow() {
@@ -167,25 +195,22 @@ bool ADS1299::configureBasicEEG() {
     return applyCytonDefaults(0x06);
 }
 
-bool ADS1299::configureInternalTestSignal() {
-    SDATAC();
-    STOP();
+bool ADS1299::configureInternalTestSignal(uint8_t amplitudeCode, uint8_t freqCode) {
+    bool wasRunning = false;
+    beginConfigTransaction(wasRunning);
 
-    writeRegister(CONFIG1, 0x96);
-    writeRegister(CONFIG2, 0xD3);
-    writeRegister(CONFIG3, 0xEC);
+    amplitudeCode &= 0x04;
+    freqCode &= 0x03;
+    uint8_t setting = static_cast<uint8_t>(0xD0 | amplitudeCode | freqCode);
+    writeRegister(CONFIG2, setting);
 
-    for (uint8_t ch = 0; ch < activeChannels; ++ch) {
-        writeRegister(CH1SET + ch, 0x65);
-    }
-
-    gain = 24;
-    return (readRegister(CONFIG2) == 0xD3) && (readRegister(CH1SET) == 0x65);
+    endConfigTransaction(wasRunning);
+    return readRegister(CONFIG2) == setting;
 }
 
 bool ADS1299::applyCytonDefaults(uint8_t dataRateBits) {
-    SDATAC();
-    STOP();
+    bool wasRunning = false;
+    beginConfigTransaction(wasRunning);
 
     config1Cache = static_cast<uint8_t>(0x90 | (dataRateBits & 0x07));
     writeRegister(CONFIG1, config1Cache);
@@ -195,9 +220,12 @@ bool ADS1299::applyCytonDefaults(uint8_t dataRateBits) {
     biasSenseP = 0;
     biasSenseN = 0;
     srb1Mask = 0;
+    leadOffConfig = kLeadOffFreq31Hz;
+    leadOffSenseP = 0;
+    leadOffSenseN = 0;
 
     for (uint8_t ch = 0; ch < activeChannels; ++ch) {
-        channelSettings[ch] = 0x60;
+        channelSettings[ch] = 0x68;
         writeRegister(CH1SET + ch, channelSettings[ch]);
         biasSenseP |= static_cast<uint8_t>(1U << ch);
         biasSenseN |= static_cast<uint8_t>(1U << ch);
@@ -205,18 +233,84 @@ bool ADS1299::applyCytonDefaults(uint8_t dataRateBits) {
 
     writeRegister(BIAS_SENSP, biasSenseP);
     writeRegister(BIAS_SENSN, biasSenseN);
+    writeRegister(LOFF, leadOffConfig);
+    writeRegister(LOFF_SENSP, leadOffSenseP);
+    writeRegister(LOFF_SENSN, leadOffSenseN);
     writeRegister(MISC1, 0x00);
 
     gain = 24;
+    endConfigTransaction(wasRunning);
     return (readRegister(CONFIG1) == config1Cache) && ((readRegister(CONFIG3) & 0xE0) == 0xE0);
 }
 
 bool ADS1299::setDataRateBits(uint8_t dataRateBits) {
-    SDATAC();
-    STOP();
+    bool wasRunning = false;
+    beginConfigTransaction(wasRunning);
     config1Cache = static_cast<uint8_t>((config1Cache & 0xF8) | (dataRateBits & 0x07));
     writeRegister(CONFIG1, config1Cache);
+    endConfigTransaction(wasRunning);
     return (readRegister(CONFIG1) & 0x07) == (config1Cache & 0x07);
+}
+
+bool ADS1299::setInputTypeForAllChannels(uint8_t inputTypeOrdinal) {
+    if (inputTypeOrdinal > 7) {
+        inputTypeOrdinal = 0;
+    }
+
+    bool wasRunning = false;
+    beginConfigTransaction(wasRunning);
+
+    for (uint8_t ch = 0; ch < activeChannels; ++ch) {
+        uint8_t chset = channelSettings[ch];
+        if ((chset & kPowerDownMask) != 0) {
+            continue;
+        }
+        chset = static_cast<uint8_t>((chset & static_cast<uint8_t>(~kInputMask)) | inputTypeOrdinal);
+        channelSettings[ch] = chset;
+        writeRegister(CH1SET + ch, chset);
+    }
+
+    endConfigTransaction(wasRunning);
+    return true;
+}
+
+bool ADS1299::configureLeadOffDetection(uint8_t amplitudeCode, uint8_t freqCode) {
+    bool wasRunning = false;
+    beginConfigTransaction(wasRunning);
+
+    leadOffConfig = static_cast<uint8_t>((amplitudeCode & 0x0C) | (freqCode & 0x03));
+    writeRegister(LOFF, leadOffConfig);
+
+    endConfigTransaction(wasRunning);
+    return readRegister(LOFF) == leadOffConfig;
+}
+
+bool ADS1299::setLeadOffForChannel(uint8_t channelIndex, bool pEnable, bool nEnable) {
+    if (channelIndex >= activeChannels) {
+        return false;
+    }
+
+    bool wasRunning = false;
+    beginConfigTransaction(wasRunning);
+
+    uint8_t mask = static_cast<uint8_t>(1U << channelIndex);
+    if (pEnable) {
+        leadOffSenseP |= mask;
+    } else {
+        leadOffSenseP &= static_cast<uint8_t>(~mask);
+    }
+
+    if (nEnable) {
+        leadOffSenseN |= mask;
+    } else {
+        leadOffSenseN &= static_cast<uint8_t>(~mask);
+    }
+
+    writeRegister(LOFF_SENSP, leadOffSenseP);
+    writeRegister(LOFF_SENSN, leadOffSenseN);
+
+    endConfigTransaction(wasRunning);
+    return true;
 }
 
 bool ADS1299::configureChannel(
@@ -241,9 +335,12 @@ bool ADS1299::configureChannel(
         inputTypeOrdinal = 0;
     }
 
+    bool wasRunning = false;
+    beginConfigTransaction(wasRunning);
+
     uint8_t chset = 0;
     if (!active) {
-        chset |= 0x80;
+        chset |= kPowerDownMask;
         inputTypeOrdinal = 1;
         biasInclude = false;
         srb2Connect = false;
@@ -252,7 +349,7 @@ bool ADS1299::configureChannel(
 
     chset |= static_cast<uint8_t>((gainLut[gainOrdinal] & 0x07) << 4);
     if (srb2Connect) {
-        chset |= 0x08;
+        chset |= kSrb2Mask;
     }
     chset |= static_cast<uint8_t>(inputTypeOrdinal & 0x07);
 
@@ -278,7 +375,15 @@ bool ADS1299::configureChannel(
     writeRegister(BIAS_SENSN, biasSenseN);
     writeRegister(MISC1, (srb1Mask != 0) ? 0x20 : 0x00);
 
+    if (!active) {
+        leadOffSenseP &= static_cast<uint8_t>(~mask);
+        leadOffSenseN &= static_cast<uint8_t>(~mask);
+        writeRegister(LOFF_SENSP, leadOffSenseP);
+        writeRegister(LOFF_SENSN, leadOffSenseN);
+    }
+
     gain = gainScalarLut[gainOrdinal];
+    endConfigTransaction(wasRunning);
     uint8_t readBack = readRegister(CH1SET + channelIndex);
     return readBack == chset;
 }
@@ -288,6 +393,7 @@ bool ADS1299::startContinuousConversion() {
     delay(1);
     digitalWrite(pinSTART, HIGH);
     START();
+    running = true;
     return true;
 }
 
@@ -295,6 +401,7 @@ bool ADS1299::stopContinuousConversion() {
     digitalWrite(pinSTART, LOW);
     STOP();
     SDATAC();
+    running = false;
     return true;
 }
 
@@ -353,6 +460,25 @@ bool ADS1299::readDataFrame(int32_t channels[8], uint32_t& status) {
 
 int8_t ADS1299::getDRDYPin() const {
     return pinDRDY;
+}
+
+bool ADS1299::isRunning() const {
+    return running;
+}
+
+void ADS1299::printRegisters(Stream& stream, const char* label) {
+    if (label != nullptr && label[0] != '\0') {
+        stream.println(label);
+    }
+
+    uint8_t regs[CONFIG4 + 1] = {0};
+    readRegisters(0x00, CONFIG4 + 1, regs);
+
+    for (uint8_t address = 0; address <= CONFIG4; ++address) {
+        char line[48];
+        snprintf(line, sizeof(line), "0x%02X, 0x%02X", address, regs[address]);
+        stream.println(line);
+    }
 }
 
 float ADS1299::countsToVolts(int32_t counts) const {

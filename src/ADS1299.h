@@ -40,9 +40,12 @@ public:
     void writeRegister(uint8_t address, uint8_t value);
 
     bool configureBasicEEG();
-    bool configureInternalTestSignal();
+    bool configureInternalTestSignal(uint8_t amplitudeCode = 0x04, uint8_t freqCode = 0x03);
     bool applyCytonDefaults(uint8_t dataRateBits = 0x06);
     bool setDataRateBits(uint8_t dataRateBits);
+    bool setInputTypeForAllChannels(uint8_t inputTypeOrdinal);
+    bool configureLeadOffDetection(uint8_t amplitudeCode, uint8_t freqCode);
+    bool setLeadOffForChannel(uint8_t channelIndex, bool pEnable, bool nEnable);
     bool configureChannel(
         uint8_t channelIndex,
         bool active,
@@ -59,9 +62,13 @@ public:
     bool readDataFrame(int32_t channels[8], uint32_t& status);
 
     int8_t getDRDYPin() const;
+    bool isRunning() const;
+    void printRegisters(Stream& stream, const char* label = nullptr);
     float countsToVolts(int32_t counts) const;
 
 private:
+    void beginConfigTransaction(bool& wasRunning);
+    void endConfigTransaction(bool wasRunning);
     void sendCommand(uint8_t command);
     void csLow();
     void csHigh();
@@ -83,7 +90,11 @@ private:
     uint8_t biasSenseP;
     uint8_t biasSenseN;
     uint8_t srb1Mask;
+    uint8_t leadOffConfig;
+    uint8_t leadOffSenseP;
+    uint8_t leadOffSenseN;
     int lastDrdyLevel;
+    bool running;
 };
 
 #endif
