@@ -204,8 +204,9 @@ bool ADS1299::configureInternalTestSignal(uint8_t amplitudeCode, uint8_t freqCod
     uint8_t setting = static_cast<uint8_t>(0xD0 | amplitudeCode | freqCode);
     writeRegister(CONFIG2, setting);
 
+    const bool ok = readRegister(CONFIG2) == setting;
     endConfigTransaction(wasRunning);
-    return readRegister(CONFIG2) == setting;
+    return ok;
 }
 
 bool ADS1299::applyCytonDefaults(uint8_t dataRateBits) {
@@ -239,8 +240,9 @@ bool ADS1299::applyCytonDefaults(uint8_t dataRateBits) {
     writeRegister(MISC1, 0x00);
 
     gain = 24;
+    const bool ok = (readRegister(CONFIG1) == config1Cache) && ((readRegister(CONFIG3) & 0xE0) == 0xE0);
     endConfigTransaction(wasRunning);
-    return (readRegister(CONFIG1) == config1Cache) && ((readRegister(CONFIG3) & 0xE0) == 0xE0);
+    return ok;
 }
 
 bool ADS1299::setDataRateBits(uint8_t dataRateBits) {
@@ -248,8 +250,9 @@ bool ADS1299::setDataRateBits(uint8_t dataRateBits) {
     beginConfigTransaction(wasRunning);
     config1Cache = static_cast<uint8_t>((config1Cache & 0xF8) | (dataRateBits & 0x07));
     writeRegister(CONFIG1, config1Cache);
+    const bool ok = (readRegister(CONFIG1) & 0x07) == (config1Cache & 0x07);
     endConfigTransaction(wasRunning);
-    return (readRegister(CONFIG1) & 0x07) == (config1Cache & 0x07);
+    return ok;
 }
 
 bool ADS1299::setInputTypeForAllChannels(uint8_t inputTypeOrdinal) {
@@ -281,8 +284,9 @@ bool ADS1299::configureLeadOffDetection(uint8_t amplitudeCode, uint8_t freqCode)
     leadOffConfig = static_cast<uint8_t>((amplitudeCode & 0x0C) | (freqCode & 0x03));
     writeRegister(LOFF, leadOffConfig);
 
+    const bool ok = readRegister(LOFF) == leadOffConfig;
     endConfigTransaction(wasRunning);
-    return readRegister(LOFF) == leadOffConfig;
+    return ok;
 }
 
 bool ADS1299::setLeadOffForChannel(uint8_t channelIndex, bool pEnable, bool nEnable) {
@@ -383,9 +387,10 @@ bool ADS1299::configureChannel(
     }
 
     gain = gainScalarLut[gainOrdinal];
-    endConfigTransaction(wasRunning);
     uint8_t readBack = readRegister(CH1SET + channelIndex);
-    return readBack == chset;
+    const bool ok = readBack == chset;
+    endConfigTransaction(wasRunning);
+    return ok;
 }
 
 bool ADS1299::startContinuousConversion() {
