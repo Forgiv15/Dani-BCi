@@ -23,7 +23,8 @@ public:
         int8_t misoPin,
         int8_t mosiPin,
         uint32_t spiClockHz = 1000000,
-        uint8_t channelCount = 8
+        uint8_t channelCount = 8,
+        bool doHardwareReset = true
     );
 
     void WAKEUP();
@@ -63,6 +64,8 @@ public:
 
     int8_t getDRDYPin() const;
     bool isRunning() const;
+    uint8_t getDeviceId() const;
+    uint8_t getOutputChannelCount() const;
     void printRegisters(Stream& stream, const char* label = nullptr);
     float countsToVolts(int32_t counts) const;
 
@@ -84,7 +87,9 @@ private:
 
     float vref;
     uint8_t gain;
+    uint8_t deviceId;
     uint8_t activeChannels;
+    uint8_t outputChannels;
     uint8_t config1Cache;
     uint8_t channelSettings[8];
     uint8_t biasSenseP;

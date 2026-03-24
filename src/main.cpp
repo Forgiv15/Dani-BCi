@@ -91,6 +91,58 @@ static DeviceCtx devices[] = {
 };
 static constexpr size_t DEVICE_COUNT = sizeof(devices) / sizeof(devices[0]);
 
+static volatile bool adsReadyFlags[DEVICE_COUNT] = {false, false};
+
+void IRAM_ATTR onAds1Drdy() {
+  adsReadyFlags[0] = true;
+}
+
+void IRAM_ATTR onAds2Drdy() {
+  adsReadyFlags[1] = true;
+}
+
+static void resetAdsReadyFlags() {
+  noInterrupts();
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    adsReadyFlags[i] = false;
+  }
+  interrupts();
+}
+
+static bool consumeAdsReadyFlagsIfReady() {
+  noInterrupts();
+
+  bool anyOnline = false;
+  bool allReady = true;
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    if (!devices[i].linkOk) {
+      continue;
+    }
+    anyOnline = true;
+    if (!adsReadyFlags[i]) {
+      allReady = false;
+      break;
+    }
+  }
+
+  if (anyOnline && allReady) {
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+      if (devices[i].linkOk) {
+        adsReadyFlags[i] = false;
+      }
+    }
+    interrupts();
+    return true;
+  }
+
+  interrupts();
+  return false;
+}
+
+static bool isStatusWordValid(uint32_t statusWord) {
+  return (statusWord & 0x00F00000UL) == 0x00C00000UL;
+}
+
 struct ChannelSetting {
   bool active;
   uint8_t gainOrdinal;
@@ -210,6 +262,7 @@ static bool bringUpLis3dh() {
   digitalWrite(PIN_LIS3DH_CS, HIGH);
 
   Wire.begin(PIN_LIS3DH_SDA, PIN_LIS3DH_SCL, LIS3DH_I2C_CLOCK_HZ);
+  Wire.setTimeOut(2);
 
   for (uint8_t address : {LIS3DH_ADDR_LOW, LIS3DH_ADDR_HIGH}) {
     lis3dhAddress = address;
@@ -505,7 +558,17 @@ static void emitDebugState() {
 
 static void printVersionInfo() {
   Serial.println("OpenBCI V3 8-Channel");
-  Serial.println("On Board ADS1299 Device ID: 0x3E");
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    Serial.print(devices[i].name);
+    Serial.print(" Device ID: 0x");
+    if (devices[i].ads->getDeviceId() < 0x10) {
+      Serial.print('0');
+    }
+    Serial.println(devices[i].ads->getDeviceId(), HEX);
+    Serial.print(devices[i].name);
+    Serial.print(" Output Channels: ");
+    Serial.println(devices[i].ads->getOutputChannelCount());
+  }
   Serial.print("LIS3DH Device ID: 0x");
   if (lis3dhWhoAmI < 0x10) {
     Serial.print('0');
@@ -525,6 +588,19 @@ static int channelSelectorToIndex(char selector) {
 }
 
 static bool setDataRateForAll(uint8_t drBits) {
+  const bool wasStreaming = streaming;
+  if (wasStreaming) {
+    digitalWrite(PIN_ADS_START, LOW);
+    delayMicroseconds(10);
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+      if (devices[i].linkOk) {
+        devices[i].ads->stopContinuousConversion();
+      }
+    }
+    resetAdsReadyFlags();
+    streaming = false;
+  }
+
   bool ok = true;
   for (size_t i = 0; i < DEVICE_COUNT; ++i) {
     if (!devices[i].linkOk) {
@@ -535,6 +611,19 @@ static bool setDataRateForAll(uint8_t drBits) {
   if (ok) {
     sampleRateCode = drBits;
   }
+
+  if (wasStreaming) {
+    sampleCounter = 0;
+    resetAdsReadyFlags();
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+      if (devices[i].linkOk) {
+        devices[i].ads->startContinuousConversion();
+      }
+    }
+    digitalWrite(PIN_ADS_START, HIGH);
+    streaming = true;
+  }
+
   return ok;
 }
 
@@ -543,26 +632,79 @@ static bool applyChannelToHardware(uint8_t channelIndex) {
     return false;
   }
 
-  DeviceCtx& dev = devices[channelIndex / ADS_CHANNELS_PER_CHIP];
+  const uint8_t deviceIndex = channelIndex / ADS_CHANNELS_PER_CHIP;
+  DeviceCtx& dev = devices[deviceIndex];
   if (!dev.linkOk) {
     return false;
   }
 
-  const uint8_t localIndex = channelIndex % ADS_CHANNELS_PER_CHIP;
-  const ChannelSetting& setting = channelSettings[channelIndex];
-  bool ok = dev.ads->configureChannel(
-      localIndex,
-      setting.active,
-      setting.gainOrdinal,
-      setting.inputTypeOrdinal,
-      setting.biasInclude,
-      setting.srb2Connect,
-      setting.srb1Connect);
+  const uint8_t firstChannel = deviceIndex * ADS_CHANNELS_PER_CHIP;
+  const uint8_t lastChannel = firstChannel + ADS_CHANNELS_PER_CHIP;
 
-  if (!setting.active) {
-    leadOffP[channelIndex] = false;
-    leadOffN[channelIndex] = false;
-    ok = dev.ads->setLeadOffForChannel(localIndex, false, false) && ok;
+  bool chipUsesSrb1 = false;
+  bool chipRequestsSrb2 = false;
+  for (uint8_t index = firstChannel; index < lastChannel; ++index) {
+    if (!channelSettings[index].active) {
+      continue;
+    }
+    if (channelSettings[index].srb1Connect) {
+      chipUsesSrb1 = true;
+    }
+    if (channelSettings[index].srb2Connect) {
+      chipRequestsSrb2 = true;
+    }
+  }
+
+  if (chipUsesSrb1 && chipRequestsSrb2) {
+    return false;
+  }
+
+  const bool wasStreaming = streaming;
+  if (wasStreaming) {
+    digitalWrite(PIN_ADS_START, LOW);
+    delayMicroseconds(10);
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+      if (devices[i].linkOk) {
+        devices[i].ads->stopContinuousConversion();
+      }
+    }
+    resetAdsReadyFlags();
+    streaming = false;
+  }
+
+  bool ok = true;
+  for (uint8_t index = firstChannel; index < lastChannel; ++index) {
+    const uint8_t localIndex = index - firstChannel;
+    const ChannelSetting& setting = channelSettings[index];
+    const bool effectiveSrb1 = chipUsesSrb1 && setting.active;
+    const bool effectiveSrb2 = setting.active && setting.srb2Connect && !chipUsesSrb1;
+
+    ok = dev.ads->configureChannel(
+             localIndex,
+             setting.active,
+             setting.gainOrdinal,
+             setting.inputTypeOrdinal,
+             setting.biasInclude,
+             effectiveSrb2,
+             effectiveSrb1) && ok;
+
+    if (!setting.active) {
+      leadOffP[index] = false;
+      leadOffN[index] = false;
+      ok = dev.ads->setLeadOffForChannel(localIndex, false, false) && ok;
+    }
+  }
+
+  if (wasStreaming) {
+    sampleCounter = 0;
+    resetAdsReadyFlags();
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+      if (devices[i].linkOk) {
+        devices[i].ads->startContinuousConversion();
+      }
+    }
+    digitalWrite(PIN_ADS_START, HIGH);
+    streaming = true;
   }
 
   return ok;
@@ -578,8 +720,35 @@ static bool applyLeadOffToHardware(uint8_t channelIndex) {
     return false;
   }
 
+  const bool wasStreaming = streaming;
+  if (wasStreaming) {
+    digitalWrite(PIN_ADS_START, LOW);
+    delayMicroseconds(10);
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+      if (devices[i].linkOk) {
+        devices[i].ads->stopContinuousConversion();
+      }
+    }
+    resetAdsReadyFlags();
+    streaming = false;
+  }
+
   const uint8_t localIndex = channelIndex % ADS_CHANNELS_PER_CHIP;
-  return dev.ads->setLeadOffForChannel(localIndex, leadOffP[channelIndex], leadOffN[channelIndex]);
+  const bool ok = dev.ads->setLeadOffForChannel(localIndex, leadOffP[channelIndex], leadOffN[channelIndex]);
+
+  if (wasStreaming) {
+    sampleCounter = 0;
+    resetAdsReadyFlags();
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+      if (devices[i].linkOk) {
+        devices[i].ads->startContinuousConversion();
+      }
+    }
+    digitalWrite(PIN_ADS_START, HIGH);
+    streaming = true;
+  }
+
+  return ok;
 }
 
 static void applyDefaultChannelState() {
@@ -598,11 +767,15 @@ static void applyDefaultChannelState() {
 static bool applyDefaultChannelSettings() {
   const bool wasStreaming = streaming;
   if (wasStreaming) {
+    // Stop conversions via START pin, then SDATAC on each chip
+    digitalWrite(PIN_ADS_START, LOW);
+    delayMicroseconds(10);
     for (size_t i = 0; i < DEVICE_COUNT; ++i) {
       if (devices[i].linkOk) {
         devices[i].ads->stopContinuousConversion();
       }
     }
+    resetAdsReadyFlags();
     streaming = false;
   }
 
@@ -619,11 +792,14 @@ static bool applyDefaultChannelSettings() {
 
   if (wasStreaming) {
     sampleCounter = 0;
+    // Re-enter RDATAC, then raise START pin
+    resetAdsReadyFlags();
     for (size_t i = 0; i < DEVICE_COUNT; ++i) {
       if (devices[i].linkOk) {
         devices[i].ads->startContinuousConversion();
       }
     }
+    digitalWrite(PIN_ADS_START, HIGH);
     streaming = true;
   }
 
@@ -639,11 +815,14 @@ static void emitStateIfDebug() {
 static bool setInputTypeForAllActiveChannels(uint8_t inputType, uint8_t amplitudeCode, uint8_t freqCode) {
   const bool wasStreaming = streaming;
   if (wasStreaming) {
+    digitalWrite(PIN_ADS_START, LOW);
+    delayMicroseconds(10);
     for (size_t i = 0; i < DEVICE_COUNT; ++i) {
       if (devices[i].linkOk) {
         devices[i].ads->stopContinuousConversion();
       }
     }
+    resetAdsReadyFlags();
     streaming = false;
   }
 
@@ -664,11 +843,13 @@ static bool setInputTypeForAllActiveChannels(uint8_t inputType, uint8_t amplitud
 
   if (wasStreaming) {
     sampleCounter = 0;
+    resetAdsReadyFlags();
     for (size_t i = 0; i < DEVICE_COUNT; ++i) {
       if (devices[i].linkOk) {
         devices[i].ads->startContinuousConversion();
       }
     }
+    digitalWrite(PIN_ADS_START, HIGH);
     streaming = true;
   }
 
@@ -680,12 +861,18 @@ static void stopStreaming() {
     return;
   }
 
+  // Stop conversions via shared START pin (controls both chips at once)
+  digitalWrite(PIN_ADS_START, LOW);
+  delayMicroseconds(10);
+
+  // Exit RDATAC mode on each chip
   for (size_t i = 0; i < DEVICE_COUNT; ++i) {
     if (devices[i].linkOk) {
       devices[i].ads->stopContinuousConversion();
     }
   }
 
+  resetAdsReadyFlags();
   streaming = false;
   emitStateIfDebug();
 }
@@ -696,39 +883,35 @@ static void startStreaming() {
   }
 
   sampleCounter = 0;
+
+  // Ensure START pin is LOW before entering RDATAC
+  digitalWrite(PIN_ADS_START, LOW);
+  delayMicroseconds(10);
+
+  // Enter RDATAC mode on each chip
+  resetAdsReadyFlags();
   for (size_t i = 0; i < DEVICE_COUNT; ++i) {
     if (devices[i].linkOk) {
       devices[i].ads->startContinuousConversion();
     }
   }
 
+  // Raise START pin to begin conversions on ALL chips simultaneously
+  digitalWrite(PIN_ADS_START, HIGH);
+
   streaming = true;
   emitStateIfDebug();
 }
 
-static bool waitForAllDrdyLow(uint32_t timeoutMs) {
+static bool waitForAllFreshFrames(uint32_t timeoutMs) {
   const uint32_t startMs = millis();
 
   while ((millis() - startMs) < timeoutMs) {
-    bool anyOnline = false;
-    bool allReady = true;
-
-    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
-      if (!devices[i].linkOk) {
-        continue;
-      }
-      anyOnline = true;
-      if (digitalRead(devices[i].drdyPin) != LOW) {
-        allReady = false;
-        break;
-      }
-    }
-
-    if (anyOnline && allReady) {
+    if (consumeAdsReadyFlagsIfReady()) {
       return true;
     }
 
-    delayMicroseconds(5);
+    delayMicroseconds(10);
   }
 
   return false;
@@ -745,7 +928,7 @@ static bool readOneSample(int32_t mergedChannels[8]) {
     return false;
   }
 
-  if (!waitForAllDrdyLow(DRDY_TIMEOUT_MS)) {
+  if (!waitForAllFreshFrames(DRDY_TIMEOUT_MS)) {
     return false;
   }
 
@@ -757,6 +940,10 @@ static bool readOneSample(int32_t mergedChannels[8]) {
     int32_t frame[8] = {0};
     uint32_t status = 0;
     if (!devices[i].ads->readDataFrame(frame, status)) {
+      return false;
+    }
+
+    if (!isStatusWordValid(status)) {
       return false;
     }
 
@@ -782,16 +969,21 @@ static void pack16be(int16_t value, uint8_t* out2) {
 }
 
 static void fillAuxPayload(uint8_t packet[33]) {
-  int16_t localAux[3] = {0, 0, 0};
+  static uint32_t lastLis3dhReadUs = 0;
+  static int16_t cachedAux[3] = {0, 0, 0};
 
   if (boardMode == BOARD_MODE_DEFAULT) {
-    readLis3dhAuxData(localAux);
+    const uint32_t nowUs = micros();
+    if ((nowUs - lastLis3dhReadUs) >= 20000) {   // Read LIS3DH at most every 20ms
+      readLis3dhAuxData(cachedAux);
+      lastLis3dhReadUs = nowUs;
+    }
   }
 
-  memcpy(auxData, localAux, sizeof(auxData));
-  pack16be(localAux[0], &packet[26]);
-  pack16be(localAux[1], &packet[28]);
-  pack16be(localAux[2], &packet[30]);
+  memcpy(auxData, cachedAux, sizeof(auxData));
+  pack16be(cachedAux[0], &packet[26]);
+  pack16be(cachedAux[1], &packet[28]);
+  pack16be(cachedAux[2], &packet[30]);
 }
 
 static void writeOpenBCIPacket(const int32_t channels[8]) {
@@ -1501,6 +1693,24 @@ static void bringUpDevices() {
   digitalWrite(PIN_LIS3DH_CS, HIGH);
   digitalWrite(PIN_SD_CS, HIGH);
 
+  // Global hardware reset ONCE for all ADS chips (shared PWDN/RESET pins)
+  pinMode(PIN_ADS_START, OUTPUT);
+  pinMode(PIN_ADS_RESET, OUTPUT);
+  pinMode(PIN_ADS_PWDN, OUTPUT);
+  digitalWrite(PIN_ADS_START, LOW);
+  digitalWrite(PIN_ADS_PWDN, HIGH);
+  digitalWrite(PIN_ADS_RESET, HIGH);
+  delay(10);
+  digitalWrite(PIN_ADS_PWDN, LOW);
+  delay(5);
+  digitalWrite(PIN_ADS_PWDN, HIGH);
+  delay(20);
+  digitalWrite(PIN_ADS_RESET, LOW);
+  delay(2);
+  digitalWrite(PIN_ADS_RESET, HIGH);
+  delay(20);
+
+  // Initialize each chip WITHOUT hardware reset (already done above)
   for (size_t i = 0; i < DEVICE_COUNT; ++i) {
     devices[i].linkOk = devices[i].ads->begin(
         devices[i].drdyPin,
@@ -1512,8 +1722,13 @@ static void bringUpDevices() {
         PIN_SPI_MISO,
         PIN_SPI_MOSI,
         1000000,
-        ADS_CHANNELS_PER_CHIP);
+        ADS_CHANNELS_PER_CHIP,
+        false);
   }
+
+  attachInterrupt(digitalPinToInterrupt(PIN_ADS1_DRDY), onAds1Drdy, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_ADS2_DRDY), onAds2Drdy, FALLING);
+  resetAdsReadyFlags();
 
   bringUpLis3dh();
   bringUpSdCard();
@@ -1547,4 +1762,5 @@ void loop() {
   if (readOneSample(channels)) {
     writeOpenBCIPacket(channels);
   }
+  yield();
 }

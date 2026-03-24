@@ -25,7 +25,9 @@ ADS1299::ADS1299()
       pinPWDN(-1),
       vref(4.5f),
             gain(24),
+                        deviceId(0x00),
             activeChannels(8),
+                        outputChannels(8),
             config1Cache(0x96),
             biasSenseP(0x00),
             biasSenseN(0x00),
@@ -50,7 +52,8 @@ bool ADS1299::begin(
     int8_t misoPin,
     int8_t mosiPin,
     uint32_t spiClockHz,
-    uint8_t channelCount
+    uint8_t channelCount,
+    bool doHardwareReset
 ) {
     pinDRDY = drdyPin;
     pinCS = csPin;
@@ -62,28 +65,30 @@ bool ADS1299::begin(
     if (activeChannels > 8) activeChannels = 8;
     spiSettings = SPISettings(spiClockHz, MSBFIRST, SPI_MODE1);
 
-    pinMode(pinDRDY, INPUT_PULLUP);
+    pinMode(pinDRDY, INPUT);
     pinMode(pinCS, OUTPUT);
-    pinMode(pinSTART, OUTPUT);
-    pinMode(pinRESET, OUTPUT);
-    pinMode(pinPWDN, OUTPUT);
-
     digitalWrite(pinCS, HIGH);
-    digitalWrite(pinSTART, LOW);
-    digitalWrite(pinPWDN, HIGH);
-    digitalWrite(pinRESET, HIGH);
 
-    delay(10);
+    if (doHardwareReset) {
+        pinMode(pinSTART, OUTPUT);
+        pinMode(pinRESET, OUTPUT);
+        pinMode(pinPWDN, OUTPUT);
 
-    digitalWrite(pinPWDN, LOW);
-    delay(5);
-    digitalWrite(pinPWDN, HIGH);
-    delay(20);
+        digitalWrite(pinSTART, LOW);
+        digitalWrite(pinPWDN, HIGH);
+        digitalWrite(pinRESET, HIGH);
+        delay(10);
 
-    digitalWrite(pinRESET, LOW);
-    delay(2);
-    digitalWrite(pinRESET, HIGH);
-    delay(20);
+        digitalWrite(pinPWDN, LOW);
+        delay(5);
+        digitalWrite(pinPWDN, HIGH);
+        delay(20);
+
+        digitalWrite(pinRESET, LOW);
+        delay(2);
+        digitalWrite(pinRESET, HIGH);
+        delay(20);
+    }
 
     if (!sharedSpiInitialized) {
         sharedSpi.begin(sclkPin, misoPin, mosiPin, pinCS);
@@ -96,23 +101,43 @@ bool ADS1299::begin(
     lastDrdyLevel = digitalRead(pinDRDY);
     running = false;
 
-    uint8_t id = readRegister(ID);
-    return (id != 0x00) && (id != 0xFF);
+    deviceId = readRegister(ID);
+    switch (deviceId & 0x03) {
+        case 0x00:
+            outputChannels = 4;
+            break;
+        case 0x01:
+            outputChannels = 6;
+            break;
+        case 0x02:
+            outputChannels = 8;
+            break;
+        default:
+            outputChannels = activeChannels;
+            break;
+    }
+
+    if (outputChannels < activeChannels) {
+        outputChannels = activeChannels;
+    }
+
+    return (deviceId != 0x00) && (deviceId != 0xFF);
 }
 
 void ADS1299::beginConfigTransaction(bool& wasRunning) {
     wasRunning = running;
     if (wasRunning) {
-        stopContinuousConversion();
+        SDATAC();
+        running = false;
     } else {
         SDATAC();
-        STOP();
     }
 }
 
 void ADS1299::endConfigTransaction(bool wasRunning) {
     if (wasRunning) {
-        startContinuousConversion();
+        RDATAC();
+        running = true;
     }
 }
 
@@ -132,9 +157,10 @@ void ADS1299::sendCommand(uint8_t command) {
     sharedSpi.beginTransaction(spiSettings);
     csLow();
     transfer(command);
+    delayMicroseconds(2);   // tSCCS: 4 tCLK before CS HIGH
     csHigh();
     sharedSpi.endTransaction();
-    delayMicroseconds(4);
+    delayMicroseconds(4);   // tSDECODE: command decode time
 }
 
 void ADS1299::WAKEUP() { sendCommand(_WAKEUP); }
@@ -155,6 +181,7 @@ uint8_t ADS1299::readRegister(uint8_t address) {
     transfer(0x00);
     delayMicroseconds(2);
     value = transfer(0x00);
+    delayMicroseconds(2);   // tSCCS
     csHigh();
     sharedSpi.endTransaction();
     return value;
@@ -174,6 +201,7 @@ void ADS1299::readRegisters(uint8_t startAddress, uint8_t count, uint8_t* data) 
     for (uint8_t i = 0; i < count; ++i) {
         data[i] = transfer(0x00);
     }
+    delayMicroseconds(2);   // tSCCS
     csHigh();
     sharedSpi.endTransaction();
 }
@@ -186,6 +214,7 @@ void ADS1299::writeRegister(uint8_t address, uint8_t value) {
     transfer(0x00);
     delayMicroseconds(2);
     transfer(value);
+    delayMicroseconds(2);   // tSCCS
     csHigh();
     sharedSpi.endTransaction();
     delayMicroseconds(3);
@@ -225,11 +254,15 @@ bool ADS1299::applyCytonDefaults(uint8_t dataRateBits) {
     leadOffSenseP = 0;
     leadOffSenseN = 0;
 
-    for (uint8_t ch = 0; ch < activeChannels; ++ch) {
-        channelSettings[ch] = 0x68;
+    for (uint8_t ch = 0; ch < outputChannels && ch < 8; ++ch) {
+        if (ch < activeChannels) {
+            channelSettings[ch] = 0x68;
+            biasSenseP |= static_cast<uint8_t>(1U << ch);
+            biasSenseN |= static_cast<uint8_t>(1U << ch);
+        } else {
+            channelSettings[ch] = static_cast<uint8_t>(kPowerDownMask | 0x61);
+        }
         writeRegister(CH1SET + ch, channelSettings[ch]);
-        biasSenseP |= static_cast<uint8_t>(1U << ch);
-        biasSenseN |= static_cast<uint8_t>(1U << ch);
     }
 
     writeRegister(BIAS_SENSP, biasSenseP);
@@ -394,17 +427,14 @@ bool ADS1299::configureChannel(
 }
 
 bool ADS1299::startContinuousConversion() {
+    // Only enter RDATAC mode — caller manages START pin
     RDATAC();
-    delay(1);
-    digitalWrite(pinSTART, HIGH);
-    START();
     running = true;
     return true;
 }
 
 bool ADS1299::stopContinuousConversion() {
-    digitalWrite(pinSTART, LOW);
-    STOP();
+    // Only exit RDATAC mode — caller manages START pin
     SDATAC();
     running = false;
     return true;
@@ -441,7 +471,7 @@ bool ADS1299::readDataFrame(int32_t channels[8], uint32_t& status) {
         status = (status << 8) | transfer(0x00);
     }
 
-    for (uint8_t ch = 0; ch < activeChannels; ++ch) {
+    for (uint8_t ch = 0; ch < outputChannels && ch < 8; ++ch) {
         uint32_t raw = 0;
         raw = (raw << 8) | transfer(0x00);
         raw = (raw << 8) | transfer(0x00);
@@ -450,13 +480,16 @@ bool ADS1299::readDataFrame(int32_t channels[8], uint32_t& status) {
         if (raw & 0x00800000UL) {
             raw |= 0xFF000000UL;
         }
-        channels[ch] = static_cast<int32_t>(raw);
+        if (ch < activeChannels) {
+            channels[ch] = static_cast<int32_t>(raw);
+        }
     }
 
     for (uint8_t ch = activeChannels; ch < 8; ++ch) {
         channels[ch] = 0;
     }
 
+    delayMicroseconds(2);   // tSCCS: 4 tCLK before CS HIGH
     csHigh();
     sharedSpi.endTransaction();
 
@@ -469,6 +502,14 @@ int8_t ADS1299::getDRDYPin() const {
 
 bool ADS1299::isRunning() const {
     return running;
+}
+
+uint8_t ADS1299::getDeviceId() const {
+    return deviceId;
+}
+
+uint8_t ADS1299::getOutputChannelCount() const {
+    return outputChannels;
 }
 
 void ADS1299::printRegisters(Stream& stream, const char* label) {
