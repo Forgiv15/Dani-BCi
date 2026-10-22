@@ -1,14 +1,20 @@
-# ESP32 + Dual ADS1299-4 OpenBCI Compatibility Notes
+# ESP32 + Dual ADS1299 OpenBCI Compatibility Notes
 
 ## What this firmware emulates
 
-This project now emulates an **8-channel Cyton-style serial board** for OpenBCI GUI:
+This project emulates a **Cyton-style serial board** for OpenBCI GUI. The
+channel count is selected at build time with `ADS1299_CHANNELS_PER_CHIP`
+(see `src/main.cpp`):
 
-- 8 EEG channels (4 from ADS1 + 4 from ADS2)
-- Cyton packet framing: `0xA0 ... 0xC0`
-- 33-byte packet length
-- 24-bit signed channel payloads (big-endian per channel)
-- 3 aux channels (currently zeros)
+- **ADS1299-4** (`ADS1299_CHANNELS_PER_CHIP = 4`): 8 EEG channels
+  (4 from ADS1 + 4 from ADS2), sent as a standard **8-channel Cyton**.
+- **ADS1299-6** (`ADS1299_CHANNELS_PER_CHIP = 6`): 12 EEG channels
+  (6 from ADS1 + 6 from ADS2), sent as **16-channel Cyton+Daisy** using the
+  official interleaved wire format (odd samples = board, even = daisy).
+
+Both modes use the standard Cyton packet framing: `0xA0 ... 0xC0`, a 33-byte
+packet, 24-bit signed channel payloads (big-endian per channel), and 3 aux
+channels (accelerometer at 25 Hz).
 
 ## OpenBCI GUI transport expectations
 
@@ -18,7 +24,8 @@ OpenBCI GUI Cyton serial mode expects a USB serial port. This is exactly what th
 
 - Use your USB-UART connection to the ESP32
 - Baud configured in firmware: `115200`
-- GUI should be set to **Cyton** + **Serial**
+- 8-channel build: set the GUI board type to **Cyton**
+- 12-channel build: set the GUI board type to **Cyton + Daisy (16 ch)**
 
 ### 2) Bluetooth
 
@@ -39,28 +46,149 @@ Implemented in firmware command parser:
 - `b` start streaming
 - `s` stop streaming
 - `d` apply default ADS settings
-- `c` announce 8-channel mode (`daisy removed`)
-- `C` reject daisy request (`no daisy to attach`)
+- `c` 8-channel mode (`daisy removed$$$` when daisy is active)
+- `C` 16-channel mode (`16$$$` / `daisy attached16$$$` / `no daisy to attach!8$$$`)
 - `~0..~6` data-rate selection (ADS1299 DR bits)
-- `x...X` per-channel ADS settings command
+- `x...X` per-channel ADS settings command (channels `1-8` = board, `Q I` = daisy)
 - `z...Z` impedance-mode style command (basic support)
-- legacy channel toggles: `1..8` off, `!@#$%^&*` on
+- legacy channel toggles: `1..8` off, `!@#$%^&*` on, daisy `q..i` off / `Q..I` on
 
-## ADS1299 defaults applied (Cyton-like)
+## Power-on self test
 
-On startup and `d` command:
+Every boot runs a self test (~6 s) before any streaming starts and prints the
+result on the serial monitor at 115200 baud. Nothing else is needed to know
+whether the board is healthy:
 
-- Data rate = `250 SPS` (`CONFIG1[2:0] = 110`)
-- Gain = `x24`
-- Input type = `NORMAL`
-- Bias include = ON
-- SRB2 = ON
-- SRB1 = OFF
+```
+=== OpenBCI ESP32 power-on self test ===
+Hardware    : ADS1299-6 x2 = 12 channels (Cyton+Daisy 16ch emulation)
+Sample rate : 250 Hz
+--- SPI bus probe ---
+bus       : SCLK=18 MISO=19 MOSI=23 @ 1 MHz, mode 1 (CPOL=0 CPHA=1)
+CS pins   : ADS1=5 ADS2=4 (must idle HIGH)
+levels    : CS1=1 CS2=1 DRDY1=1 DRDY2=1 RESET=1 PWDN=1 START=0
+idle MISO : 0xFF (no CS asserted) - floating/pulled high
+[ADS1] RREG(0x00) raw: opcode=0x00 count=0x00 data=0x3D -> ID=0x3D
+[ADS1] regs 00-17: 3D 96 C0 EC 00 61 61 61 61 61 61 00 00 00 00 00 00 00 00 00 0F 00 00 00
+[ADS2] RREG(0x00) raw: opcode=0x00 count=0x00 data=0x3D -> ID=0x3D
+[ADS2] regs 00-17: 3D 96 C0 EC 00 61 61 61 61 61 61 00 00 00 00 00 00 00 00 00 0F 00 00 00
+[SPI]  CS isolates devices        OK : ADS1=0xA5/0x5A (want 0xA5/0x5A), ADS2=0x00/0x00
+[ADS1] SPI + device ID             OK : id=0x3D (expected 0x3D)
+[ADS1] CLK_EN (clock master)       OK : CONFIG1=0xF6, CLK_EN=1, expected=1
+[ADS1] DRDY / clock present        OK : DRDY 250 Hz (expected 250 Hz)
+[ADS1] RDATAC frame                OK : status=0xC00000 ch1=-3 (status nibble must be 0xC)
+[ADS1] AFE shorted input           OK : worst mean=0.31uV rms=0.42uV railed=0.0%
+[ADS1] AFE internal test signal    OK : amp 1861..1864uV (expect ~1875uV) railed=0.0%
+[ADS2] SPI + device ID             OK : id=0x3D (expected 0x3D)
+[ADS2] CLK_EN (clock master)       OK : CONFIG1=0xD6, CLK_EN=0, expected=0
+[ADS2] DRDY / clock present        OK : DRDY 250 Hz (expected 250 Hz)
+[ADS2] RDATAC frame                OK : status=0xC00000 ch1=-1 (status nibble must be 0xC)
+[ADS2] AFE shorted input           OK : worst mean=0.28uV rms=0.39uV railed=0.0%
+[ADS2] AFE internal test signal    OK : amp 1858..1863uV (expect ~1875uV) railed=0.0%
+[AUX]  LIS3DH present              OK : address=0x18 WHO_AM_I=0x33
+[AUX]  LIS3DH data read            OK : X=-12 Y=41 Z=998 (4g range, ~500 LSB per g)
+[SD]   SD card present             OK : type=3 size=7624MB
+=== POST PASSED (15 checks, 0 failed) ===
+```
+
+What each check proves:
+
+| Check | Meaning |
+|-------|---------|
+| `--- SPI bus probe ---` | Raw view: pin levels, MISO idle byte, and the exact bytes clocked out of each part |
+| `RREG(0x00) raw` | `data` is the ID register. `0xFF` = nothing driving MISO, `0x00` = line low/shorted |
+| `CS isolates devices` | Two patterns written to ADS1's `LOFF_FLIP`; ADS2 must not see them |
+| `SPI + device ID` | SPI wiring/CS is good and the fitted part reports the right channel count (`0x3C`=4ch, `0x3D`=6ch, `0x3E`=8ch) |
+| `CLK_EN (clock master)` | `CONFIG1` bit 5 read back correctly for this device's role |
+| `DRDY / clock present` | The device is actually converting at 250 SPS. For ADS2 this proves the clock is reaching it from ADS1 |
+| `RDATAC frame` | A real 24-bit data frame was read and its status nibble is `0xC`, proving SPI framing and conversion |
+| `AFE shorted input` | All channels powered up, gain 24, inputs internally shorted → offset and noise should be tiny |
+| `AFE internal test signal` | Internal 1.875 mV square wave reproduced on every channel |
+| `LIS3DH` | I²C address, `WHO_AM_I`, and live axis data |
+| `SD card` | Card detected and readable |
+
+When a check fails, the offending channels are listed individually underneath so
+you can see exactly which input is at fault.
+
+### Interpreting a non-responding ADS1299
+
+| Symptom | Likely cause |
+|---------|--------------|
+| `idle MISO = 0x00`, `data=0x00` | MISO held low — short to GND, or the device never releases DOUT |
+| `data=0xFF` | Nothing drives MISO — no power, `PWDN` low, or wrong `CS` pin |
+| ID valid but `DRDY 0 Hz` and `RDATAC frame` fails | No clock: check `CLKSEL` straps and the `CLK` trace from ADS1 |
+| `CS isolates devices` fails with ADS2 seeing ADS1's data | `CS1`/`CS2` shorted or one is stuck low |
+| ID is `0x3C`/`0x3E` but you fitted a `-6` part | Wrong `ADS1299_CHANNELS_PER_CHIP` for the fitted chip |
+
+If `idle MISO` reports `0xFF` but `data` is also `0xFF`, add a 10 kΩ pull-up from
+MISO to 3.3 V; a completely floating MISO makes the raw byte meaningless.
+
+## Clock wiring (very important)
+
+The two ADS1299s are clocked from a single oscillator:
+
+- **ADS1** has `CLKSEL` tied **high** and `CONFIG1.CLK_EN = 1`, so its internal
+  oscillator is driven out on the `CLK` pin.
+- **ADS2** has `CLKSEL` tied **low**, takes that signal on `CLK` as an external
+  clock, and is configured with `CLK_EN = 0`.
+
+This creates a bootstrapping order that the firmware handles explicitly: ADS2
+**cannot answer on SPI at all** until ADS1 is driving `CLK`, and ADS1 only drives
+`CLK` once `CLK_EN` is written. Bring-up therefore:
+
+1. resets and probes ADS1, then immediately writes `CONFIG1` with `CLK_EN = 1`
+   (`enableClockOutput()`), waits 10 ms,
+2. only then probes ADS2,
+3. re-probes anything that did not answer up to 5 more times,
+4. and re-checks once more at stream start (`recoverMissingDevices()`), configuring
+   anything that has appeared since.
+
+A device that is detected late still gets the full `applyCytonDefaults()` write,
+including `CONFIG3.PD_REFBUF = 1`. Skipping that leaves the part at its reset
+value (`CONFIG3 = 0x60`), which means **the internal reference buffer is off** and
+every sample is meaningless.
+
+If ADS2 reports `DRDY / clock present` as `FAIL`, the clock is not arriving —
+check the `CLK` trace and both `CLKSEL` straps.
+
+## What the SPI bus does during streaming (this is normal)
+
+In `RDATAC` mode the ADS1299 converts continuously on its own. The MCU does not
+send anything meaningful to start a conversion:
+
+- **`START` is driven HIGH once** when streaming begins and stays high. It is not
+  toggled per sample.
+- **`MOSI` carries only `0x00` dummy bytes**, so the line sits at 0 V with no
+  visible transitions. Absence of MOSI activity during streaming is expected.
+- **`SCLK`** shows a burst of 21 clocks (12-channel read) per sample.
+- **`CS`** pulses low for the duration of each read. In 16-channel daisy
+  emulation one device is read per output sample, so each `CS` line pulses at
+  about 125 Hz with a ~2 % duty cycle — a multimeter will show it as constantly
+  high; use a scope to see it.
+- **`DOUT`** streams the data; **`DRDY`** falls once per conversion at 250 Hz.
+
+## ADS1299 register defaults applied (Cyton-like)
+
+On startup, `d` command, and after the self test:
+
+- `CONFIG1`: `DAISY_EN = 1` (multiple readback, since both devices share
+  SCLK/DIN/DOUT with independent CS), `CLK_EN` per device role, `250 SPS`
+- `CONFIG2`: internal test signal off
+- `CONFIG3`: `PD_REFBUF = 1`, `BIASREF_INT = 1`, `PD_BIAS = 1`
+- `CHnSET`: gain = `x24`, input type = `NORMAL`, SRB2 = ON, bias include = ON
 
 ## Channel mapping
 
+ADS1299-4 (8-channel build):
+
 - Channel 1..4 -> ADS1 CH1..CH4
 - Channel 5..8 -> ADS2 CH1..CH4
+
+ADS1299-6 (12-channel, 16-channel daisy emulation):
+
+- Board channels 1..6 -> ADS1 CH1..CH6 (GUI channels 1-6)
+- Daisy channels 9..14 -> ADS2 CH1..CH6 (GUI channels 9-14)
+- GUI channels 7, 8, 15, 16 are zero-padded
 
 ## Packet format detail
 
@@ -69,8 +197,13 @@ Each sample packet (33 bytes):
 1. Byte 0: `0xA0`
 2. Byte 1: sample counter (`0..255`, wraps)
 3. Bytes 2..25: 8 channels × 3 bytes signed 24-bit
-4. Bytes 26..31: aux payload (6 bytes, currently zero)
+4. Bytes 26..31: aux payload (6 bytes, accelerometer X/Y/Z)
 5. Byte 32: `0xC0`
+
+In 16-channel mode the 8 channel slots alternate: odd sample numbers carry the
+board (ADS1) channels, even sample numbers carry the daisy (ADS2) channels. This
+matches the official Cyton+Daisy wire format, so the stock GUI reconstructs both
+halves without any parser changes.
 
 ## Practical setup checklist
 
@@ -79,7 +212,8 @@ Each sample packet (33 bytes):
    - Data source: Cyton (live)
    - Transfer protocol: Serial
    - Correct COM port
-   - 8 channels
+   - 8-channel build: board type **Cyton** (8 channels)
+   - 12-channel build: board type **Cyton + Daisy** (16 channels)
 3. Start session, then stream.
 4. Use GUI Hardware Settings to change gain/input/bias/SRB per channel (handled through `x...X`).
 

@@ -7,6 +7,19 @@
 namespace {
 SPIClass sharedSpi(VSPI);
 bool sharedSpiInitialized = false;
+SemaphoreHandle_t spiMutex = nullptr;
+
+void spiLock() {
+  if (spiMutex != nullptr) {
+    xSemaphoreTake(spiMutex, portMAX_DELAY);
+  }
+}
+
+void spiUnlock() {
+  if (spiMutex != nullptr) {
+    xSemaphoreGive(spiMutex);
+  }
+}
 
 constexpr uint8_t kGainMask = 0x70;
 constexpr uint8_t kInputMask = 0x07;
@@ -14,6 +27,20 @@ constexpr uint8_t kSrb2Mask = 0x08;
 constexpr uint8_t kPowerDownMask = 0x80;
 
 constexpr uint8_t kLeadOffFreq31Hz = 0x02;
+
+// CONFIG1 (datasheet SBAS499C table 13):
+//   bit7 = 1                      (reserved, always write 1)
+//   bit6 = DAISY_EN               (1 = multiple readback mode)
+//   bit5 = CLK_EN                 (1 = internal oscillator driven out on CLK)
+//   bits4:3 = 0b10                (reserved, always write 2h)
+//   bits2:0 = DR[2:0]             (output data rate)
+constexpr uint8_t kConfig1Reserved = 0x80 | 0x10;
+constexpr uint8_t kConfig1DaisyEn = 0x40;
+constexpr uint8_t kConfig1ClkEn = 0x20;
+// Two ADS1299 devices share SCLK/DIN/DOUT with independent CS and DRDY pins,
+// which is "multiple readback" rather than the daisy-chain (DOUT->DAISY_IN)
+// topology, so DAISY_EN must be 1.
+constexpr uint8_t kConfig1Base = kConfig1Reserved | kConfig1DaisyEn;
 }
 
 ADS1299::ADS1299()
@@ -23,10 +50,12 @@ ADS1299::ADS1299()
       pinSTART(-1),
       pinRESET(-1),
       pinPWDN(-1),
+      pinMISO(-1),
       vref(4.5f),
             gain(24),
             activeChannels(8),
             config1Cache(0x96),
+            clockOutput(false),
             biasSenseP(0x00),
             biasSenseN(0x00),
             srb1Mask(0x00),
@@ -50,13 +79,15 @@ bool ADS1299::begin(
     int8_t misoPin,
     int8_t mosiPin,
     uint32_t spiClockHz,
-    uint8_t channelCount
+    uint8_t channelCount,
+    bool pulseControlPins
 ) {
     pinDRDY = drdyPin;
     pinCS = csPin;
     pinSTART = startPin;
     pinRESET = resetPin;
     pinPWDN = pwdnPin;
+    pinMISO = misoPin;
     activeChannels = channelCount;
     if (activeChannels < 1) activeChannels = 1;
     if (activeChannels > 8) activeChannels = 8;
@@ -75,19 +106,25 @@ bool ADS1299::begin(
 
     delay(10);
 
-    digitalWrite(pinPWDN, LOW);
-    delay(5);
-    digitalWrite(pinPWDN, HIGH);
-    delay(20);
+    if (pulseControlPins) {
+        digitalWrite(pinPWDN, LOW);
+        delay(5);
+        digitalWrite(pinPWDN, HIGH);
+        delay(20);
 
-    digitalWrite(pinRESET, LOW);
-    delay(2);
-    digitalWrite(pinRESET, HIGH);
-    delay(20);
+        digitalWrite(pinRESET, LOW);
+        delay(2);
+        digitalWrite(pinRESET, HIGH);
+        delay(20);
+    }
 
     if (!sharedSpiInitialized) {
         sharedSpi.begin(sclkPin, misoPin, mosiPin, pinCS);
         sharedSpiInitialized = true;
+    }
+
+    if (spiMutex == nullptr) {
+        spiMutex = xSemaphoreCreateMutex();
     }
 
     SDATAC();
@@ -102,18 +139,17 @@ bool ADS1299::begin(
 
 void ADS1299::beginConfigTransaction(bool& wasRunning) {
     wasRunning = running;
-    if (wasRunning) {
-        stopContinuousConversion();
-    } else {
-        SDATAC();
-        STOP();
-    }
+    // The START/PWDN/RESET pins are shared between the two ADS1299 devices on
+    // this board, so conversion start/stop is managed globally by the
+    // application. A config transaction only needs the part in SDATAC/STOP.
+    SDATAC();
+    STOP();
+    running = false;
 }
 
 void ADS1299::endConfigTransaction(bool wasRunning) {
-    if (wasRunning) {
-        startContinuousConversion();
-    }
+    (void)wasRunning;
+    // Conversion restart is handled globally by the application.
 }
 
 void ADS1299::csLow() {
@@ -129,12 +165,45 @@ uint8_t ADS1299::transfer(uint8_t data) {
 }
 
 void ADS1299::sendCommand(uint8_t command) {
+    spiLock();
     sharedSpi.beginTransaction(spiSettings);
     csLow();
     transfer(command);
+    // The ADS1299 needs CS held low for 4 tCLK (~2 us) after the last SCLK
+    // edge before it latches the command opcode; releasing CS immediately can
+    // silently drop SDATAC/RDATAC/RESET.
+    delayMicroseconds(2);
     csHigh();
     sharedSpi.endTransaction();
+    spiUnlock();
     delayMicroseconds(4);
+}
+
+void ADS1299::rawReadRegister(uint8_t address, uint8_t trace[3]) {
+    spiLock();
+    sharedSpi.beginTransaction(spiSettings);
+    csLow();
+    delayMicroseconds(2);
+    trace[0] = transfer(_RREG | (address & 0x1F));
+    delayMicroseconds(2);
+    trace[1] = transfer(0x00);
+    delayMicroseconds(2);
+    trace[2] = transfer(0x00);
+    delayMicroseconds(2);
+    csHigh();
+    sharedSpi.endTransaction();
+    spiUnlock();
+}
+
+uint8_t ADS1299::probeIdleMiso() {
+    spiLock();
+    sharedSpi.beginTransaction(spiSettings);
+    // CS stays high, so no device on the bus drives DOUT and the byte shows
+    // whatever the MISO line floats to.
+    const uint8_t value = transfer(0x00);
+    sharedSpi.endTransaction();
+    spiUnlock();
+    return value;
 }
 
 void ADS1299::WAKEUP() { sendCommand(_WAKEUP); }
@@ -148,6 +217,7 @@ void ADS1299::RDATA() { sendCommand(_RDATA); }
 
 uint8_t ADS1299::readRegister(uint8_t address) {
     uint8_t value = 0;
+    spiLock();
     sharedSpi.beginTransaction(spiSettings);
     csLow();
     transfer(_RREG | (address & 0x1F));
@@ -157,6 +227,7 @@ uint8_t ADS1299::readRegister(uint8_t address) {
     value = transfer(0x00);
     csHigh();
     sharedSpi.endTransaction();
+    spiUnlock();
     return value;
 }
 
@@ -165,6 +236,7 @@ void ADS1299::readRegisters(uint8_t startAddress, uint8_t count, uint8_t* data) 
         return;
     }
 
+    spiLock();
     sharedSpi.beginTransaction(spiSettings);
     csLow();
     transfer(_RREG | (startAddress & 0x1F));
@@ -176,9 +248,11 @@ void ADS1299::readRegisters(uint8_t startAddress, uint8_t count, uint8_t* data) 
     }
     csHigh();
     sharedSpi.endTransaction();
+    spiUnlock();
 }
 
 void ADS1299::writeRegister(uint8_t address, uint8_t value) {
+    spiLock();
     sharedSpi.beginTransaction(spiSettings);
     csLow();
     transfer(_WREG | (address & 0x1F));
@@ -188,6 +262,7 @@ void ADS1299::writeRegister(uint8_t address, uint8_t value) {
     transfer(value);
     csHigh();
     sharedSpi.endTransaction();
+    spiUnlock();
     delayMicroseconds(3);
 }
 
@@ -213,7 +288,8 @@ bool ADS1299::applyCytonDefaults(uint8_t dataRateBits) {
     bool wasRunning = false;
     beginConfigTransaction(wasRunning);
 
-    config1Cache = static_cast<uint8_t>(0x90 | (dataRateBits & 0x07));
+    config1Cache = static_cast<uint8_t>(kConfig1Base | (clockOutput ? kConfig1ClkEn : 0x00) |
+                                        (dataRateBits & 0x07));
     writeRegister(CONFIG1, config1Cache);
     writeRegister(CONFIG2, 0xC0);
     writeRegister(CONFIG3, 0xEC);
@@ -251,6 +327,61 @@ bool ADS1299::setDataRateBits(uint8_t dataRateBits) {
     config1Cache = static_cast<uint8_t>((config1Cache & 0xF8) | (dataRateBits & 0x07));
     writeRegister(CONFIG1, config1Cache);
     const bool ok = (readRegister(CONFIG1) & 0x07) == (config1Cache & 0x07);
+    endConfigTransaction(wasRunning);
+    return ok;
+}
+
+void ADS1299::setClockOutput(bool enable) {
+    clockOutput = enable;
+}
+
+bool ADS1299::isClockOutputEnabled() const {
+    return clockOutput;
+}
+
+uint8_t ADS1299::config1Value() const {
+    return config1Cache;
+}
+
+bool ADS1299::enableClockOutput() {
+    clockOutput = true;
+
+    bool wasRunning = false;
+    beginConfigTransaction(wasRunning);
+
+    config1Cache = static_cast<uint8_t>(kConfig1Base | kConfig1ClkEn | (config1Cache & 0x07));
+    writeRegister(CONFIG1, config1Cache);
+    // Let the oscillator stabilise on the CLK pin before a slave samples it.
+    delay(2);
+    const bool ok = (readRegister(CONFIG1) & kConfig1ClkEn) != 0;
+
+    endConfigTransaction(wasRunning);
+    return ok;
+}
+
+bool ADS1299::detect() {
+    SDATAC();
+    delay(1);
+    const uint8_t id = readRegister(ID);
+    return (id != 0x00) && (id != 0xFF);
+}
+
+bool ADS1299::verifyClockOutput(bool expected) {
+    const uint8_t want = static_cast<uint8_t>(expected ? (config1Cache | kConfig1ClkEn)
+                                                      : (config1Cache & ~kConfig1ClkEn));
+    bool wasRunning = false;
+    beginConfigTransaction(wasRunning);
+
+    config1Cache = want;
+    writeRegister(CONFIG1, config1Cache);
+
+    bool ok = (readRegister(CONFIG1) & kConfig1ClkEn) == (want & kConfig1ClkEn);
+    if (!ok) {
+        writeRegister(CONFIG1, config1Cache);
+        delay(1);
+        ok = (readRegister(CONFIG1) & kConfig1ClkEn) == (want & kConfig1ClkEn);
+    }
+
     endConfigTransaction(wasRunning);
     return ok;
 }
@@ -433,6 +564,7 @@ bool ADS1299::readDataFrame(int32_t channels[8], uint32_t& status) {
         return false;
     }
 
+    spiLock();
     sharedSpi.beginTransaction(spiSettings);
     csLow();
 
@@ -459,6 +591,7 @@ bool ADS1299::readDataFrame(int32_t channels[8], uint32_t& status) {
 
     csHigh();
     sharedSpi.endTransaction();
+    spiUnlock();
 
     return true;
 }
