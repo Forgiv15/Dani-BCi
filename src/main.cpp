@@ -17,6 +17,7 @@ static constexpr int PIN_ADS2_CS = 4;
 static constexpr int PIN_ADS_START = 25;
 static constexpr int PIN_ADS_RESET = 17;
 static constexpr int PIN_ADS_PWDN = 2;
+static constexpr int PIN_STATUS_LED = 27;
 static constexpr int PIN_LIS3DH_CS = 26;
 static constexpr int PIN_LIS3DH_SDA = 21;
 static constexpr int PIN_LIS3DH_SCL = 22;
@@ -133,6 +134,17 @@ static File sdFile;
 static char sdFileName[24] = {0};
 static uint32_t sdRecordStartMs = 0;
 static uint32_t sdRecordDurationMs = 0;
+
+static void ledBlinkTask(void* parameter) {
+  (void)parameter;
+  bool ledOn = false;
+
+  for (;;) {
+    ledOn = !ledOn;
+    digitalWrite(PIN_STATUS_LED, ledOn ? HIGH : LOW);
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
 
 struct SdModeSetting {
   char command;
@@ -1522,6 +1534,10 @@ static void bringUpDevices() {
 void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(1200);
+
+  pinMode(PIN_STATUS_LED, OUTPUT);
+  digitalWrite(PIN_STATUS_LED, LOW);
+  xTaskCreate(ledBlinkTask, "ledBlink", 1024, nullptr, tskIDLE_PRIORITY, nullptr);
 
   bringUpDevices();
   applyDefaultChannelState();
