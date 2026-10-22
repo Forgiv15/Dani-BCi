@@ -573,7 +573,11 @@ bool ADS1299::readDataFrame(int32_t channels[8], uint32_t& status) {
         status = (status << 8) | transfer(0x00);
     }
 
-    for (uint8_t ch = 0; ch < activeChannels; ++ch) {
+    // The RDATAC frame is always status + 8 channel slots (216 bits). Clock the
+    // whole frame even on a 6-channel part: stopping early leaves the device
+    // mid-frame, and a read that crosses a conversion reload then returns
+    // bit-shifted channel data.
+    for (uint8_t ch = 0; ch < 8; ++ch) {
         uint32_t raw = 0;
         raw = (raw << 8) | transfer(0x00);
         raw = (raw << 8) | transfer(0x00);
@@ -582,11 +586,7 @@ bool ADS1299::readDataFrame(int32_t channels[8], uint32_t& status) {
         if (raw & 0x00800000UL) {
             raw |= 0xFF000000UL;
         }
-        channels[ch] = static_cast<int32_t>(raw);
-    }
-
-    for (uint8_t ch = activeChannels; ch < 8; ++ch) {
-        channels[ch] = 0;
+        channels[ch] = (ch < activeChannels) ? static_cast<int32_t>(raw) : 0;
     }
 
     csHigh();

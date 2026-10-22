@@ -12,9 +12,10 @@ the user-supplied sampling rate for reproducibility.
 from __future__ import annotations
 
 import csv
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -289,7 +290,7 @@ def _describe_format(delimiter: str, has_header: bool) -> str:
 def _recommend_channel_columns(numeric_columns: Sequence[str]) -> list[str]:
     direct_match = [column for column in numeric_columns if column.lower().startswith(("ch ", "ch", "eeg"))]
     if direct_match:
-        return direct_match[:8]
+        return direct_match[:32]
 
     excluded_tokens = ("time", "timestamp", "elapsed", "sample", "index", "accel", "aux", "marker")
     preferred = [
@@ -298,10 +299,10 @@ def _recommend_channel_columns(numeric_columns: Sequence[str]) -> list[str]:
         if not any(token in column.lower() for token in excluded_tokens)
     ]
     if preferred:
-        return preferred[:8]
+        return preferred[:32]
 
     fallback = [column for column in numeric_columns if "sample" not in column.lower()]
-    return list(fallback[:8] if fallback else numeric_columns[:8])
+    return list(fallback[:32] if fallback else numeric_columns[:32])
 
 
 def _normalize_timebase(timestamp_values: np.ndarray, sample_rate: float) -> np.ndarray:
@@ -343,3 +344,42 @@ def _clean_channel_name(column_name: str, index: int) -> str:
     if not text:
         return f"Ch {index + 1}"
     return text
+
+
+def read_openbci_metadata(file_path: str | Path, max_lines: int = 128) -> dict[str, str]:
+    """Parse the ``%Key = Value`` comment block of an OpenBCI-style CSV."""
+
+    metadata: dict[str, str] = {}
+    path = Path(file_path)
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line_number, line in enumerate(handle):
+            if line_number >= max_lines:
+                break
+            if not line.startswith("%"):
+                if line.strip():
+                    break
+                continue
+            body = line[1:].strip()
+            if not body:
+                continue
+            if "=" in body:
+                key, value = body.split("=", 1)
+                metadata[key.strip()] = value.strip()
+            else:
+                metadata.setdefault("format", body)
+    return metadata
+
+
+def openbci_sample_rate(metadata: Mapping[str, str]) -> Optional[float]:
+    """Return the sample rate recorded in an OpenBCI header, if present."""
+
+    value = ""
+    for key, item in metadata.items():
+        if key.lower() == "sample rate":
+            value = item
+            break
+    match = re.search(r"[-+]?[0-9]*\.?[0-9]+", value)
+    if not match:
+        return None
+    rate = float(match.group(0))
+    return rate if rate > 0 else None

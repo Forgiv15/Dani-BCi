@@ -49,7 +49,7 @@ static constexpr uint8_t WIRE_CHANNELS = 8;                                 // a
 static constexpr uint8_t GUI_CHANNELS = (TOTAL_ADS_CHANNELS == 8) ? 8 : 16; // channels the GUI sees
 static constexpr bool DAISY_MODE = (TOTAL_ADS_CHANNELS > 8);                // interleaved 16ch emulation
 
-static constexpr uint32_t SERIAL_BAUD = 115200;
+static constexpr uint32_t SERIAL_BAUD = 921600;
 static constexpr uint32_t SERIAL_TX_BUFFER = 4096;
 static constexpr bool USE_DEBUG_APP_MODE = false;
 static constexpr uint32_t LIS3DH_I2C_CLOCK_HZ = 400000;
@@ -152,6 +152,13 @@ static uint8_t lis3dhAddress = LIS3DH_ADDR_LOW;
 static uint8_t lis3dhWhoAmI = 0x00;
 static volatile int16_t gAuxData[3] = {0, 0, 0};
 static SemaphoreHandle_t auxMutex = nullptr;
+// Given from the DRDY ISR, taken by the acquisition task. Using a real
+// blocking wait (instead of polling a flag) lets the idle task run, which keeps
+// the task watchdog quiet and removes the multi-second jitter.
+static SemaphoreHandle_t conversionSem = nullptr;
+static volatile uint32_t missedConversions = 0;
+static volatile uint32_t droppedPackets = 0;
+static volatile uint32_t corruptFrames = 0;
 static bool sdPresent = false;
 static volatile bool sdRecording = false;
 static File sdFile;
@@ -537,6 +544,15 @@ static void emitFailure(const char* msg) {
   }
 }
 
+// One packet is 33 bytes on the wire (10 bits per byte). Keeping 10% headroom
+// guarantees Serial.write() never blocks or truncates, so the acquisition task
+// always reads the converters right after DRDY.
+static uint32_t maxSustainedPacketRate() {
+  constexpr uint32_t PACKET_WIRE_BYTES = 33;
+  const uint32_t usableBitsPerSecond = (SERIAL_BAUD / 10UL) * 9UL;
+  return usableBitsPerSecond / (PACKET_WIRE_BYTES * 10UL);
+}
+
 static uint16_t sampleRateFromCode(uint8_t code) {
   static const uint16_t sampleRates[] = {16000, 8000, 4000, 2000, 1000, 500, 250};
   if (code > 6) {
@@ -635,6 +651,9 @@ static void printVersionInfo() {
   Serial.print("SD card: ");
   Serial.println(sdPresent ? "present" : "not present");
   Serial.println("Firmware: v3.1.5");
+  Serial.print("Serial link limit: ");
+  Serial.print(maxSustainedPacketRate());
+  Serial.println(" SPS");
   Serial.print("$$$");
 }
 
@@ -858,6 +877,9 @@ static void startStreaming() {
   recoverMissingDevices();
 
   sampleCounter = 0;
+  missedConversions = 0;
+  droppedPackets = 0;
+  corruptFrames = 0;
   for (size_t i = 0; i < DEVICE_COUNT; ++i) {
     devices[i].drdyPending = false;
   }
@@ -892,51 +914,41 @@ static bool waitForDeviceDrdy(DeviceCtx& dev, uint32_t timeoutMs) {
   return true;
 }
 
+// The 24-bit status word of every RDATAC frame starts with 1100b (datasheet
+// section on the data output format). Anything else means the SPI read was
+// misaligned or the part was not in RDATAC, in which case the sample must be
+// discarded rather than published as a spike.
 static bool readDeviceFrame(DeviceCtx& dev, int32_t channels[TOTAL_ADS_CHANNELS]) {
-  int32_t frame[8] = {0};
-  uint32_t status = 0;
-  if (!dev.ads->readDataFrame(frame, status)) {
-    return false;
-  }
+  // A frame is only valid if no conversion boundary happened while the bytes
+  // were being clocked out. Reading across a DRDY reload returns a bit-shifted
+  // frame whose status nibble can still look valid, which is what produced
+  // single-sample spikes on every channel of that converter.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    int32_t frame[8] = {0};
+    uint32_t status = 0;
+    const uint32_t drdyBefore = dev.drdyCount;
 
-  for (uint8_t ch = 0; ch < dev.channelCount; ++ch) {
-    channels[dev.channelOffset + ch] = frame[ch];
-  }
-  return true;
-}
-
-static bool readBothSamples(int32_t channels[TOTAL_ADS_CHANNELS]) {
-  memset(channels, 0, sizeof(int32_t) * TOTAL_ADS_CHANNELS);
-
-  bool anyOnline = false;
-  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
-    anyOnline = anyOnline || devices[i].linkOk;
-  }
-  if (!anyOnline) {
-    return false;
-  }
-
-  const uint32_t timeout = drdyTimeoutMs();
-  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
-    if (!devices[i].linkOk) {
-      continue;
-    }
-    if (!waitForDeviceDrdy(devices[i], timeout)) {
+    if (!dev.ads->readDataFrame(frame, status)) {
       return false;
     }
-  }
 
-  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
-    if (!devices[i].linkOk) {
+    if ((status >> 20) != 0xC) {
+      corruptFrames++;
       continue;
     }
-    if (!readDeviceFrame(devices[i], channels)) {
-      return false;
+
+    if (dev.drdyCount != drdyBefore) {
+      corruptFrames++;
+      continue;
     }
-    devices[i].drdyPending = false;
+
+    for (uint8_t ch = 0; ch < dev.channelCount; ++ch) {
+      channels[dev.channelOffset + ch] = frame[ch];
+    }
+    return true;
   }
 
-  return true;
+  return false;
 }
 
 static void pack24be(int32_t value, uint8_t* out3) {
@@ -968,32 +980,33 @@ static void fillAuxPayload(uint8_t packet[33], int16_t auxOut[3]) {
   pack16be(localAux[2], &packet[30]);
 }
 
-static void writeOpenBCIPacket(const int32_t channels[TOTAL_ADS_CHANNELS], bool boardSample) {
+// Publishes one conversion. Both ADS1299s are sampled on every DRDY edge, so
+// `fresh` always holds up-to-date data for all real channels. In 16-channel
+// daisy emulation only one converter's channels fit in a packet, so packets
+// alternate and each sent value is the average of the last two conversions of
+// that converter - the same scheme the stock Cyton+Daisy firmware uses.
+static void publishConversion(const int32_t fresh[TOTAL_ADS_CHANNELS], const int32_t previous[TOTAL_ADS_CHANNELS],
+                              bool havePrevious, uint32_t sequence) {
+  const bool boardSample = (sequence & 1) != 0;
+  const uint8_t packetIndex = static_cast<uint8_t>(sequence);
+
   uint8_t packet[33];
-  const uint8_t packetIndex = sampleCounter;
   packet[0] = PACKET_START_BYTE;
-  packet[1] = sampleCounter++;
+  packet[1] = packetIndex;
 
   uint8_t offset = 2;
   for (uint8_t slot = 0; slot < WIRE_CHANNELS; ++slot) {
     int32_t value = 0;
 
     if (daisyActive) {
-      if (boardSample) {
-        // Board (ADS1) channels occupy slots 1..6, slots 7..8 are zero.
-        if (slot < ADS_CHANNELS_PER_CHIP) {
-          value = channels[slot];
-        }
-      } else {
-        // Daisy (ADS2) channels occupy slots 1..6, slots 7..8 are zero.
-        if (slot < ADS_CHANNELS_PER_CHIP) {
-          value = channels[ADS_CHANNELS_PER_CHIP + slot];
-        }
+      // Slots 1..6 carry the active converter, slots 7..8 stay zero.
+      if (slot < ADS_CHANNELS_PER_CHIP) {
+        const uint8_t real = boardSample ? slot : static_cast<uint8_t>(ADS_CHANNELS_PER_CHIP + slot);
+        value = havePrevious ? ((previous[real] + fresh[real]) / 2) : fresh[real];
       }
     } else {
-      // Plain 8-channel mode: every packet carries all real channels.
       if (slot < TOTAL_ADS_CHANNELS) {
-        value = channels[slot];
+        value = fresh[slot];
       }
     }
 
@@ -1004,9 +1017,17 @@ static void writeOpenBCIPacket(const int32_t channels[TOTAL_ADS_CHANNELS], bool 
   int16_t currentAux[3] = {0, 0, 0};
   fillAuxPayload(packet, currentAux);
   packet[32] = PACKET_END_STANDARD;
+  queueSampleForSd(packetIndex, fresh, currentAux);
+
+  // Never block the acquisition task on the UART: a stalled host must not cost
+  // us a conversion. Dropping a packet is harmless because the GUI maps
+  // board/daisy by the sample-counter parity inside the packet.
+  if (Serial.availableForWrite() < static_cast<int>(sizeof(packet))) {
+    droppedPackets++;
+    return;
+  }
 
   Serial.write(packet, sizeof(packet));
-  queueSampleForSd(packetIndex, channels, currentAux);
 }
 
 static void handleRadioCommandByte(uint8_t cmd) {
@@ -1229,6 +1250,16 @@ static void handleSampleRateChar(char rateChar) {
   }
 
   const uint8_t newRate = static_cast<uint8_t>(rateChar - '0');
+  const uint16_t requestedHz = sampleRateFromCode(newRate);
+  if (requestedHz > maxSustainedPacketRate()) {
+    char msg[96];
+    snprintf(msg, sizeof(msg), "rate %uHz needs %lukbit/s, serial link carries %lukbit/s",
+             static_cast<unsigned>(requestedHz),
+             static_cast<unsigned long>(requestedHz * 33UL * 10UL / 1000UL),
+             static_cast<unsigned long>(SERIAL_BAUD / 1000UL));
+    emitFailure(msg);
+    return;
+  }
   if (setDataRateForAll(newRate)) {
     emitSampleRateResponse();
   } else {
@@ -1643,8 +1674,15 @@ static void handleCommandChar(char cmd) {
       }
       break;
     case 's':
-      stopStreaming();
-      emitSuccess("Stream stopped");
+      if (stopStreaming()) {
+        char msg[112];
+        snprintf(msg, sizeof(msg), "Stream stopped (missed=%lu dropped=%lu corrupt=%lu)",
+                 static_cast<unsigned long>(missedConversions), static_cast<unsigned long>(droppedPackets),
+                 static_cast<unsigned long>(corruptFrames));
+        emitSuccess(msg);
+      } else {
+        emitSuccess("Stream stopped");
+      }
       break;
     case 'v':
       stopStreaming();
@@ -1788,54 +1826,98 @@ static void pollSerialCommands() {
 static void IRAM_ATTR adsDrdyIsr0() {
   devices[0].drdyPending = true;
   devices[0].drdyCount++;
+  BaseType_t woken = pdFALSE;
+  if (conversionSem != nullptr) {
+    xSemaphoreGiveFromISR(conversionSem, &woken);
+  }
+  if (woken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
 }
 
 static void IRAM_ATTR adsDrdyIsr1() {
   devices[1].drdyPending = true;
   devices[1].drdyCount++;
+  BaseType_t woken = pdFALSE;
+  if (conversionSem != nullptr) {
+    xSemaphoreGiveFromISR(conversionSem, &woken);
+  }
+  if (woken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
 }
 
 static void streamingTask(void* parameter) {
   (void)parameter;
 
+  int32_t previous[TOTAL_ADS_CHANNELS] = {0};
+  bool havePrevious = false;
+  bool wasStreaming = false;
+
   for (;;) {
-    if (!streaming || (!devices[0].linkOk && !devices[1].linkOk)) {
-      vTaskDelay(pdMS_TO_TICKS(1));
+    if (!streaming) {
+      wasStreaming = false;
+      havePrevious = false;
+      vTaskDelay(pdMS_TO_TICKS(2));
       continue;
     }
 
-    if (daisyActive) {
-      // 16-channel emulation is interleaved: odd sample numbers carry the
-      // board (ADS1) channels, even sample numbers the daisy (ADS2) channels.
-      // Each device is read only when its own DRDY has fired, so the two
-      // independent clocks can never desynchronize a read.
-      const bool boardSample = (sampleCounter & 1) != 0;
-      DeviceCtx& dev = boardSample ? devices[0] : devices[1];
-
-      if (!dev.linkOk) {
-        // The other device is missing: keep the alternating packet cadence so
-        // the GUI stays in sync, with zeros for the missing half.
-        int32_t channels[TOTAL_ADS_CHANNELS] = {0};
-        writeOpenBCIPacket(channels, boardSample);
-        continue;
+    if (!wasStreaming) {
+      // Consume stale edges left over from the previous session.
+      while (xSemaphoreTake(conversionSem, 0) == pdTRUE) {
       }
+      havePrevious = false;
+      wasStreaming = true;
+    }
 
-      if (!waitForDeviceDrdy(dev, drdyTimeoutMs())) {
-        continue;
-      }
+    // Block until the next conversion. This yields the CPU, so the idle task
+    // and the task watchdog keep running.
+    if (xSemaphoreTake(conversionSem, pdMS_TO_TICKS(50)) != pdTRUE) {
+      missedConversions++;
+      continue;
+    }
 
-      int32_t channels[TOTAL_ADS_CHANNELS] = {0};
-      if (!readDeviceFrame(dev, channels)) {
-        continue;
-      }
-      dev.drdyPending = false;
-      writeOpenBCIPacket(channels, boardSample);
+    // Seed with the previous conversion so a failed read holds the last good
+    // sample instead of publishing zeros or a spike.
+    int32_t fresh[TOTAL_ADS_CHANNELS];
+    if (havePrevious) {
+      memcpy(fresh, previous, sizeof(fresh));
     } else {
-      int32_t channels[TOTAL_ADS_CHANNELS] = {0};
-      if (readBothSamples(channels)) {
-        writeOpenBCIPacket(channels, true);
+      memset(fresh, 0, sizeof(fresh));
+    }
+
+    bool anyLinked = false;
+    bool readFailed = false;
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+      if (!devices[i].linkOk) {
+        continue;
+      }
+      anyLinked = true;
+      if (readDeviceFrame(devices[i], fresh)) {
+        devices[i].drdyPending = false;
+      } else {
+        readFailed = true;
       }
     }
+
+    // Both converters raise one edge per conversion. Discard any second edge
+    // that landed while we were reading, so one conversion produces exactly
+    // one published sample.
+    while (xSemaphoreTake(conversionSem, 0) == pdTRUE) {
+    }
+
+    if (!anyLinked) {
+      missedConversions++;
+      continue;
+    }
+    if (readFailed) {
+      missedConversions++;
+    }
+
+    publishConversion(fresh, previous, havePrevious, sampleCounter);
+    sampleCounter++;
+    memcpy(previous, fresh, sizeof(previous));
+    havePrevious = true;
   }
 }
 
@@ -2450,6 +2532,7 @@ void setup() {
   sdQueue = xQueueCreate(SD_QUEUE_LENGTH, sizeof(SdSample));
   auxMutex = xSemaphoreCreateMutex();
   sdMutex = xSemaphoreCreateMutex();
+  conversionSem = xSemaphoreCreateBinary();
 
   bringUpDevices();
   applyDefaultChannelState();

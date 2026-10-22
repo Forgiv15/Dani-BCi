@@ -46,7 +46,14 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from data_loader import CsvPreview, SignalDataset, load_openbci_csv, sniff_csv_layout
+from data_loader import (
+    CsvPreview,
+    SignalDataset,
+    load_openbci_csv,
+    openbci_sample_rate,
+    read_openbci_metadata,
+    sniff_csv_layout,
+)
 from fft_analysis import (
     DEFAULT_INPUT_ATTENUATOR_RATIO,
     FFTSettings,
@@ -97,7 +104,13 @@ class SelectableViewBox(pg.ViewBox):
 
 
 class ImportOptionsDialog(QDialog):
-    def __init__(self, file_path: Path, preview: CsvPreview, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        file_path: Path,
+        preview: CsvPreview,
+        parent: Optional[QWidget] = None,
+        default_sample_rate: Optional[float] = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("CSV Import Options")
         self.resize(520, 620)
@@ -112,7 +125,7 @@ class ImportOptionsDialog(QDialog):
         self.sample_rate_spin = QDoubleSpinBox()
         self.sample_rate_spin.setRange(0.1, 100_000.0)
         self.sample_rate_spin.setDecimals(3)
-        self.sample_rate_spin.setValue(250.0)
+        self.sample_rate_spin.setValue(float(default_sample_rate) if default_sample_rate else 250.0)
         self.sample_rate_spin.setSuffix(" Hz")
         form.addRow("Sampling rate", self.sample_rate_spin)
 
@@ -251,6 +264,23 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         restore_action = QAction("Restore Original Data", self)
         restore_action.triggered.connect(self.restore_original_data)
         edit_menu.addAction(restore_action)
+
+        window_menu = self.menuBar().addMenu("Window")
+        live_action = QAction("Live recorder", self)
+        live_action.triggered.connect(self.open_live_recorder)
+        window_menu.addAction(live_action)
+
+    def open_live_recorder(self) -> None:
+        """Open the acquisition window, reusing this analyzer for its results."""
+
+        from live_gui import LiveRecorderWindow
+
+        if getattr(self, "_live_window", None) is None:
+            self._live_window = LiveRecorderWindow()
+            self._live_window.attach_analyzer(self)
+        self._live_window.show()
+        self._live_window.raise_()
+        self._live_window.activateWindow()
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -722,6 +752,14 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         file_name, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV files (*.csv);;All files (*)")
         if not file_name:
             return
+        self.open_csv_path(file_name)
+
+    def open_csv_path(self, file_name: str | Path, selection: Optional[tuple[float, float]] = None) -> None:
+        """Load a CSV by path, using the sample rate stored in the file header.
+
+        ``selection`` optionally restricts the analysis region to the given time
+        range (used to analyze a named section of a recording).
+        """
 
         file_path = Path(file_name)
         try:
@@ -730,7 +768,12 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             QMessageBox.critical(self, "CSV Import", f"Could not inspect the CSV file.\n\n{exc}")
             return
 
-        dialog = ImportOptionsDialog(file_path, preview, self)
+        try:
+            default_sample_rate = openbci_sample_rate(read_openbci_metadata(file_path))
+        except OSError:
+            default_sample_rate = None
+
+        dialog = ImportOptionsDialog(file_path, preview, self, default_sample_rate=default_sample_rate)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -767,9 +810,21 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self._rebuild_channel_controls()
         self._rebuild_waveform_items()
         self._initialize_selection()
+
+        section_text = ""
+        if selection is not None and dataset.sample_count > 1:
+            start_s, end_s = sorted((float(selection[0]), float(selection[1])))
+            start_s = max(start_s, float(dataset.time_s[0]))
+            end_s = min(end_s, float(dataset.time_s[-1]))
+            if end_s > start_s:
+                self._set_selection_region(start_s, end_s, refresh=False)
+                self.waveform_plot.setXRange(start_s, end_s, padding=0.02)
+                section_text = f" | section {start_s:.2f}-{end_s:.2f} s"
+
         self._refresh_analysis()
         self.statusBar().showMessage(
-            f"Loaded {dataset.sample_count:,} samples across {dataset.channel_count} channel(s) at {dataset.sample_rate:.3f} Hz."
+            f"Loaded {dataset.sample_count:,} samples across {dataset.channel_count} channel(s) "
+            f"at {dataset.sample_rate:.3f} Hz.{section_text}"
         )
 
     def _rebuild_channel_controls(self) -> None:
@@ -1765,7 +1820,12 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
 def main() -> None:
     pg.setConfigOptions(antialias=False, background="w", foreground="k")
     app = QApplication(sys.argv)
-    window = ScientificSignalAnalyzerWindow()
+    if "--live" in sys.argv:
+        from live_gui import LiveRecorderWindow
+
+        window = LiveRecorderWindow()
+    else:
+        window = ScientificSignalAnalyzerWindow()
     window.show()
     sys.exit(app.exec())
 

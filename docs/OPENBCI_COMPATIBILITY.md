@@ -151,6 +151,39 @@ every sample is meaningless.
 If ADS2 reports `DRDY / clock present` as `FAIL`, the clock is not arriving —
 check the `CLK` trace and both `CLKSEL` straps.
 
+## Acquisition timing and data integrity
+
+The acquisition path is built around the ADS1299's `DRDY` edge, which is the
+only thing that signals "a new conversion is ready":
+
+1. The `DRDY` ISR does nothing but give a binary semaphore and bump a counter.
+2. The acquisition task blocks on that semaphore (a real block, so the idle task
+   and the task watchdog keep running — busy-waiting here starves `IDLE0` and
+   makes the watchdog fire every 5 s, which corrupts the UART stream).
+3. **Both** ADS1299s are read back-to-back immediately after the edge, so each
+   read completes ~400 µs into a 4 ms conversion period. A converter's output
+   register is therefore never read near the moment it is overwritten.
+4. The 24-bit status word of each frame is validated (top nibble must be `1100b`).
+   A misaligned frame is discarded and counted, never published.
+5. In 16-channel daisy emulation each packet carries one converter and the value
+   sent is the average of the last two conversions of that converter — the same
+   decimation scheme the stock Cyton+Daisy firmware uses.
+6. The UART write never blocks: if the host has stalled, the packet is dropped
+   (and counted) instead of costing a conversion.
+
+`s` reports the health counters when streaming stops:
+
+```
+Success: Stream stopped (missed=0 dropped=0 corrupt=0)$$$
+```
+
+- **`missed`** — conversions where no `DRDY` arrived within 50 ms, or where no
+  converter produced a valid frame.
+- **`dropped`** — packets skipped because the host was not reading fast enough.
+- **`corrupt`** — frames rejected by the status-word alignment check.
+
+All three should stay at 0 during normal operation.
+
 ## What the SPI bus does during streaming (this is normal)
 
 In `RDATAC` mode the ADS1299 converts continuously on its own. The MCU does not
@@ -160,11 +193,10 @@ send anything meaningful to start a conversion:
   toggled per sample.
 - **`MOSI` carries only `0x00` dummy bytes**, so the line sits at 0 V with no
   visible transitions. Absence of MOSI activity during streaming is expected.
-- **`SCLK`** shows a burst of 21 clocks (12-channel read) per sample.
-- **`CS`** pulses low for the duration of each read. In 16-channel daisy
-  emulation one device is read per output sample, so each `CS` line pulses at
-  about 125 Hz with a ~2 % duty cycle — a multimeter will show it as constantly
-  high; use a scope to see it.
+- **`SCLK`** shows two bursts of 21 clocks per conversion (one per ADS1299),
+  ~336 µs total.
+- **`CS1` and `CS2`** each pulse low once per conversion at 250 Hz for ~170 µs
+  (~4 % duty). A multimeter will show them as constantly high; use a scope.
 - **`DOUT`** streams the data; **`DRDY`** falls once per conversion at 250 Hz.
 
 ## ADS1299 register defaults applied (Cyton-like)
@@ -216,6 +248,11 @@ halves without any parser changes.
    - 12-channel build: board type **Cyton + Daisy** (16 channels)
 3. Start session, then stream.
 4. Use GUI Hardware Settings to change gain/input/bias/SRB per channel (handled through `x...X`).
+
+The repository also ships its own acquisition window that speaks this protocol
+directly (bulk channel configuration, automatic settings replay on connect,
+recording with named sections, FFT/accelerometer views and a serial monitor):
+see [`docs/LIVE_RECORDER.md`](LIVE_RECORDER.md).
 
 ## EEG quality reminders
 
