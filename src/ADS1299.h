@@ -22,7 +22,7 @@ public:
         int8_t sclkPin,
         int8_t misoPin,
         int8_t mosiPin,
-        uint32_t spiClockHz = 1000000,
+        uint32_t spiClockHz = 2000000,
         uint8_t channelCount = 8,
         bool pulseControlPins = true
     );
@@ -68,6 +68,14 @@ public:
     bool setInputTypeForAllChannels(uint8_t inputTypeOrdinal);
     bool configureLeadOffDetection(uint8_t amplitudeCode, uint8_t freqCode);
     bool setLeadOffForChannel(uint8_t channelIndex, bool pEnable, bool nEnable);
+
+    // SRB1 is one switch for the whole chip (MISC1 bit 5): it ties the negative
+    // input of every channel to the SRB1 pin. SRB2 is the per-channel switch
+    // (CHnSET bit 3). Both are driven from a single board-wide mode so an
+    // inconsistent combination cannot be programmed.
+    bool setSrb1Routing(bool enable);
+    bool setSrb2ForAllChannels(bool enable);
+    uint8_t misc1Value() const;
     bool configureChannel(
         uint8_t channelIndex,
         bool active,

@@ -50,6 +50,15 @@ Implemented in firmware command parser:
 - `C` 16-channel mode (`16$$$` / `daisy attached16$$$` / `no daisy to attach!8$$$`)
 - `~0..~6` data-rate selection (ADS1299 DR bits)
 - `x...X` per-channel ADS settings command (channels `1-8` = board, `Q I` = daisy)
+- `?` dump every ADS1299 register as plain text
+- `N<0|1|2>` board-wide reference routing (0 = true differential, 1 = SRB1,
+  2 = SRB2). Applied to every converter at once; `x...X` no longer touches
+  `MISC1`, because SRB1 is a single switch per chip and a per-channel request
+  could silently move every other channel's negative input.
+- `P` configuration readback for the GUI: one `[CFG] DEV=ADS1 LINK=1 REGS=<48 hex chars>`
+  line per converter (registers `0x00..0x17`) plus a
+  `[CFG] CODE=.. SPS=.. SPICLK=.. SPILIMIT=.. SERIALLIMIT=.. DONE=1` line.
+  Streaming is paused for the readback and restarted afterwards.
 - `z...Z` impedance-mode style command (basic support)
 - legacy channel toggles: `1..8` off, `!@#$%^&*` on, daisy `q..i` off / `Q..I` on
 
@@ -193,11 +202,51 @@ send anything meaningful to start a conversion:
   toggled per sample.
 - **`MOSI` carries only `0x00` dummy bytes**, so the line sits at 0 V with no
   visible transitions. Absence of MOSI activity during streaming is expected.
-- **`SCLK`** shows two bursts of 21 clocks per conversion (one per ADS1299),
-  ~336 µs total.
-- **`CS1` and `CS2`** each pulse low once per conversion at 250 Hz for ~170 µs
-  (~4 % duty). A multimeter will show them as constantly high; use a scope.
+- **`SCLK`** runs at 2 MHz and shows two bursts of 27 clocks per conversion (one
+  per ADS1299, the full status + 8-channel frame), ~108 µs each and ~216 µs
+  total.
+- **`CS1` and `CS2`** each pulse low once per conversion at 250 Hz for ~110 µs.
+  A multimeter will show them as constantly high; use a scope.
 - **`DOUT`** streams the data; **`DRDY`** falls once per conversion at 250 Hz.
+
+### Bus budgets
+
+The firmware reports both limits in the `v` reply:
+
+```
+Serial link limit: 2513 SPS
+SPI clock: 2000 kHz, frame 216 us x 2 devices, SPI link limit: 4166 SPS
+```
+
+- **Serial (ESP32 → PC)**: 33 bytes per packet at 10 bits/byte, 10 % headroom.
+  This is normally the binding limit.
+- **SPI (ESP32 → 2x ADS1299)**: each converter answers a 216-bit `RDATAC` frame
+  and both are read inside the same sample period (they share `START`), so one
+  sample costs 432 bits = 216 µs at 2 MHz, i.e. at most 4166 SPS with 10 %
+  headroom. A `~` rate request above either limit is refused with the reason.
+
+## Reference / SRB routing
+
+`MISC1` bit 5 (SRB1) closes one switch inside each ADS1299 that connects the
+negative input of **all** channels of that chip to the SRB1 pin, so it is a
+chip-wide setting. `CHnSET` bit 3 (SRB2) is the per-channel equivalent for the
+SRB2 pin. The firmware keeps one board-wide mode and derives both:
+
+| Mode | `MISC1` | `CHnSET` bit 3 | Montage |
+|------|---------|----------------|---------|
+| 0 (differential) | `0x00` | 0 | each channel uses its own INP and INN |
+| 1 (SRB1) | `0x20` | 0 | all INN tied to the SRB1 pin |
+| 2 (SRB2, default) | `0x00` | 1 | all INN switched to the SRB2 pin |
+
+`configureChannel()` only tracks the SRB1 flag; the routing itself is written by
+`setSrb1Routing()` / `setSrb2ForAllChannels()`, and `applyCytonDefaults()` leaves
+`MISC1` alone so a default pass cannot switch the reference off underneath a
+running SRB1 configuration. The mode is re-applied after `d`/`v` and when a
+converter is recovered at stream start.
+
+If a channel reports full-scale input, the mode does not match the wiring: an
+SRB2 mode with the reference electrode on SRB1 (or vice versa) leaves every INN
+floating, and the bias amplifier then drives the inputs into the rail.
 
 ## ADS1299 register defaults applied (Cyton-like)
 

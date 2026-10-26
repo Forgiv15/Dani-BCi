@@ -54,9 +54,18 @@ static constexpr uint32_t SERIAL_TX_BUFFER = 4096;
 static constexpr bool USE_DEBUG_APP_MODE = false;
 static constexpr uint32_t LIS3DH_I2C_CLOCK_HZ = 400000;
 static constexpr uint32_t SD_SPI_CLOCK_HZ = 4000000;
+// ADS1299 SCLK. The datasheet allows up to 4 MHz for reads, but everything on
+// the shared bus is byte-banged through the ESP32 SPI peripheral, so 2 MHz
+// halves the time spent inside a data frame compared to the old 1 MHz setting.
+static constexpr uint32_t ADS_SPI_CLOCK_HZ = 2000000;
 
 static constexpr uint8_t PACKET_START_BYTE = 0xA0;
 static constexpr uint8_t PACKET_END_STANDARD = 0xC0;
+
+// Consecutive failed frame reads before a converter's channels are published as
+// zeros. Small enough to notice a dead path in well under a second, large
+// enough to ride out a single torn frame.
+static constexpr uint8_t STALE_FRAME_LIMIT = 4;
 
 static constexpr uint8_t LOFF_MAG_6NA = 0x00;
 static constexpr uint8_t LOFF_FREQ_31P2HZ = 0x02;
@@ -105,12 +114,13 @@ struct DeviceCtx {
   bool linkOk;
   volatile bool drdyPending;
   volatile uint32_t drdyCount;
+  uint8_t failedReads;
 };
 
 static DeviceCtx devices[] = {
-    {&ads1, "ADS1", PIN_ADS1_DRDY, PIN_ADS1_CS, 0, ADS_CHANNELS_PER_CHIP, 0, true, false, false, 0},
+    {&ads1, "ADS1", PIN_ADS1_DRDY, PIN_ADS1_CS, 0, ADS_CHANNELS_PER_CHIP, 0, true, false, false, 0, 0},
     {&ads2, "ADS2", PIN_ADS2_DRDY, PIN_ADS2_CS, ADS_CHANNELS_PER_CHIP, ADS_CHANNELS_PER_CHIP, 0, false, false,
-     false, 0},
+     false, 0, 0},
 };
 static constexpr size_t DEVICE_COUNT = sizeof(devices) / sizeof(devices[0]);
 
@@ -127,6 +137,28 @@ static ChannelSetting channelSettings[TOTAL_ADS_CHANNELS];
 static bool leadOffP[TOTAL_ADS_CHANNELS];
 static bool leadOffN[TOTAL_ADS_CHANNELS];
 
+// Reference ("SRB") mode, applied to both converters at once.
+//
+// SRB1 is driven by MISC1 bit 5, which is one switch for the entire chip: it
+// ties the negative input of *every* channel to the SRB1 pin. It therefore
+// cannot be a per-channel setting, and a per-channel request that flipped it
+// would silently move every other channel's reference. SRB2 is the
+// per-channel CHnSET bit 3, but the recorder exposes it as one board-wide
+// choice as well, so exactly one of these three states is always programmed.
+static constexpr uint8_t REFERENCE_MODE_DIFFERENTIAL = 0;  // INP/INN from electrodes
+static constexpr uint8_t REFERENCE_MODE_SRB1 = 1;          // all INN -> SRB1 pin
+static constexpr uint8_t REFERENCE_MODE_SRB2 = 2;          // all INN -> SRB2 pin
+static uint8_t referenceMode = REFERENCE_MODE_SRB2;
+
+static const char* referenceModeName(uint8_t mode) {
+  switch (mode) {
+    case REFERENCE_MODE_DIFFERENTIAL: return "differential";
+    case REFERENCE_MODE_SRB1: return "SRB1";
+    case REFERENCE_MODE_SRB2: return "SRB2";
+    default: return "unknown";
+  }
+}
+
 static volatile bool streaming = false;
 static volatile uint8_t sampleCounter = 0;
 static uint8_t sampleRateCode = 0x06;
@@ -135,6 +167,7 @@ static volatile bool daisyActive = DAISY_MODE;
 static bool awaitingSampleRate = false;
 static bool awaitingBoardMode = false;
 static bool awaitingMarker = false;
+static bool awaitingReferenceMode = false;
 static char xPayload[24];
 static uint8_t xLen = 0;
 static bool parsingX = false;
@@ -553,6 +586,32 @@ static uint32_t maxSustainedPacketRate() {
   return usableBitsPerSecond / (PACKET_WIRE_BYTES * 10UL);
 }
 
+// SPI budget between the ESP32 and the converters. One RDATAC frame is always
+// 3 status bytes + 8 channel slots = 27 bytes (216 bits), and both devices are
+// read inside the same sample period because they share START, so every output
+// sample costs two frames on the bus.
+static uint32_t spiFrameTimeUs() {
+  constexpr uint32_t SPI_FRAME_BITS = 3 * 8 + 8 * 8 * 3;  // 216
+  const uint32_t totalBits = SPI_FRAME_BITS * DEVICE_COUNT;
+  return (totalBits * 1000000UL + ADS_SPI_CLOCK_HZ - 1UL) / ADS_SPI_CLOCK_HZ;
+}
+
+// Same 10% headroom as the serial limit: the bus must carry both frames with
+// room left for the register housekeeping the acquisition task does.
+static uint32_t maxSampleRateFromSpi() {
+  const uint32_t frameUs = spiFrameTimeUs();
+  if (frameUs == 0) {
+    return 0;
+  }
+  return 900000UL / frameUs;
+}
+
+static uint32_t maxUsableSampleRate() {
+  const uint32_t serialLimit = maxSustainedPacketRate();
+  const uint32_t spiLimit = maxSampleRateFromSpi();
+  return (spiLimit != 0 && spiLimit < serialLimit) ? spiLimit : serialLimit;
+}
+
 static uint16_t sampleRateFromCode(uint8_t code) {
   static const uint16_t sampleRates[] = {16000, 8000, 4000, 2000, 1000, 500, 250};
   if (code > 6) {
@@ -654,6 +713,17 @@ static void printVersionInfo() {
   Serial.print("Serial link limit: ");
   Serial.print(maxSustainedPacketRate());
   Serial.println(" SPS");
+  Serial.print("SPI clock: ");
+  Serial.print(ADS_SPI_CLOCK_HZ / 1000UL);
+  Serial.print(" kHz, frame ");
+  Serial.print(spiFrameTimeUs());
+  Serial.print(" us x ");
+  Serial.print(static_cast<unsigned>(DEVICE_COUNT));
+  Serial.print(" devices, SPI link limit: ");
+  Serial.print(maxSampleRateFromSpi());
+  Serial.println(" SPS");
+  Serial.print("Reference mode: ");
+  Serial.println(referenceModeName(referenceMode));
   Serial.print("$$$");
 }
 
@@ -730,14 +800,18 @@ static bool applyChannelToHardware(uint8_t channelIndex) {
 
   const uint8_t localIndex = channelIndex % ADS_CHANNELS_PER_CHIP;
   const ChannelSetting& setting = channelSettings[channelIndex];
+  // SRB2 is only ever programmed when the board is in SRB2 mode, and SRB1
+  // (chip-wide) is never requested from here: the reference mode owns both, so
+  // a stray per-channel digit cannot leave the inputs floating.
+  const bool srb2 = (referenceMode == REFERENCE_MODE_SRB2) && setting.active;
   bool ok = dev.ads->configureChannel(
       localIndex,
       setting.active,
       setting.gainOrdinal,
       setting.inputTypeOrdinal,
       setting.biasInclude,
-      setting.srb2Connect,
-      setting.srb1Connect);
+      srb2,
+      false);
 
   if (!setting.active) {
     leadOffP[channelIndex] = false;
@@ -745,6 +819,36 @@ static bool applyChannelToHardware(uint8_t channelIndex) {
     ok = dev.ads->setLeadOffForChannel(localIndex, false, false) && ok;
   }
 
+  return ok;
+}
+
+// Programs the reference routing for every converter and remembers it, so the
+// next channel write cannot fall back to a different mode.
+static bool applyReferenceToDevice(DeviceCtx& dev) {
+  if (!dev.linkOk) {
+    return true;
+  }
+  bool ok = dev.ads->setSrb1Routing(referenceMode == REFERENCE_MODE_SRB1);
+  ok = dev.ads->setSrb2ForAllChannels(referenceMode == REFERENCE_MODE_SRB2) && ok;
+  return ok;
+}
+
+static bool applyReferenceMode(uint8_t mode) {
+  if (mode > REFERENCE_MODE_SRB2) {
+    return false;
+  }
+
+  const bool wasStreaming = stopStreaming();
+  referenceMode = mode;
+
+  bool ok = true;
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    ok = applyReferenceToDevice(devices[i]) && ok;
+  }
+
+  if (wasStreaming) {
+    startStreaming();
+  }
   return ok;
 }
 
@@ -768,11 +872,15 @@ static void applyDefaultChannelState() {
     channelSettings[i].gainOrdinal = 6;
     channelSettings[i].inputTypeOrdinal = 0;
     channelSettings[i].biasInclude = true;
+    // SRB2 mode is the default because it is what a referential montage with
+    // one reference electrode on the SRB2 pin needs; the recorder overrides
+    // this with an 'N' command as soon as it applies its saved settings.
     channelSettings[i].srb2Connect = true;
     channelSettings[i].srb1Connect = false;
     leadOffP[i] = false;
     leadOffN[i] = false;
   }
+  referenceMode = REFERENCE_MODE_SRB2;
 }
 
 static bool applyDefaultChannelSettings() {
@@ -787,6 +895,9 @@ static bool applyDefaultChannelSettings() {
     }
     ok = devices[i].ads->applyCytonDefaults(sampleRateCode) && ok;
     ok = devices[i].ads->configureLeadOffDetection(LOFF_MAG_6NA, LOFF_FREQ_31P2HZ) && ok;
+    // applyCytonDefaults() only writes CHnSET, so the reference routing has to
+    // be re-programmed or SRB1 could stay enabled from an earlier mode.
+    ok = applyReferenceToDevice(devices[i]) && ok;
   }
 
   if (wasStreaming) {
@@ -841,6 +952,7 @@ static void recoverMissingDevices() {
     dev.deviceId = dev.ads->readRegister(0x00);
     dev.ads->applyCytonDefaults(sampleRateCode);
     dev.ads->configureLeadOffDetection(LOFF_MAG_6NA, LOFF_FREQ_31P2HZ);
+    applyReferenceToDevice(dev);
     for (uint8_t ch = 0; ch < dev.channelCount; ++ch) {
       applyChannelToHardware(static_cast<uint8_t>(dev.channelOffset + ch));
     }
@@ -1238,6 +1350,26 @@ static void emitSampleRateResponse() {
   emitSuccess(msg);
 }
 
+// Reads the digit after an 'N' command and programs the board-wide reference
+// mode. Sent by the recorder after the per-channel writes, so the SRB state is
+// always the last thing that changes and can never be left half applied.
+static void handleReferenceModeChar(char modeChar) {
+  if (modeChar < '0' || modeChar > '2') {
+    emitFailure("invalid reference mode (0=diff, 1=SRB1, 2=SRB2)");
+    return;
+  }
+
+  const uint8_t mode = static_cast<uint8_t>(modeChar - '0');
+  char msg[72];
+  if (applyReferenceMode(mode)) {
+    snprintf(msg, sizeof(msg), "Reference mode %s", referenceModeName(mode));
+    emitSuccess(msg);
+  } else {
+    snprintf(msg, sizeof(msg), "reference mode %s failed", referenceModeName(mode));
+    emitFailure(msg);
+  }
+}
+
 static void handleSampleRateChar(char rateChar) {
   if (rateChar == '~') {
     emitSampleRateResponse();
@@ -1251,12 +1383,20 @@ static void handleSampleRateChar(char rateChar) {
 
   const uint8_t newRate = static_cast<uint8_t>(rateChar - '0');
   const uint16_t requestedHz = sampleRateFromCode(newRate);
-  if (requestedHz > maxSustainedPacketRate()) {
-    char msg[96];
-    snprintf(msg, sizeof(msg), "rate %uHz needs %lukbit/s, serial link carries %lukbit/s",
-             static_cast<unsigned>(requestedHz),
-             static_cast<unsigned long>(requestedHz * 33UL * 10UL / 1000UL),
-             static_cast<unsigned long>(SERIAL_BAUD / 1000UL));
+  if (requestedHz > maxUsableSampleRate()) {
+    char msg[128];
+    if (maxSampleRateFromSpi() < maxSustainedPacketRate()) {
+      snprintf(msg, sizeof(msg), "rate %uHz needs %luus per SPI frame, SPI link at %lukHz allows %luSPS",
+               static_cast<unsigned>(requestedHz),
+               static_cast<unsigned long>(spiFrameTimeUs()),
+               static_cast<unsigned long>(ADS_SPI_CLOCK_HZ / 1000UL),
+               static_cast<unsigned long>(maxSampleRateFromSpi()));
+    } else {
+      snprintf(msg, sizeof(msg), "rate %uHz needs %lukbit/s, serial link carries %lukbit/s",
+               static_cast<unsigned>(requestedHz),
+               static_cast<unsigned long>(requestedHz * 33UL * 10UL / 1000UL),
+               static_cast<unsigned long>(SERIAL_BAUD / 1000UL));
+    }
     emitFailure(msg);
     return;
   }
@@ -1373,6 +1513,47 @@ static void printAllRegisters() {
     }
     Serial.println(lis3dhWhoAmI, HEX);
     Serial.print("$$$");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Configuration readback ("P")
+//
+// The GUI writes settings with x/~ commands and only sees a per-command
+// acknowledgement. This command clocks every register of both converters back
+// out so the GUI can compare the whole chip state (CONFIG1..CONFIG4, each
+// CHnSET, the bias masks and MISC1) against what it asked for, instead of
+// trusting the write acknowledgements alone.
+// ---------------------------------------------------------------------------
+static void emitConfigurationReport() {
+  const bool wasStreaming = stopStreaming();
+
+  Serial.println("[CFG] BEGIN");
+
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    DeviceCtx& dev = devices[i];
+    uint8_t regs[CONFIG4 + 1] = {0};
+    if (dev.linkOk) {
+      dev.ads->readRegisters(0x00, CONFIG4 + 1, regs);
+    }
+    char regsHex[(CONFIG4 + 1) * 2 + 1];
+    for (uint8_t address = 0; address <= CONFIG4; ++address) {
+      snprintf(&regsHex[address * 2], 3, "%02X", regs[address]);
+    }
+    regsHex[(CONFIG4 + 1) * 2] = '\0';
+    Serial.printf("[CFG] DEV=%s LINK=%d REGS=%s\n", dev.name, dev.linkOk ? 1 : 0, regsHex);
+  }
+
+  Serial.printf("[CFG] CODE=%u SPS=%u SPICLK=%lu SPILIMIT=%lu SERIALLIMIT=%lu REF=%s DONE=1\n",
+                static_cast<unsigned>(sampleRateCode),
+                static_cast<unsigned>(sampleRateFromCode(sampleRateCode)),
+                static_cast<unsigned long>(ADS_SPI_CLOCK_HZ),
+                static_cast<unsigned long>(maxSampleRateFromSpi()),
+                static_cast<unsigned long>(maxSustainedPacketRate()),
+                referenceModeName(referenceMode));
+
+  if (wasStreaming) {
+    startStreaming();
   }
 }
 
@@ -1630,6 +1811,12 @@ static void handleCommandChar(char cmd) {
     return;
   }
 
+  if (awaitingReferenceMode) {
+    awaitingReferenceMode = false;
+    handleReferenceModeChar(cmd);
+    return;
+  }
+
   if (parsingX) {
     if (cmd == 'X') {
       parseAndApplyXCommand(xPayload, xLen);
@@ -1727,6 +1914,9 @@ static void handleCommandChar(char cmd) {
     case '?':
       printAllRegisters();
       break;
+    case 'P':
+      emitConfigurationReport();
+      break;
     case '~':
       awaitingSampleRate = true;
       break;
@@ -1735,6 +1925,9 @@ static void handleCommandChar(char cmd) {
       break;
     case '`':
       awaitingMarker = true;
+      break;
+    case 'N':
+      awaitingReferenceMode = true;
       break;
     case 'x':
       parsingX = true;
@@ -1895,8 +2088,21 @@ static void streamingTask(void* parameter) {
       anyLinked = true;
       if (readDeviceFrame(devices[i], fresh)) {
         devices[i].drdyPending = false;
+        devices[i].failedReads = 0;
       } else {
         readFailed = true;
+        // Holding the last value forever hides a dead converter: the packet
+        // counter keeps advancing, so the host sees a healthy stream made of a
+        // frozen sample. After a few misses publish zeros instead, which the
+        // recorder shows as "no data" and the analyzer sees as a flat line.
+        if (devices[i].failedReads < 0xFF) {
+          devices[i].failedReads++;
+        }
+        if (devices[i].failedReads > STALE_FRAME_LIMIT) {
+          for (uint8_t ch = 0; ch < devices[i].channelCount; ++ch) {
+            fresh[devices[i].channelOffset + ch] = 0;
+          }
+        }
       }
     }
 
@@ -1980,7 +2186,7 @@ static void bringUpDevices() {
         PIN_SPI_SCLK,
         PIN_SPI_MISO,
         PIN_SPI_MOSI,
-        1000000,
+        ADS_SPI_CLOCK_HZ,
         ADS_CHANNELS_PER_CHIP,
         pulseControlPins);
 

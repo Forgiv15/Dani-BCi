@@ -55,6 +55,7 @@ from data_loader import (
     sniff_csv_layout,
 )
 from fft_analysis import (
+    CHANNEL_AVERAGE_LABEL,
     DEFAULT_INPUT_ATTENUATOR_RATIO,
     FFTSettings,
     SpectrumResult,
@@ -454,7 +455,10 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         layout.addLayout(controls)
 
         self.metrics_formula_label = QLabel(
-            "Units: EEG amplitudes are treated as uVrms. Selection Avg RMS is the RMS of each channel over the full selected region after exclusions, active filters, and a fixed 0.5-100 Hz bandpass filter. Auto mode finds the dominant spectral tone; Manual Hz measures the exact user-entered frequency with a sine-fit RMS estimator. "
+            "Units: EEG amplitudes are treated as uVrms. Selection Avg RMS is the RMS of each channel over the full selected region after exclusions, active filters, and a fixed 0.5-100 Hz bandpass filter. "
+            "Band RMS 0.1-100 Hz is the same RMS computed over the full EEG band and is the input-referred noise number: with shorted inputs it should sit at the amplifier noise floor, and it is what the live recorder shows with its default 0.1 / 150 Hz display filters (use a selection of at least ~10 s so the 0.1 Hz corner can settle). "
+            f"The '{CHANNEL_AVERAGE_LABEL}' row averages every channel, so that cell is the single 0.1-100 Hz noise value of the selection. "
+            "Auto mode finds the dominant spectral tone; Manual Hz measures the exact user-entered frequency with a sine-fit RMS estimator. "
             "50 Hz pickup is the exact 50 Hz RMS. SNR = 10 log10(Pfund / Pnoise). THD uses harmonics 2f through 5f. ENOB = (SNR - 1.76) / 6.02. "
             "CMRR uses the selected CMRR frequency or the fundamental if no CMRR frequency is specified. When ADS1299 sinc3 correction is enabled, the app applies the sinc3 gain to the user-entered common-mode input, so CMRR_corrected(f) = CMRR_measured(f) + G_ADC(f), where G_ADC(f) is typically negative at higher frequency. Crosstalk uses the selected Crosstalk frequency or the fundamental if no Crosstalk frequency is specified."
         )

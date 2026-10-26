@@ -29,43 +29,77 @@ shrinks down to roughly 1300 px if you drag it narrow.
 
 ## Connecting
 
-1. Pick the port and press **Connect**.
+1. Pick the port and press **Connect**. With **Auto-connect on start** ticked
+   (the default) the recorder opens the port used last time by itself, or
+   `COM5` when nothing was used before; untick it to always start offline.
 2. The recorder sends `v` (version request) and waits for the board answer.
    On a freshly opened port the ESP32 may still be running its ~6 s power-on
    self test; the request is retried until the board replies.
 3. From the reply the recorder learns the ADS1299 IDs, the LIS3DH ID, the SD
-   card state and the firmware version. Those appear under the connection
-   status and in the serial monitor.
+   card state, the firmware version and the two link budgets. Those appear
+   under the connection status and in the serial monitor.
 4. The **saved** sample rate and per-channel settings are written back to the
    board automatically and every channel is confirmed individually.
 
 If the reply shows a daisy device but the saved profile is 8 channels (or the
 other way round) the profile is switched and the port re-opened once.
 
-### Serial link budget
+### Link budgets (serial and SPI)
 
-One packet is 33 bytes on the wire, so the ADS rate is also the packet rate.
-At 115200 baud the link carries about **314 packets/s** with the headroom the
-firmware keeps, which means **250 SPS is the highest usable ADS rate** over the
-default serial link (Cyton+Daisy then runs at 125 Hz per channel).
+Two independent limits decide the highest usable ADS rate, and the Hardware
+settings group shows both:
 
-* The rate list in *Hardware settings* marks rates above the link capacity.
+| Link | Calculation | Limit at the defaults |
+| --- | --- | --- |
+| ESP32 → PC (serial) | 33 bytes/packet at 10 bits/byte, 10 % headroom | 314 SPS at 115200 baud, 2513 SPS at 921600 |
+| ESP32 → 2x ADS1299 (SPI) | 216-bit frame per converter, both read per sample: 432 bits at 2 MHz = 216 µs | 4166 SPS |
+
+One sample therefore costs 216 µs on the SPI bus; the bus would only become the
+limiting factor above ~4 kHz per channel. The line *Limit in force* names the
+tighter of the two.
+
+* The rate list in *Hardware settings* marks rates above the link capacity and
+  also shows the SPI budget.
 * If a saved configuration asks for a faster rate, the recorder downgrades to
-  the highest supported rate, says so in the Hardware settings status and in
-  the serial monitor, and applies the rest normally.
+  the highest supported rate, says which link caused it, and applies the rest
+  normally.
 * The status bar warning *"Receiving 176 of 250 Hz"* means samples are being
   lost - lower the ADS rate or raise `SERIAL_BAUD` in the firmware and pick the
   same baud rate in the recorder.
+
+### Verifying the board configuration
+
+Write acknowledgements only say "the command arrived". **Verify board
+configuration** reads the chips themselves:
+
+1. The recorder sends `P`; the firmware pauses streaming, clocks registers
+   `0x00..0x17` out of both converters and answers with one
+   `[CFG] DEV=ADS1 LINK=1 REGS=...` line per chip plus the rate/clock summary.
+2. The recorder rebuilds the register image the saved settings *should*
+   produce (CHnSET = gain, SRB2, input type and the power-down bit; BIAS_SENSP/N
+   one bit per bias-included channel; MISC1 bit 5 for SRB1; CONFIG1 with
+   DAISY_EN, CLK_EN on the clock master and the DR bits) and compares.
+3. The result is one green line - *"Configuration verified: all 12 channels and
+   both converters match the saved settings"* - or a red list of the exact
+   registers that differ, for example
+   `ADS1 CH1SET 0x68, expected 0x08`.
+4. Streaming resumes by itself; the raw report is in the serial monitor.
+
+This catches the cases where a write silently did not stick: a stuck SPI line,
+a channel that stayed powered down, a bias/SRB bit that never latched, or a
+sample rate that was refused.
 
 ## Hardware settings
 
 Settings are edited in two places:
 
 * **Hardware settings...** opens the full table: one row per GUI channel with
-  `On`, `Gain`, `Input`, `Bias`, `SRB2`, `SRB1`, plus a status column that shows
-  whether the last write was confirmed by the firmware.
-* The compact quick row in the dock sets the five fields for *all* channels in
-  one click, which is the fast path for a uniform measurement.
+  `On`, `Gain`, `Input`, `Bias`, plus a status column that shows whether the last
+  write was confirmed by the firmware. The reference mode and the configuration
+  check live in the same dialog.
+* The compact quick row in the dock sets gain / input / bias for *all* channels in
+  one click, which is the fast path for a uniform measurement. The reference mode
+  is a separate one-line choice underneath it.
 
 In the dialog every channel also has a selection checkbox, and the bulk row
 ("Set every selected channel to") applies to the ticked channels only. That
@@ -77,8 +111,40 @@ mixed measurements".
 | Gain | x1 ... x24 | PGA gain; the host scales counts to microvolts with the same value |
 | Input | Normal, Shorted, Bias Meas, MVDD, Temp, Test Sig, BIAS DRP, BIAS DRN | ADS1299 `CHnSET` MUX |
 | Bias | Include / Exclude | channel participates in the bias (DRL) loop |
-| SRB2 | On / Off | per-channel SRB2 switch |
-| SRB1 | On / Off | shared SRB1 bus of each ADS1299 |
+
+Board profile and ADS sample rate live at the top of the dialog. In the 16-channel
+build GUI channels **7, 8, 15 and 16 are padding** (the ADS1299-6 only has six
+inputs per chip); they are shown greyed out, cannot be selected, and are never
+written or recorded.
+
+Per-channel rate is the ADS rate for the 8-channel profile and **half** the ADS
+rate for Cyton+Daisy, because the two converters are interleaved into one
+16-channel frame.
+
+### Reference / SRB (one setting, not per channel)
+
+There is exactly **one** reference choice for the whole board - in the dock next
+to *Apply these to all channels*, and at the top of the Hardware settings dialog:
+
+| Mode | What the chip is programmed with | Wiring it expects |
+|------|----------------------------------|-------------------|
+| True differential | `MISC1` SRB1 = 0, every `CHnSET` SRB2 = 0 | each channel has its own INP **and** INN electrode; the bias/DRL electrode keeps the common mode in range |
+| SRB1 | `MISC1` bit 5 = 1 on **every** converter, every `CHnSET` SRB2 = 0 | one reference electrode on the **SRB1** pin; every INN is internally tied to it |
+| SRB2 | `MISC1` SRB1 = 0, `CHnSET` bit 3 = 1 on every active channel | one reference electrode on the **SRB2** pin |
+
+Why it is not per channel: `MISC1` bit 5 is a single switch inside each
+ADS1299 that connects the negative input of *all* channels at once. A
+per-channel SRB1 checkbox could therefore never be honoured by the hardware - and
+worse, turning it on for one channel silently moved every other channel's
+reference onto the SRB1 node, which is exactly how an input ends up floating and
+saturated. The recorder now derives the per-channel `CHnSET` SRB2 bit and the
+`MISC1` byte from the single mode, so an inconsistent combination cannot be
+written. The firmware enforces the same rule: `N<0|1|2>` is applied *after* the
+per-channel writes, and `x...X` can no longer change `MISC1` at all.
+
+If a channel still saturates (see the warning below), the mode does not match the
+wiring - typically SRB2 selected while the reference electrode sits on SRB1, or a
+differential setup with no bias/DRL electrode at all.
 
 Board profile and ADS sample rate live at the top of the dialog. In the 16-channel
 build GUI channels **7, 8, 15 and 16 are padding** (the ADS1299-6 only has six
@@ -116,9 +182,10 @@ OpenBCI time series panel:
 
 * one shared time axis at the bottom of the view, in seconds since the stream
   started - it stays visible when you scroll;
-* per row: the channel number badge, small `+max / +half / 0 / -half / -max`
-  labels and grid lines at exactly those five levels, so a 400 uV scale shows
-  lines at 0, +/-200 and +/-400 uV and the row edge *is* 400 uV;
+* per row: the channel number badge, the **DC value** (see below), small
+  `+max / +half / 0 / -half / -max` labels and grid lines at exactly those five
+  levels, so a 400 uV scale shows lines at 0, +/-200 and +/-400 uV and the row
+  edge *is* 400 uV;
 * `Scale` sets that range for every row at once;
 * `Rows` chooses how many rows fill the window (4, 6, 8, 10 or 12); with
   more channels than rows the stack scrolls with the mouse wheel;
@@ -126,6 +193,44 @@ OpenBCI time series panel:
 * `Center` removes the mean of the visible window per channel (display only) so
   electrode offsets do not push a trace off its row;
 * `Pause` freezes the traces while acquisition and recording continue.
+
+### DC value under every channel number
+
+Directly under each badge is the running mean of the **raw** signal with a 0.1 Hz
+corner (an exponential average over roughly the last 1.6 s of samples), so it is
+exactly the part the display high-pass removes: the electrode/offset potential of
+that input. The number is shown on one line and its unit (`uV` / `mV`) on the line
+below it, without any label in front, so it stays readable in a narrow gutter. It
+is updated about 30 times per second and is coloured teal while the channel is
+healthy.
+
+A shorted input therefore reads a small value, an open electrode drifts, and a
+channel pinned at `+187.500 mV` (gain x24) is sitting on the ADC rail.
+
+### No-data and saturated-input warnings
+
+Two failure modes are called out, each with a red banner across the top of the
+time-series panel, a marked badge and a message in the dock:
+
+* **no data (0 V)** - the samples stay at **exactly** zero for 2 s. The badge gets
+  a red ring with `!` and the value reads `+0.00` with `no data` underneath.
+  A shorted input is *not* this: it still produces amplifier noise. An exact run
+  of zeros means the channel is powered down, the register write never reached
+  the chip, or the electrode path is completely open.
+* **input saturated** - every sample of the batch sits within 2 % of the ADC full
+  scale (`VREF / gain` = 187.5 mV at x24) for 0.5 s. The badge gets an amber ring,
+  the value turns amber and the unit line reads `saturated`. This is what a
+  floating or wrongly referenced input looks like: the differential input is
+  pinned at the rail, so the trace is either flat or full of rail-to-rail noise.
+
+The banner lists the affected channels, for example
+
+```
+no data (0 V): CH 3   |   input saturated: CH 1, CH 2, CH 5
+```
+
+If several channels saturate at once, check the **reference mode** against the
+wiring first - that is almost always the cause - then the bias/DRL electrode.
 
 ### Channels (dock)
 
@@ -187,6 +292,10 @@ Dropdowns with an explicit **Off** entry:
 * 50 Hz and 100 Hz notches with adjustable Q,
 * Butterworth high-pass (0.1 ... 40 Hz) and low-pass (5 ... 200 Hz).
 
+The **default band is 0.1 Hz high-pass / 150 Hz low-pass**, the same band the
+analyzer is normally driven with. Existing settings files adopt this band once
+(settings version 2); after that whatever you select is remembered.
+
 Filters affect the traces and the FFT only; recordings stay raw so the offline
 analyzer can apply its own zero-phase filters.
 
@@ -213,6 +322,19 @@ its own.
 
 Sections can still be edited after the recording stops; the sidecar is rewritten
 each time.
+
+### Noise metric in the analyzer
+
+The analyzer reports the input-referred noise in the band you actually measure
+in: **`Band RMS 0.1-100 Hz (uVrms)`**, one value per channel (RMS of the selection
+after a 0.1-100 Hz zero-phase Butterworth bandpass), plus the
+**`All channels (mean)`** row at the bottom of the metrics table, whose cell in
+that column is the single averaged 0.1-100 Hz noise figure of the selection.
+Use at least ~10 s of data so the 0.1 Hz corner can settle, and analyze a section
+of shorted inputs to read the amplifier floor.
+
+`Selection Avg RMS (uVrms)` is the older metric and uses a 0.5-100 Hz band; it is
+still there, so the two can be compared directly.
 
 ## Files on disk
 
@@ -282,11 +404,15 @@ visible without opening the monitor.
 `settings/live_recorder.json` (git-ignored) stores:
 
 * hardware: board profile, ADS rate, all per-channel fields (replayed on connect),
-* connection: last port and baud rate,
+* connection: last port, baud rate and whether to auto-connect on start,
 * display: scale, window, row height, FFT points/window/smoothing/scale/log,
   FFT trace selection and end frequency, filters, accelerometer settings,
   visible channels, record-only-checked-channels,
 * recording: session name and output folder.
+
+The file carries a `version` field. Version 2 introduced the 0.1 / 150 Hz
+default band and the auto-connect flag, so an older file adopts those defaults
+once and then keeps your choices.
 
 Delete the file to return to defaults.
 
@@ -295,11 +421,13 @@ Delete the file to return to defaults.
 | Command | Meaning |
 |---------|---------|
 | `v` | version / device inventory (also stops streaming and re-applies defaults) |
-| `~<0-6>` | ADS data rate (16000 ... 250 SPS, rejected above the link capacity) |
-| `x<selector><digits>X` | per-channel power/gain/input/bias/SRB2/SRB1 |
+| `~<0-6>` | ADS data rate (16000 ... 250 SPS, rejected above the serial or SPI limit) |
+| `x<selector><digits>X` | per-channel power/gain/input/bias (the last two digits are accepted but SRB is owned by `N`) |
+| `N<0\|1\|2>` | board-wide reference mode: 0 = differential, 1 = SRB1, 2 = SRB2 |
 | `b` / `s` | start / stop streaming |
 | `d` | firmware defaults for all channels |
 | `?` | register dump (serial monitor) |
+| `P` | configuration readback for **Verify board configuration** (`[CFG]` lines) |
 
 Selectors are `1`-`8` for the board channels and `Q W E R T Y U I` for channels
 9-16 of the daisy half.
@@ -313,14 +441,23 @@ Three firmware behaviours exist specifically to keep the data spike-free:
    before and after each SPI read. If a conversion started while the frame was
    being clocked, the frame is discarded and re-read once, and `corrupt` is
    incremented instead of publishing a spike.
-3. **Rates above the serial link capacity are refused** by `~`, so packets are
-   never queued faster than the UART can drain them.
+3. **Rates above the serial or SPI link capacity are refused** by `~`, so packets
+   are never queued faster than the UART can drain them and both converters can
+   still be read inside one sample period.
+
+The SPI clock is `ADS_SPI_CLOCK_HZ` in `src/main.cpp` (currently 2 MHz); raising
+it to 4 MHz is allowed by the ADS1299 datasheet and would double the SPI budget
+to ~8300 SPS, but the serial link becomes the binding limit long before that.
 
 ## Troubleshooting
 
 | Symptom | What to check |
 |---------|---------------|
 | Single-sample spikes on all channels | Those were torn RDATAC frames. Reflash the current firmware and keep the ADS rate within the link budget; check the `corrupt` counter after stopping the stream |
+| "No data from CH n" warning | That channel reads exactly zero: press **Verify board configuration** and look for the CHnSET mismatch, or check that the channel is powered on / the electrode path is connected |
+| "input saturated" warning | The differential input is at the ADC rail. Check that the reference mode matches the wiring (SRB2 selected but the reference on SRB1 is the classic mistake), then the bias/DRL electrode and the gain |
+| Channel values frozen at one number | The firmware used to hold the last sample when a converter stopped answering. It now publishes zeros after four missed frames, so a dead SPI/DRDY path shows up as "no data" instead |
+| "Configuration mismatch" after verify | The listed registers did not stick. A whole chip missing points at CS/SPI wiring; one channel points at that channel's input or power bit |
 | "The board did not answer the version request" | wrong port, port already open in another program, or the board is still running the self test |
 | Some channels show `rejected` | those channels do not exist on the fitted chip (padding), or the firmware refused the value |
 | Traces flat / all zeros | input type set to `Shorted`, or channels powered down (`On` unchecked) |

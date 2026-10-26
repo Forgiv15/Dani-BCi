@@ -60,6 +60,37 @@ SAMPLE_RATE_BY_CODE = {code: rate for rate, code in SAMPLE_RATES}
 CODE_BY_SAMPLE_RATE = {rate: code for rate, code in SAMPLE_RATES}
 BOARD_CHANNEL_CHOICES = (("Cyton + Daisy (16 channels)", 16), ("Cyton (8 channels)", 8))
 
+# ADS1299 SPI bus. This has to match ADS_SPI_CLOCK_HZ in the firmware; the app
+# only uses it to sanity-check the budget the board reports.
+ADS_SPI_CLOCK_HZ = 2_000_000
+ADS_SPI_FRAME_BITS = 3 * 8 + 8 * 8 * 3  # 3 status bytes + 8 x 24-bit samples = 216
+
+# Default display band. Matches what the offline analyzer is usually driven
+# with, so the live traces and the analysis look at the same signal.
+DEFAULT_HIGH_PASS_HZ = 0.1
+DEFAULT_LOW_PASS_HZ = 150.0
+# Bumped whenever a stored settings file needs to adopt a new default.
+SETTINGS_VERSION = 3
+
+# Reference ("SRB") routing. SRB1 is a single switch inside each ADS1299
+# (MISC1 bit 5) that ties the negative input of every channel to the SRB1 pin,
+# so it can never be a per-channel choice; SRB2 is the per-channel CHnSET bit 3
+# but is exposed as one board-wide mode as well. Exactly one of the three states
+# is always programmed, which is what keeps the input from floating.
+REFERENCE_MODE_DIFFERENTIAL = "diff"
+REFERENCE_MODE_SRB1 = "srb1"
+REFERENCE_MODE_SRB2 = "srb2"
+REFERENCE_MODE_CHOICES = (
+    ("True differential (INP/INN from electrodes)", REFERENCE_MODE_DIFFERENTIAL),
+    ("SRB1 (all INN to SRB1, one reference)", REFERENCE_MODE_SRB1),
+    ("SRB2 (all INN to SRB2, one reference)", REFERENCE_MODE_SRB2),
+)
+REFERENCE_MODE_CODES = {
+    REFERENCE_MODE_DIFFERENTIAL: 0,
+    REFERENCE_MODE_SRB1: 1,
+    REFERENCE_MODE_SRB2: 2,
+}
+
 # Cyton selectors for the second half of a 16-channel board.
 DAISY_SELECTORS = ("Q", "W", "E", "R", "T", "Y", "U", "I")
 
@@ -87,6 +118,32 @@ def max_sustained_packet_rate(baud: int) -> int:
 
     usable_bits = (max(int(baud), 9600) // 10) * 9
     return max(usable_bits // (PACKET_LENGTH * 10), 1)
+
+
+def spi_frame_microseconds(spi_clock_hz: int = ADS_SPI_CLOCK_HZ, device_count: int = 2) -> float:
+    """Time on the wire for the RDATAC frames of every converter.
+
+    Each ADS1299 answers one 216-bit frame and both are read inside the same
+    sample period because they share the START line.
+    """
+
+    clock = max(float(spi_clock_hz), 1.0)
+    return ADS_SPI_FRAME_BITS * max(int(device_count), 1) / clock * 1e6
+
+
+def max_sample_rate_from_spi(spi_clock_hz: int = ADS_SPI_CLOCK_HZ, device_count: int = 2) -> int:
+    """Samples per second the ADS1299 SPI bus can serve with 10% headroom."""
+
+    frame_us = spi_frame_microseconds(spi_clock_hz, device_count)
+    if frame_us <= 0.0:
+        return 0
+    return max(int(900_000.0 / frame_us), 1)
+
+
+def max_usable_sample_rate(baud: int, spi_clock_hz: int = ADS_SPI_CLOCK_HZ, device_count: int = 2) -> int:
+    """Tighter of the serial and SPI limits, in board samples per second."""
+
+    return min(max_sustained_packet_rate(baud), max_sample_rate_from_spi(spi_clock_hz, device_count))
 
 
 def supported_packet_rates(baud: int) -> list[tuple[int, int]]:
@@ -179,6 +236,13 @@ def build_channel_command(channel_index: int, setting: ChannelSetting) -> bytes:
 
 def build_sample_rate_command(code: int) -> bytes:
     return f"~{int(code)}".encode("ascii")
+
+
+def build_reference_command(mode: str) -> bytes:
+    """``N<0|1|2>``: one board-wide reference routing for every converter."""
+
+    code = REFERENCE_MODE_CODES.get(str(mode), REFERENCE_MODE_CODES[REFERENCE_MODE_SRB2])
+    return f"N{code}".encode("ascii")
 
 
 @dataclass(slots=True)
@@ -584,6 +648,7 @@ class HardwareSettings:
 
     board_channels: int = 16
     sample_rate_code: int = 6
+    reference_mode: str = REFERENCE_MODE_SRB2
     channels: list[ChannelSetting] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -595,10 +660,46 @@ class HardwareSettings:
             self.channels.extend(ChannelSetting() for _ in range(target - len(self.channels)))
         while len(self.channels) > target:
             self.channels.pop()
+        self.sync_reference()
 
     def set_board_channels(self, board_channels: int) -> None:
         self.board_channels = int(board_channels)
         self.ensure_channels()
+
+    def normalised_reference_mode(self) -> str:
+        mode = str(self.reference_mode or REFERENCE_MODE_SRB2)
+        return mode if mode in REFERENCE_MODE_CODES else REFERENCE_MODE_SRB2
+
+    def sync_reference(self) -> None:
+        """Make every channel agree with the single board-wide reference mode.
+
+        SRB1 is one switch per chip and SRB2 is meant to be uniform across the
+        inputs, so the per-channel flags are derived rather than chosen. This is
+        what stops one channel from silently moving every other channel's
+        negative input onto a different node.
+        """
+
+        mode = self.normalised_reference_mode()
+        self.reference_mode = mode
+        for channel in self.channels:
+            channel.srb1 = mode == REFERENCE_MODE_SRB1
+            channel.srb2 = mode == REFERENCE_MODE_SRB2
+
+    def set_reference_mode(self, mode: str) -> None:
+        self.reference_mode = mode if mode in REFERENCE_MODE_CODES else REFERENCE_MODE_SRB2
+        self.sync_reference()
+
+    @property
+    def reference_mode_code(self) -> int:
+        return REFERENCE_MODE_CODES[self.normalised_reference_mode()]
+
+    @property
+    def reference_mode_label(self) -> str:
+        mode = self.normalised_reference_mode()
+        for label, value in REFERENCE_MODE_CHOICES:
+            if value == mode:
+                return label
+        return mode
 
     @property
     def sample_rate_hz(self) -> float:
@@ -619,23 +720,6 @@ class HardwareSettings:
             gains[real] = float(self.channels[gui_index].gain_scalar)
         return gains
 
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "board_channels": int(self.board_channels),
-            "sample_rate_code": int(self.sample_rate_code),
-            "channels": [
-                {
-                    "active": channel.active,
-                    "gain_ordinal": int(channel.gain_ordinal),
-                    "input_ordinal": int(channel.input_ordinal),
-                    "bias": channel.bias,
-                    "srb2": channel.srb2,
-                    "srb1": channel.srb1,
-                }
-                for channel in self.channels
-            ],
-        }
-
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> "HardwareSettings":
         channels = [
@@ -650,11 +734,231 @@ class HardwareSettings:
             for item in payload.get("channels", [])
             if isinstance(item, dict)
         ]
+        mode = payload.get("reference_mode")
+        if not isinstance(mode, str) or mode not in REFERENCE_MODE_CODES:
+            # Files written before the reference mode existed carried per-channel
+            # SRB flags; recover the single mode they were aiming for.
+            active = [channel for channel in channels if channel.active] or channels
+            if active and all(channel.srb1 for channel in active):
+                mode = REFERENCE_MODE_SRB1
+            elif active and not any(channel.srb2 for channel in active):
+                mode = REFERENCE_MODE_DIFFERENTIAL
+            else:
+                mode = REFERENCE_MODE_SRB2
         return cls(
             board_channels=int(payload.get("board_channels", 16)),
             sample_rate_code=int(payload.get("sample_rate_code", 6)),
+            reference_mode=mode,
             channels=channels,
         )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "board_channels": int(self.board_channels),
+            "sample_rate_code": int(self.sample_rate_code),
+            "reference_mode": self.normalised_reference_mode(),
+            "channels": [
+                {
+                    "active": channel.active,
+                    "gain_ordinal": int(channel.gain_ordinal),
+                    "input_ordinal": int(channel.input_ordinal),
+                    "bias": channel.bias,
+                    "srb2": channel.srb2,
+                    "srb1": channel.srb1,
+                }
+                for channel in self.channels
+            ],
+        }
+
+
+@dataclass(slots=True)
+class DeviceExpectation:
+    """Register bytes the firmware should hold for one ADS1299 after a write."""
+
+    name: str
+    config1: int
+    config2: int
+    config3: int
+    channel_regs: list[int]
+    bias_sensp: int
+    bias_sensn: int
+    misc1: int
+
+    def describe(self, local_index: int, reg: int) -> str:
+        """Human readable reason for a CHnSET byte."""
+
+        gain_ordinal = (reg >> 4) & 0x07
+        return f"gain x{GAIN_SCALARS[min(gain_ordinal, 6)]}"
+
+
+def channels_per_device(board_channels: int) -> int:
+    """Real ADS channels behind each of the two converters."""
+
+    return 6 if int(board_channels) > 8 else 4
+
+
+def expected_device_registers(hardware: "HardwareSettings") -> list[DeviceExpectation]:
+    """Compute the register image the firmware should have after applying settings.
+
+    Mirrors ADS1299::configureChannel() and applyCytonDefaults():
+    CHnSET = gain<<4 | SRB2 | input (plus 0x80 and input 1 when the channel is
+    powered down), BIAS_SENSP/N carry one bit per bias-included channel,
+    MISC1 bit 5 enables the SRB1 routing and CONFIG1 carries DAISY_EN plus
+    CLK_EN on the clock master.
+    """
+
+    per_device = channels_per_device(hardware.board_channels)
+    device_count = 2
+    mapping = physical_channel_map(hardware.board_channels)
+    rate_bits = int(hardware.sample_rate_code) & 0x07
+
+    expectations: list[DeviceExpectation] = []
+    for device in range(device_count):
+        channel_regs: list[int] = []
+        bias_sensp = 0
+        bias_sensn = 0
+        srb1_any = False
+        for local in range(per_device):
+            real = device * per_device + local
+            gui_index = next((index for index, value in enumerate(mapping) if value == real), None)
+            setting = None
+            if gui_index is not None and gui_index < len(hardware.channels):
+                setting = hardware.channels[gui_index]
+            if setting is None:
+                channel_regs.append(0x61)
+                continue
+            gain = min(max(int(setting.gain_ordinal), 0), 6)
+            if not setting.active:
+                channel_regs.append(0x80 | (gain << 4) | 0x01)
+                continue
+            value = (gain << 4) | (0x08 if setting.srb2 else 0x00) | (int(setting.input_ordinal) & 0x07)
+            channel_regs.append(value)
+            if setting.bias:
+                bias_sensp |= 1 << local
+                bias_sensn |= 1 << local
+            if setting.srb1:
+                srb1_any = True
+        expectations.append(
+            DeviceExpectation(
+                name=f"ADS{device + 1}",
+                config1=0x90 | 0x40 | (0x20 if device == 0 else 0x00) | rate_bits,
+                config2=0xC0,
+                config3=0xEC,
+                channel_regs=channel_regs,
+                bias_sensp=bias_sensp,
+                bias_sensn=bias_sensn,
+                misc1=0x20 if srb1_any else 0x00,
+            )
+        )
+    return expectations
+
+
+@dataclass(slots=True)
+class RegisterCheck:
+    """One comparison between a reported register byte and the expected one."""
+
+    device: str
+    label: str
+    actual: int
+    expected: int
+
+    @property
+    def matches(self) -> bool:
+        return self.actual == self.expected
+
+    def describe(self) -> str:
+        return f"{self.device} {self.label} 0x{self.actual:02X}, expected 0x{self.expected:02X}"
+
+
+def compare_configuration(
+    report: dict[str, list[int]],
+    hardware: "HardwareSettings",
+) -> tuple[list[RegisterCheck], list[str]]:
+    """Compare a readback report with the settings that were written.
+
+    ``report`` maps device name to the 24 register bytes (0x00..0x17). Returns
+    the mismatching register checks and a list of plain notes (missing
+    converter, unexpected device ID, and so on).
+    """
+
+    checks: list[RegisterCheck] = []
+    notes: list[str] = []
+    for expectation in expected_device_registers(hardware):
+        regs = report.get(expectation.name)
+        if not regs or len(regs) < 0x18:
+            notes.append(f"{expectation.name} did not report registers")
+            continue
+        if regs[0] not in (0x3E, 0x3F):
+            notes.append(f"{expectation.name} reports device ID 0x{regs[0]:02X}")
+        for address, expected in (
+            (0x01, expectation.config1),
+            (0x02, expectation.config2),
+            (0x03, expectation.config3),
+            (0x0D, expectation.bias_sensp),
+            (0x0E, expectation.bias_sensn),
+            (0x15, expectation.misc1),
+        ):
+            actual = regs[address]
+            if actual != expected:
+                checks.append(RegisterCheck(expectation.name, REGISTER_LABELS[address], actual, expected))
+        for local, expected in enumerate(expectation.channel_regs):
+            actual = regs[0x05 + local]
+            if actual != expected:
+                checks.append(RegisterCheck(expectation.name, f"CH{local + 1}SET", actual, expected))
+    return checks, notes
+
+
+REGISTER_LABELS = {
+    0x00: "ID",
+    0x01: "CONFIG1",
+    0x02: "CONFIG2",
+    0x03: "CONFIG3",
+    0x04: "LOFF",
+    0x05: "CH1SET",
+    0x06: "CH2SET",
+    0x07: "CH3SET",
+    0x08: "CH4SET",
+    0x09: "CH5SET",
+    0x0A: "CH6SET",
+    0x0B: "CH7SET",
+    0x0C: "CH8SET",
+    0x0D: "BIAS_SENSP",
+    0x0E: "BIAS_SENSN",
+    0x0F: "LOFF_SENSP",
+    0x10: "LOFF_SENSN",
+    0x11: "LOFF_FLIP",
+    0x12: "LOFF_STATP",
+    0x13: "LOFF_STATN",
+    0x14: "GPIO",
+    0x15: "MISC1",
+    0x16: "MISC2",
+    0x17: "CONFIG4",
+}
+
+
+def parse_configuration_report(lines: Sequence[str]) -> dict[str, list[int]]:
+    """Collect ``[CFG] DEV=ADS1 LINK=1 REGS=<hex>`` lines into register lists."""
+
+    report: dict[str, list[int]] = {}
+    for line in lines:
+        text = line.strip()
+        if not text.startswith("[CFG]"):
+            continue
+        fields = dict(
+            token.split("=", 1) for token in text[len("[CFG]"):].split() if "=" in token
+        )
+        name = fields.get("DEV")
+        regs_hex = fields.get("REGS")
+        if not name or not regs_hex:
+            continue
+        regs_hex = regs_hex.strip()
+        if len(regs_hex) % 2:
+            continue
+        try:
+            report[name] = [int(regs_hex[index:index + 2], 16) for index in range(0, len(regs_hex), 2)]
+        except ValueError:
+            continue
+    return report
 
 
 @dataclass(slots=True)
@@ -680,8 +984,8 @@ class ViewSettings:
     notch_50: bool = False
     notch_100: bool = False
     notch_q: float = 30.0
-    high_pass_hz: float = 0.0
-    low_pass_hz: float = 0.0
+    high_pass_hz: float = DEFAULT_HIGH_PASS_HZ
+    low_pass_hz: float = DEFAULT_LOW_PASS_HZ
     visible_channels: list[bool] = field(default_factory=list)
 
     def ensure_visibility(self, channel_count: int) -> None:
@@ -725,13 +1029,19 @@ class AppSettings:
     baud_rate: int = 115200
     session_name: str = "session"
     output_dir: str = "recordings"
+    auto_connect: bool = True
+    version: int = SETTINGS_VERSION
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "version": 1,
+            "version": SETTINGS_VERSION,
             "hardware": self.hardware.as_dict(),
             "view": self.view.as_dict(),
-            "connection": {"last_port": self.last_port, "baud_rate": int(self.baud_rate)},
+            "connection": {
+                "last_port": self.last_port,
+                "baud_rate": int(self.baud_rate),
+                "auto_connect": bool(self.auto_connect),
+            },
             "recording": {"session_name": self.session_name, "output_dir": self.output_dir},
         }
 
@@ -741,14 +1051,32 @@ class AppSettings:
         recording = payload.get("recording") if isinstance(payload.get("recording"), dict) else {}
         hardware_payload = payload.get("hardware") if isinstance(payload.get("hardware"), dict) else {}
         view_payload = payload.get("view") if isinstance(payload.get("view"), dict) else {}
-        return cls(
+        try:
+            version = int(payload.get("version", 1) or 1)
+        except (TypeError, ValueError):
+            version = 1
+        settings = cls(
             hardware=HardwareSettings.from_dict(hardware_payload),
             view=ViewSettings.from_dict(view_payload),
             last_port=str(connection.get("last_port", "")),
             baud_rate=int(connection.get("baud_rate", 115200)),
             session_name=str(recording.get("session_name", "session")),
             output_dir=str(recording.get("output_dir", "recordings")),
+            auto_connect=bool(connection.get("auto_connect", True)),
+            version=version,
         )
+        settings.migrate()
+        return settings
+
+    def migrate(self) -> None:
+        """Adopt newer defaults once, without touching later user choices."""
+
+        if self.version < 2:
+            # Version 2 turned the display band on by default (0.1 Hz / 150 Hz).
+            self.view.high_pass_hz = DEFAULT_HIGH_PASS_HZ
+            self.view.low_pass_hz = DEFAULT_LOW_PASS_HZ
+        self.hardware.sync_reference()
+        self.version = SETTINGS_VERSION
 
 
 class SettingsStore:
@@ -955,6 +1283,7 @@ class DemoBoardPort:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._gains = [24.0] * (12 if self.board_channels > 8 else 8)
+        self._settings = HardwareSettings(board_channels=self.board_channels, sample_rate_code=self.sample_rate_code)
         self._rng = np.random.default_rng(20261022)
         self._phases = np.linspace(0.0, np.pi, max(self.board_channels, 8), endpoint=False)
         self._counter = 0
@@ -1042,6 +1371,7 @@ class DemoBoardPort:
                     next_char = chr(data[index + 1])
                     if next_char.isdigit():
                         self.sample_rate_code = int(next_char)
+                        self._settings.sample_rate_code = self.sample_rate_code
                         rate = SAMPLE_RATE_BY_CODE.get(self.sample_rate_code, 250)
                         self._emit_text(f"Success: Sample rate is {rate}Hz")
                         index += 2
@@ -1049,7 +1379,53 @@ class DemoBoardPort:
                 self._emit_text("Failure: sample rate out of bounds")
             elif char == "?":
                 self._emit_text("Board ADS Registers\nCH1SET=0x61 CH2SET=0x61\n$$$", terminator="")
+            elif char == "P":
+                self._emit_configuration_report()
+            elif char == "N":
+                if index + 1 < len(data):
+                    digit = chr(data[index + 1])
+                    if digit.isdigit() and int(digit) <= 2:
+                        self._settings.set_reference_mode(
+                            (
+                                REFERENCE_MODE_DIFFERENTIAL,
+                                REFERENCE_MODE_SRB1,
+                                REFERENCE_MODE_SRB2,
+                            )[int(digit)]
+                        )
+                        self._emit_text(
+                            f"Success: Reference mode {self._settings.reference_mode}"
+                        )
+                        index += 2
+                        continue
+                self._emit_text("Failure: invalid reference mode (0=diff, 1=SRB1, 2=SRB2)")
             index += 1
+
+    def _emit_configuration_report(self) -> None:
+        """Answer the firmware's ``P`` command with the same ``[CFG]`` lines."""
+
+        lines = ["[CFG] BEGIN"]
+        for expectation in expected_device_registers(self._settings):
+            regs = [0x00] * 0x18
+            regs[0x00] = 0x3E
+            regs[0x01] = expectation.config1
+            regs[0x02] = expectation.config2
+            regs[0x03] = expectation.config3
+            for local, value in enumerate(expectation.channel_regs):
+                regs[0x05 + local] = value
+            for local in range(len(expectation.channel_regs), 8):
+                regs[0x05 + local] = 0x81
+            regs[0x0D] = expectation.bias_sensp
+            regs[0x0E] = expectation.bias_sensn
+            regs[0x15] = expectation.misc1
+            payload = "".join(f"{value:02X}" for value in regs)
+            lines.append(f"[CFG] DEV={expectation.name} LINK=1 REGS={payload}")
+        rate = SAMPLE_RATE_BY_CODE.get(self.sample_rate_code, 250)
+        lines.append(
+            f"[CFG] CODE={self.sample_rate_code} SPS={rate} SPICLK={ADS_SPI_CLOCK_HZ} "
+            f"SPILIMIT={max_sample_rate_from_spi(ADS_SPI_CLOCK_HZ, 2)} "
+            f"SERIALLIMIT={max_sustained_packet_rate(self.baudrate)} DONE=1"
+        )
+        self._emit_text("\n".join(lines) + "\n", terminator="")
 
     def _apply_channel_command(self, payload: str) -> None:
         if len(payload) < 7:
@@ -1070,13 +1446,35 @@ class DemoBoardPort:
         assert real is not None
         if real < len(self._gains):
             self._gains[real] = float(gain_scalar_from_ordinal(gain_ordinal))
+        if logical < len(self._settings.channels):
+            self._settings.channels[logical] = ChannelSetting(
+                active=digits[0] == "0",
+                gain_ordinal=gain_ordinal,
+                input_ordinal=int(digits[2]) if digits[2].isdigit() else 0,
+                bias=digits[3] == "1",
+                srb2=digits[4] == "1",
+                srb1=digits[5] == "1",
+            )
+            # The reference mode owns SRB1/SRB2, exactly like the firmware.
+            self._settings.sync_reference()
         self._emit_text(f"Success: Channel set for {logical + 1}")
 
     def _version_text(self) -> str:
         lines = ["OpenBCI V3 8-16 channel", "On Board ADS1299 Device ID: 0x3D"]
         if self.board_channels > 8:
             lines.append("On Daisy ADS1299 Device ID: 0x3D")
-        lines.extend(["LIS3DH Device ID: 0x33", "SD card: present", "Firmware: v3.1.5", "$$$"])
+        lines.extend(
+            [
+                "LIS3DH Device ID: 0x33",
+                "SD card: present",
+                "Firmware: v3.1.5",
+                f"Serial link limit: {max_sustained_packet_rate(self.baudrate)} SPS",
+                f"SPI clock: {ADS_SPI_CLOCK_HZ // 1000} kHz, frame "
+                f"{spi_frame_microseconds(ADS_SPI_CLOCK_HZ, 2):.0f} us x 2 devices",
+                f"SPI link limit: {max_sample_rate_from_spi(ADS_SPI_CLOCK_HZ, 2)} SPS",
+                "$$$",
+            ]
+        )
         return "\n".join(lines) + "\n"
 
     def _run(self) -> None:

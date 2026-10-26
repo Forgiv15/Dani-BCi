@@ -69,6 +69,7 @@ except ImportError:  # pragma: no cover - only hit without pyserial installed
 
 from fft_analysis import WINDOW_MAP
 from live_protocol import (
+    ADS_SPI_CLOCK_HZ,
     BOARD_CHANNEL_CHOICES,
     CODE_BY_SAMPLE_RATE,
     DemoBoardPort,
@@ -78,20 +79,31 @@ from live_protocol import (
     MixedStreamParser,
     OpenBCIRecording,
     PacketDecoder,
+    REFERENCE_MODE_CHOICES,
+    REFERENCE_MODE_SRB1,
+    REFERENCE_MODE_SRB2,
     RingBuffer,
     Annotation,
     SAMPLE_RATES,
     SAMPLE_RATE_BY_CODE,
     SettingsStore,
+    VREF_VOLTS,
+    build_reference_command,
+    max_sample_rate_from_spi,
     max_sustained_packet_rate,
+    max_usable_sample_rate,
     save_annotation_sidecar,
+    spi_frame_microseconds,
     supported_packet_rates,
     StreamingFilter,
     TextLine,
     ChannelSetting,
     build_channel_command,
     build_sample_rate_command,
+    compare_configuration,
+    expected_device_registers,
     format_duration,
+    parse_configuration_report,
     physical_channel_map,
     real_channel_indices,
     sanitize_filename,
@@ -158,11 +170,22 @@ LOW_PASS_CHOICES = (
     (150.0, "150 Hz"),
     (200.0, "200 Hz"),
 )
-TRACK_GUTTER_WIDTH = 50
+TRACK_GUTTER_WIDTH = 72
 BUFFER_SECONDS = 90.0
 DEFAULT_BAUD = 115200
 UI_INTERVAL_MS = 33
 FFT_INTERVAL_TICKS = 4
+VERIFY_TIMEOUT_MS = 4000
+# Corner of the running average shown as "DC" under every channel badge.
+DC_CUTOFF_HZ = 0.1
+# How long a channel may report exactly zero before it is called out.
+STALL_SECONDS = 2.0
+# Fraction of the ADC full scale above which an input counts as saturated, and
+# how long it has to stay there before the row is flagged.
+RAIL_FRACTION = 0.98
+RAIL_SECONDS = 0.5
+# Port tried on startup when nothing was used before.
+AUTOCONNECT_FALLBACK_PORT = "COM5"
 DEMO_PORT = "__DEMO__"
 STREAM_HEALTH_PATTERN = re.compile(r"missed=(\d+)\s+dropped=(\d+)\s+corrupt=(\d+)")
 
@@ -422,18 +445,50 @@ class AccelerometerPanel(QWidget):
         painter.end()
 
 class TrackGutter(QWidget):
-    """Left gutter of one trace row: channel badge and amplitude labels."""
+    """Left gutter of one trace row: channel badge, DC value and amplitude labels."""
 
     def __init__(self, index: int, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.index = index
         self._scale = 100.0
+        self._dc_uv: Optional[float] = None
+        self._state = "ok"
         self.setFixedWidth(TRACK_GUTTER_WIDTH)
 
     def set_scale(self, scale: float) -> None:
         if abs(float(scale) - self._scale) > 1e-9:
             self._scale = float(scale)
             self.update()
+
+    def set_dc(self, dc_uv: Optional[float]) -> None:
+        if dc_uv is None:
+            changed = self._dc_uv is not None
+            self._dc_uv = None
+        else:
+            changed = self._dc_uv is None or abs(dc_uv - self._dc_uv) >= 0.005
+            self._dc_uv = float(dc_uv)
+        if changed:
+            self.update()
+
+    def set_state(self, state: str) -> None:
+        if state != self._state:
+            self._state = state
+            self.update()
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @staticmethod
+    def _format_dc(dc_uv: float) -> tuple[str, str]:
+        """Value and the unit that goes underneath it."""
+
+        magnitude = abs(dc_uv)
+        if magnitude >= 1000.0:
+            return f"{dc_uv / 1000.0:+.3f}", "mV"
+        if magnitude >= 100.0:
+            return f"{dc_uv:+.1f}", "uV"
+        return f"{dc_uv:+.2f}", "uV"
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
         painter = QPainter(self)
@@ -442,18 +497,72 @@ class TrackGutter(QWidget):
         height = self.height()
 
         badge = 18
-        painter.setPen(Qt.PenStyle.NoPen)
+        badge_y = 3
+        if self._state == "stall":
+            painter.setPen(QPen(QColor("#dc2626"), 2.0))
+        elif self._state == "rail":
+            painter.setPen(QPen(QColor("#f59e0b"), 2.0))
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(pg.intColor(self.index, hues=16, values=1, maxValue=210))
-        painter.drawEllipse(4, 5, badge, badge)
+        painter.drawEllipse(4, badge_y, badge, badge)
         badge_font = QFont(self.font())
         badge_font.setBold(True)
         badge_font.setPointSizeF(8.0)
         painter.setFont(badge_font)
         painter.setPen(QColor("#ffffff"))
-        painter.drawText(QRect(4, 5, badge, badge), Qt.AlignmentFlag.AlignCenter, str(self.index + 1))
+        painter.drawText(QRect(4, badge_y, badge, badge), Qt.AlignmentFlag.AlignCenter, str(self.index + 1))
+
+        if self._state != "ok":
+            painter.setPen(QColor("#dc2626") if self._state == "stall" else QColor("#b45309"))
+            painter.drawText(
+                QRect(24, badge_y, width - 26, badge),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                "!" if self._state == "stall" else "~",
+            )
+
+        # The DC number sits directly under the badge with its unit below it, so
+        # the row never has to give up space to an explanatory word. The state is
+        # carried by the colour and by the unit line, never by hiding the value.
+        if self._dc_uv is None:
+            value_text, unit_text = "-", "uV"
+        else:
+            value_text, unit_text = self._format_dc(self._dc_uv)
+        if self._state == "stall":
+            unit_text = "no data"
+        elif self._state == "rail":
+            unit_text = "saturated"
+
+        value_font = QFont(self.font())
+        value_font.setPointSizeF(7.5)
+        value_font.setBold(self._state != "ok")
+        painter.setFont(value_font)
+        if self._state == "stall":
+            painter.setPen(QColor("#dc2626"))
+        elif self._state == "rail":
+            painter.setPen(QColor("#b45309"))
+        else:
+            painter.setPen(QColor("#0f766e"))
+        value_top = badge_y + badge + 1
+        painter.drawText(
+            QRect(2, value_top, width - 4, 13),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            value_text,
+        )
+
+        if height > value_top + 22:
+            unit_font = QFont(self.font())
+            unit_font.setPointSizeF(6.0)
+            painter.setFont(unit_font)
+            painter.setPen(QColor("#94a3b8") if self._state == "ok" else QColor("#dc2626"))
+            painter.drawText(
+                QRect(2, value_top + 12, width - 4, 10),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                unit_text,
+            )
 
         label_font = QFont(self.font())
-        label_font.setPointSizeF(7.0)
+        label_font.setPointSizeF(6.5)
         painter.setFont(label_font)
         painter.setPen(QColor("#64748b"))
         top_margin = 7
@@ -470,7 +579,7 @@ class TrackGutter(QWidget):
             y = int(top_margin + fraction * usable)
             text = "0" if abs(value) < 1e-9 else f"{value:+.0f}"
             painter.drawText(
-                QRect(0, y - 7, width - 5, 14),
+                QRect(40, y - 6, width - 44, 12),
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                 text,
             )
@@ -533,8 +642,16 @@ class ChannelTrack(QWidget):
     def set_data(self, times: np.ndarray, values: np.ndarray) -> None:
         self.curve.setData(times, values)
 
+    def set_dc(self, dc_uv: Optional[float]) -> None:
+        self.gutter.set_dc(dc_uv)
+
+    def set_state(self, state: str) -> None:
+        self.gutter.set_state(state)
+
     def clear(self) -> None:
         self.curve.setData([], [])
+        self.gutter.set_dc(None)
+        self.gutter.set_state("ok")
 
 
 class TimeSeriesPanel(QWidget):
@@ -623,6 +740,17 @@ class TimeSeriesPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         layout.addLayout(toolbar)
+        # Full-width row: the state banner must never be squeezed into the
+        # toolbar where a long "input saturated: CH 1, CH 3, ..." would clip.
+        self.state_banner = QLabel("")
+        self.state_banner.setWordWrap(True)
+        self.state_banner.setStyleSheet(
+            "color: #b91c1c; font-weight: 600; font-size: 11px; background: #fef2f2; "
+            "border: 1px solid #fecaca; padding: 2px 6px;"
+        )
+        self.state_banner.setVisible(False)
+        layout.addWidget(self.state_banner)
+        self._states: dict[int, str] = {}
         layout.addWidget(self.scroll, 1)
         layout.addLayout(axis_row)
 
@@ -727,6 +855,35 @@ class TimeSeriesPanel(QWidget):
         for index in self._visible:
             self.tracks[index].plot.setXRange(x0, x1, padding=0.0)
         self.axis_plot.setXRange(x0, x1, padding=0.0)
+
+    def set_dc(self, values: dict[int, Optional[float]]) -> None:
+        """Show the sub-0.1 Hz level under each channel badge."""
+
+        for index, track in self.tracks.items():
+            track.set_dc(values.get(index))
+
+    def set_channel_states(self, states: dict[int, str]) -> None:
+        """``ok`` / ``stall`` / ``rail`` per channel, plus a banner that says so."""
+
+        self._states = dict(states)
+        for index, track in self.tracks.items():
+            track.set_state(self._states.get(index, "ok"))
+        self._update_state_banner()
+
+    def _update_state_banner(self) -> None:
+        stalled = sorted(index for index, state in self._states.items() if state == "stall")
+        railed = sorted(index for index, state in self._states.items() if state == "rail")
+        parts: list[str] = []
+        if stalled:
+            parts.append("no data (0 V): " + ", ".join(channel_label(index) for index in stalled))
+        if railed:
+            parts.append("input saturated: " + ", ".join(channel_label(index) for index in railed))
+        if not parts:
+            self.state_banner.setText("")
+            self.state_banner.setVisible(False)
+            return
+        self.state_banner.setText("   |   ".join(parts))
+        self.state_banner.setVisible(True)
 
 class SpectrumPanel(QWidget):
     """Live RMS spectrum with FFT length, window, smoothing, scale and cursor."""
@@ -1276,8 +1433,9 @@ class HardwareSettingsDialog(QDialog):
     """
 
     applyRequested = pyqtSignal(object, list)
+    verifyRequested = pyqtSignal(object)
 
-    HEADERS = ("", "Channel", "On", "Gain", "Input", "Bias", "SRB2", "SRB1", "Status")
+    HEADERS = ("", "Channel", "On", "Gain", "Input", "Bias", "Status")
 
     def __init__(
         self,
@@ -1288,7 +1446,7 @@ class HardwareSettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Hardware settings")
-        self.resize(1000, 620)
+        self.resize(1040, 720)
         self._board_channels = int(hardware.board_channels)
         self._rate_code = int(hardware.sample_rate_code)
         self._channels = [channel.copy() for channel in hardware.channels]
@@ -1296,13 +1454,16 @@ class HardwareSettingsDialog(QDialog):
         self._rows: list[dict] = []
         self._statuses = dict(statuses or {})
         self._link_limit = int(link_limit) if link_limit else None
+        self._reference_mode = hardware.normalised_reference_mode()
+        self._connected = False
 
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
 
         intro = QLabel(
             "Settings are saved automatically and replayed on every connect. "
-            "Use the bulk row to set every channel at once, or edit single channels for mixed measurements."
+            "Use the bulk row to set every channel at once, or edit single channels for mixed measurements. "
+            "The reference mode is one setting for the whole board."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -1327,6 +1488,21 @@ class HardwareSettingsDialog(QDialog):
         form.addWidget(self.rate_note)
         layout.addLayout(form)
 
+        reference_group = QGroupBox("Reference / SRB")
+        reference_layout = QVBoxLayout(reference_group)
+        reference_row = QHBoxLayout()
+        self.reference_combo = QComboBox()
+        for label, value in REFERENCE_MODE_CHOICES:
+            self.reference_combo.addItem(label, value)
+        self.reference_combo.setCurrentIndex(max(self.reference_combo.findData(self._reference_mode), 0))
+        reference_row.addWidget(self.reference_combo, 1)
+        reference_layout.addLayout(reference_row)
+        self.reference_note = QLabel("")
+        self.reference_note.setWordWrap(True)
+        self.reference_note.setStyleSheet("color: #475569; font-size: 11px;")
+        reference_layout.addWidget(self.reference_note)
+        layout.addWidget(reference_group)
+
         bulk_group = QGroupBox("Set every selected channel to")
         bulk_layout = QHBoxLayout(bulk_group)
         self.bulk_gain = QComboBox()
@@ -1336,16 +1512,10 @@ class HardwareSettingsDialog(QDialog):
         self.bulk_input.addItems(list(INPUT_TYPE_LABELS))
         self.bulk_bias = QComboBox()
         self.bulk_bias.addItems(["Include", "Exclude"])
-        self.bulk_srb2 = QComboBox()
-        self.bulk_srb2.addItems(["On", "Off"])
-        self.bulk_srb1 = QComboBox()
-        self.bulk_srb1.addItems(["Off", "On"])
         for label, widget in (
             ("Gain", self.bulk_gain),
             ("Input", self.bulk_input),
             ("Bias", self.bulk_bias),
-            ("SRB2", self.bulk_srb2),
-            ("SRB1", self.bulk_srb1),
         ):
             bulk_layout.addWidget(QLabel(label))
             bulk_layout.addWidget(widget)
@@ -1378,6 +1548,7 @@ class HardwareSettingsDialog(QDialog):
         self.table.setAlternatingRowColors(True)
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table, 1)
+        layout.addWidget(self._build_verify_group())
 
         buttons = QDialogButtonBox()
         defaults_button = QPushButton("Board defaults")
@@ -1397,8 +1568,32 @@ class HardwareSettingsDialog(QDialog):
 
         self.board_combo.currentIndexChanged.connect(self._on_board_changed)
         self.rate_combo.currentIndexChanged.connect(self._on_rate_changed)
+        self.reference_combo.currentIndexChanged.connect(self._on_reference_changed)
         self._populate_table()
         self._update_rate_note()
+        self._update_reference_note()
+
+    # -- configuration check ----------------------------------------------
+
+    def set_connected(self, connected: bool) -> None:
+        self._connected = bool(connected)
+        self.verify_button.setEnabled(self._connected)
+
+    def _on_verify_clicked(self) -> None:
+        # Stage the current dialog state first, so verification compares what
+        # the board *should* hold after the next apply.
+        self.verifyRequested.emit(self.collect())
+
+    def set_verify_result(self, text: str, state: str = "info") -> None:
+        colours = {"error": "#b91c1c", "success": "#15803d", "busy": "#b45309"}
+        self.verify_result_label.setStyleSheet(
+            f"color: {colours.get(state, '#475569')}; font-size: 11px;"
+        )
+        self.verify_result_label.setText(text)
+
+    def set_verify_busy(self, busy: bool) -> None:
+        self.verify_button.setEnabled(self._connected and not busy)
+        self.verify_button.setText("Verifying..." if busy else "Verify board configuration")
 
     # -- table plumbing ----------------------------------------------------
 
@@ -1426,15 +1621,9 @@ class HardwareSettingsDialog(QDialog):
             bias = QComboBox()
             bias.addItems(["Include", "Exclude"])
             bias.setCurrentIndex(0 if (setting and setting.bias) else 1)
-            srb2 = QComboBox()
-            srb2.addItems(["On", "Off"])
-            srb2.setCurrentIndex(0 if (setting and setting.srb2) else 1)
-            srb1 = QComboBox()
-            srb1.addItems(["Off", "On"])
-            srb1.setCurrentIndex(1 if (setting and setting.srb1) else 0)
             status = QLabel(self._status_text(self._statuses.get(row, "")))
 
-            widgets = (select, active, gain, input_combo, bias, srb2, srb1)
+            widgets = (select, active, gain, input_combo, bias)
             if padding:
                 for widget in widgets:
                     widget.setEnabled(False)
@@ -1443,9 +1632,7 @@ class HardwareSettingsDialog(QDialog):
             self.table.setCellWidget(row, 3, gain)
             self.table.setCellWidget(row, 4, input_combo)
             self.table.setCellWidget(row, 5, bias)
-            self.table.setCellWidget(row, 6, srb2)
-            self.table.setCellWidget(row, 7, srb1)
-            self.table.setCellWidget(row, 8, status)
+            self.table.setCellWidget(row, 6, status)
             self.table.setRowHeight(row, 30)
 
             self._rows.append(
@@ -1455,8 +1642,6 @@ class HardwareSettingsDialog(QDialog):
                     "gain": gain,
                     "input": input_combo,
                     "bias": bias,
-                    "srb2": srb2,
-                    "srb1": srb1,
                     "status": status,
                     "padding": padding,
                 }
@@ -1466,6 +1651,27 @@ class HardwareSettingsDialog(QDialog):
         self.table.setColumnWidth(2, 44)
         self._update_summary()
 
+    def _build_verify_group(self) -> QGroupBox:
+        verify_group = QGroupBox("Configuration check")
+        verify_layout = QVBoxLayout(verify_group)
+        verify_row = QHBoxLayout()
+        self.verify_button = QPushButton("Verify board configuration")
+        self.verify_button.setToolTip(
+            "Ask the board to clock every ADS1299 register back out over serial and compare it with "
+            "the staged settings. Can be run as often as you like."
+        )
+        self.verify_button.setEnabled(False)
+        self.verify_button.clicked.connect(self._on_verify_clicked)
+        verify_row.addWidget(self.verify_button)
+        verify_row.addStretch(1)
+        verify_layout.addLayout(verify_row)
+        self.verify_result_label = QLabel("Connect the board to enable the register readback.")
+        self.verify_result_label.setWordWrap(True)
+        self.verify_result_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.verify_result_label.setStyleSheet("color: #475569; font-size: 11px;")
+        verify_layout.addWidget(self.verify_result_label)
+        return verify_group
+
     def _sync_row(self, row: int) -> None:
         widgets = self._rows[row]
         setting = self._channels[row]
@@ -1473,8 +1679,6 @@ class HardwareSettingsDialog(QDialog):
         widgets["gain"].setCurrentIndex(setting.gain_ordinal)
         widgets["input"].setCurrentIndex(setting.input_ordinal)
         widgets["bias"].setCurrentIndex(0 if setting.bias else 1)
-        widgets["srb2"].setCurrentIndex(0 if setting.srb2 else 1)
-        widgets["srb1"].setCurrentIndex(1 if setting.srb1 else 0)
 
     def _collect_from_rows(self) -> None:
         for row, widgets in enumerate(self._rows):
@@ -1485,16 +1689,39 @@ class HardwareSettingsDialog(QDialog):
             setting.gain_ordinal = int(widgets["gain"].currentIndex())
             setting.input_ordinal = int(widgets["input"].currentIndex())
             setting.bias = widgets["bias"].currentIndex() == 0
-            setting.srb2 = widgets["srb2"].currentIndex() == 0
-            setting.srb1 = widgets["srb1"].currentIndex() == 1
 
     def collect(self) -> HardwareSettings:
         self._collect_from_rows()
-        return HardwareSettings(
+        hardware = HardwareSettings(
             board_channels=self._board_channels,
             sample_rate_code=self._rate_code,
+            reference_mode=self._reference_mode,
             channels=[channel.copy() for channel in self._channels],
         )
+        hardware.sync_reference()
+        return hardware
+
+    def _on_reference_changed(self) -> None:
+        self._reference_mode = str(self.reference_combo.currentData() or REFERENCE_MODE_SRB2)
+        self._update_reference_note()
+
+    def _update_reference_note(self) -> None:
+        if self._reference_mode == REFERENCE_MODE_SRB1:
+            text = (
+                "SRB1 closes one switch inside each ADS1299 (MISC1 bit 5), so every channel's negative "
+                "input goes to the SRB1 pin at once. Connect the reference electrode to SRB1."
+            )
+        elif self._reference_mode == REFERENCE_MODE_SRB2:
+            text = (
+                "SRB2 switches each channel's negative input to the SRB2 pin (CHnSET bit 3). "
+                "Connect the reference electrode to SRB2."
+            )
+        else:
+            text = (
+                "True differential: no SRB routing at all. Every channel needs its own INP and INN "
+                "electrode, and the bias/DRL electrode keeps the common mode in range."
+            )
+        self.reference_note.setText(text)
 
     def _on_board_changed(self) -> None:
         board_channels = int(self.board_combo.currentData() or 16)
@@ -1525,6 +1752,7 @@ class HardwareSettingsDialog(QDialog):
             text = f"per channel: {rate:g} Hz"
         if self._link_limit:
             text += f"  |  serial link: up to {self._link_limit} SPS"
+        text += f"  |  SPI link: up to {max_sample_rate_from_spi(ADS_SPI_CLOCK_HZ, 2)} SPS"
         self.rate_note.setText(text)
 
     def _set_selection(self, checked: bool) -> None:
@@ -1543,8 +1771,6 @@ class HardwareSettingsDialog(QDialog):
         gain = self.bulk_gain.currentIndex()
         input_ordinal = self.bulk_input.currentIndex()
         bias = self.bulk_bias.currentIndex() == 0
-        srb2 = self.bulk_srb2.currentIndex() == 0
-        srb1 = self.bulk_srb1.currentIndex() == 1
         for row, widgets in enumerate(self._rows):
             if widgets["padding"] or row >= len(self._channels):
                 continue
@@ -1554,8 +1780,6 @@ class HardwareSettingsDialog(QDialog):
             setting.gain_ordinal = gain
             setting.input_ordinal = input_ordinal
             setting.bias = bias
-            setting.srb2 = srb2
-            setting.srb1 = srb1
             self._sync_row(row)
 
     def _restore_defaults(self) -> None:
@@ -1564,6 +1788,9 @@ class HardwareSettingsDialog(QDialog):
         for row in range(len(self._channels)):
             self._channels[row] = ChannelSetting()
             self._sync_row(row)
+        self._reference_mode = REFERENCE_MODE_SRB2
+        self.reference_combo.setCurrentIndex(max(self.reference_combo.findData(self._reference_mode), 0))
+        self._update_reference_note()
 
     def _emit_apply(self, selected_only: bool) -> None:
         self._collect_from_rows()
@@ -1801,6 +2028,15 @@ class LiveRecorderWindow(QMainWindow):
         self.accel_ring = RingBuffer(int(BUFFER_SECONDS * 20.0), 3)
         self._last_aux_counts: Optional[np.ndarray] = None
         self._accel_zero_ticks = 0
+        # Slowly tracked mean of the raw signal: the part below ~0.1 Hz that the
+        # display filters remove. alpha comes from the sample rate in _rebuild_buffers.
+        self._dc_state: Optional[np.ndarray] = None
+        self._dc_alpha = 1.0
+        self._zero_seconds = np.zeros(self.channel_count, dtype=np.float64)
+        self._rail_seconds = np.zeros(self.channel_count, dtype=np.float64)
+        self._channel_states: dict[int, str] = {}
+        self._stalled_channels: set[int] = set()
+        self._real_mask: Optional[np.ndarray] = None
         self._rate_downgrade_note = ""
         self.stream_health: Optional[tuple[int, int, int]] = None
         self.filter = StreamingFilter(self.sample_rate, self.channel_count)
@@ -1829,6 +2065,15 @@ class LiveRecorderWindow(QMainWindow):
         self._apply_timer.setSingleShot(True)
         self._apply_timer.timeout.connect(self._on_apply_timeout)
 
+        self._verify_timer = QTimer(self)
+        self._verify_timer.setSingleShot(True)
+        self._verify_timer.timeout.connect(self._on_verify_timeout)
+        self._verify_lines: list[str] = []
+        self._verify_pending = False
+        self._pending_verify_hardware: Optional[HardwareSettings] = None
+        self.verify_result_text = ""
+        self.verify_result_state = "info"
+
         self._probe_timer = QTimer(self)
         self._probe_timer.setSingleShot(True)
         self._probe_timer.timeout.connect(self._probe_board)
@@ -1850,6 +2095,7 @@ class LiveRecorderWindow(QMainWindow):
         self.spectrum_panel.ensure_channels(labels)
         self._refresh_annotations()
         self._ui_timer.start()
+        QTimer.singleShot(400, self._autoconnect)
 
     # -- construction ------------------------------------------------------
 
@@ -1949,6 +2195,12 @@ class LiveRecorderWindow(QMainWindow):
         self.stream_button.toggled.connect(self._on_stream_toggled)
         button_row.addWidget(self.stream_button)
         layout.addLayout(button_row)
+
+        self.auto_connect_check = QCheckBox("Auto-connect on start")
+        self.auto_connect_check.setToolTip(
+            "On startup, connect to the port used last time (or COM5) without asking."
+        )
+        layout.addWidget(self.auto_connect_check)
 
         self.connection_label = QLabel("Not connected")
         self.connection_label.setWordWrap(True)
@@ -2089,6 +2341,13 @@ class LiveRecorderWindow(QMainWindow):
         none_button.clicked.connect(lambda: self._set_all_channels(False))
         row.addWidget(none_button)
         layout.addLayout(row)
+
+        self.channel_warning_label = QLabel("")
+        self.channel_warning_label.setWordWrap(True)
+        self.channel_warning_label.setStyleSheet("color: #b91c1c; font-size: 11px; font-weight: 600;")
+        self.channel_warning_label.setVisible(False)
+        layout.addWidget(self.channel_warning_label)
+
         self.channel_checkboxes: list[QCheckBox] = []
         return group
 
@@ -2102,13 +2361,39 @@ class LiveRecorderWindow(QMainWindow):
 
         button_row = QHBoxLayout()
         self.hardware_button = QPushButton("Hardware settings...")
+        self.hardware_button.setToolTip(
+            "Per-channel gain/input/bias, the reference mode and the Verify button live there."
+        )
         self.hardware_button.clicked.connect(self.open_hardware_settings)
         button_row.addWidget(self.hardware_button)
         self.reapply_button = QPushButton("Re-apply saved")
-        self.reapply_button.setToolTip("Send the saved sample rate and channel settings to the board again")
+        self.reapply_button.setToolTip("Send the saved sample rate, reference mode and channel settings again")
         self.reapply_button.clicked.connect(lambda: self.apply_hardware())
         button_row.addWidget(self.reapply_button)
         layout.addLayout(button_row)
+
+        reference_row = QHBoxLayout()
+        reference_row.addWidget(QLabel("Reference"))
+        self.reference_combo = QComboBox()
+        for label, value in REFERENCE_MODE_CHOICES:
+            self.reference_combo.addItem(label, value)
+        self.reference_combo.setToolTip(
+            "One setting for the whole board.\n"
+            "True differential: every channel measures its own INP- INN pair.\n"
+            "SRB1: all negative inputs are tied to the SRB1 pin (one switch per ADS1299, "
+            "so it can never be per channel).\n"
+            "SRB2: every channel's negative input is switched to the SRB2 pin.\n"
+            "The mode is applied last when the settings are written, so a wrong combination "
+            "cannot be left on the chip."
+        )
+        self.reference_combo.currentIndexChanged.connect(self._on_reference_changed)
+        reference_row.addWidget(self.reference_combo, 1)
+        layout.addLayout(reference_row)
+
+        self.reference_note = QLabel("")
+        self.reference_note.setWordWrap(True)
+        self.reference_note.setStyleSheet("color: #64748b; font-size: 11px;")
+        layout.addWidget(self.reference_note)
 
         quick = QGridLayout()
         quick.setHorizontalSpacing(6)
@@ -2120,20 +2405,12 @@ class LiveRecorderWindow(QMainWindow):
         self.quick_input.addItems(list(INPUT_TYPE_LABELS))
         self.quick_bias = QComboBox()
         self.quick_bias.addItems(["Include", "Exclude"])
-        self.quick_srb2 = QComboBox()
-        self.quick_srb2.addItems(["On", "Off"])
-        self.quick_srb1 = QComboBox()
-        self.quick_srb1.addItems(["Off", "On"])
         quick.addWidget(QLabel("Gain"), 0, 0)
         quick.addWidget(self.quick_gain, 0, 1)
         quick.addWidget(QLabel("Input"), 0, 2)
         quick.addWidget(self.quick_input, 0, 3)
         quick.addWidget(QLabel("Bias"), 1, 0)
         quick.addWidget(self.quick_bias, 1, 1)
-        quick.addWidget(QLabel("SRB2"), 1, 2)
-        quick.addWidget(self.quick_srb2, 1, 3)
-        quick.addWidget(QLabel("SRB1"), 2, 0)
-        quick.addWidget(self.quick_srb1, 2, 1)
         layout.addLayout(quick)
 
         self.quick_apply_button = QPushButton("Apply these to all channels")
@@ -2242,14 +2519,39 @@ class LiveRecorderWindow(QMainWindow):
         self.accel_threshold_spin.setValue(self.view.accel_motion_threshold_g)
         self.accel_baseline_spin.setValue(self.view.accel_baseline_seconds)
         self._update_accel_scale_label()
+        # Restore the filter controls with the change signals detached: each
+        # handler writes the whole filter state back, so touching one widget
+        # would overwrite the others with their not-yet-restored values.
+        blockers = [
+            QSignalBlocker(widget)
+            for widget in (
+                self.notch_50_check,
+                self.notch_100_check,
+                self.notch_q_spin,
+                self.high_pass_combo,
+                self.low_pass_combo,
+                self.accel_scale_combo,
+                self.accel_threshold_spin,
+                self.accel_baseline_spin,
+            )
+        ]
         self.notch_50_check.setChecked(self.view.notch_50)
         self.notch_100_check.setChecked(self.view.notch_100)
         self.notch_q_spin.setValue(self.view.notch_q)
         self._select_combo_value(self.high_pass_combo, self.view.high_pass_hz)
         self._select_combo_value(self.low_pass_combo, self.view.low_pass_hz)
+        del blockers
         self.record_visible_check.setChecked(bool(self.view.record_visible_only))
         self._update_record_scope_label()
         self.spectrum_panel.set_sample_rate(self.sample_rate)
+        self.auto_connect_check.setChecked(bool(self.settings.auto_connect))
+        self.auto_connect_check.toggled.connect(self._on_auto_connect_changed)
+        self.hardware.sync_reference()
+        position = self.reference_combo.findData(self.hardware.normalised_reference_mode())
+        self.reference_combo.blockSignals(True)
+        self.reference_combo.setCurrentIndex(position if position >= 0 else 0)
+        self.reference_combo.blockSignals(False)
+        self._update_reference_note()
 
         self.time_panel.scale_combo.currentIndexChanged.connect(self._on_view_changed)
         self.time_panel.window_combo.currentIndexChanged.connect(self._on_view_changed)
@@ -2288,6 +2590,46 @@ class LiveRecorderWindow(QMainWindow):
         self.view.record_visible_only = self.record_visible_check.isChecked()
         self._update_record_scope_label()
         self._save_settings()
+
+    def _on_auto_connect_changed(self, checked: bool) -> None:
+        self.settings.auto_connect = bool(checked)
+        self._save_settings()
+
+    def _on_reference_changed(self, *_args) -> None:
+        mode = str(self.reference_combo.currentData() or REFERENCE_MODE_SRB2)
+        if mode == self.hardware.reference_mode:
+            self._update_reference_note()
+            return
+        if self.recording is not None:
+            # Reject the change instead of leaving the combo and the board apart.
+            self.reference_combo.blockSignals(True)
+            self.reference_combo.setCurrentIndex(
+                max(self.reference_combo.findData(self.hardware.reference_mode), 0)
+            )
+            self.reference_combo.blockSignals(False)
+            QMessageBox.information(
+                self, "Reference", "Stop the recording before changing the reference mode."
+            )
+            return
+        self.hardware.set_reference_mode(mode)
+        if self._settings_dialog is not None:
+            position = self._settings_dialog.reference_combo.findData(mode)
+            if position >= 0:
+                self._settings_dialog.reference_combo.setCurrentIndex(position)
+        self._update_reference_note()
+        self._save_settings()
+        if self.connected:
+            self.apply_hardware()
+
+    def _update_reference_note(self) -> None:
+        mode = self.hardware.normalised_reference_mode()
+        if mode == REFERENCE_MODE_SRB1:
+            text = "SRB1 pin is the shared reference for every input of a converter."
+        elif mode == REFERENCE_MODE_SRB2:
+            text = "SRB2 pin is the shared reference (per-channel switch, applied to all)."
+        else:
+            text = "No SRB routing: every channel needs its own INP and INN."
+        self.reference_note.setText(text)
 
     def _record_indices(self) -> list[int]:
         """Physical channel indices that the next recording will store."""
@@ -2350,7 +2692,8 @@ class LiveRecorderWindow(QMainWindow):
         self.view.low_pass_hz = float(self.low_pass_combo.currentData() or 0.0)
         self.settings.hardware = self.hardware
         self.settings.session_name = self.session_name_edit.text().strip() or "session"
-        self.settings.last_port = str(self.port_combo.currentData() or "")
+        port = str(self.port_combo.currentData() or "")
+        self.settings.last_port = "" if port == DEMO_PORT else port
         self.settings.baud_rate = int(self.baud_combo.currentData() or DEFAULT_BAUD)
         try:
             self.store.save(self.settings)
@@ -2396,6 +2739,32 @@ class LiveRecorderWindow(QMainWindow):
         if list_ports is None:
             self.connection_label.setText("pyserial is not installed - only the DEMO source is available")
         self._save_settings()
+
+    def _autoconnect_port(self) -> Optional[str]:
+        """Port to open on startup: the last one used, else the saved default."""
+
+        candidates: list[str] = []
+        if self.settings.last_port and self.settings.last_port != DEMO_PORT:
+            candidates.append(self.settings.last_port)
+        candidates.append(AUTOCONNECT_FALLBACK_PORT)
+        for candidate in candidates:
+            if candidate and candidate != DEMO_PORT and self.port_combo.findData(candidate) >= 0:
+                return candidate
+        return None
+
+    def _autoconnect(self) -> None:
+        if not self.auto_connect_check.isChecked() or self.connected or self.worker is not None:
+            return
+        port = self._autoconnect_port()
+        if not port:
+            return
+        index = self.port_combo.findData(port)
+        if index < 0:
+            return
+        self.port_combo.setCurrentIndex(index)
+        self.connection_label.setText(f"Auto-connecting to {port}...")
+        self._log("in", f"[connection] auto-connecting to {port}", "info")
+        self.connect_button.setChecked(True)
 
     def _on_connect_toggled(self, checked: bool) -> None:
         if checked:
@@ -2447,6 +2816,11 @@ class LiveRecorderWindow(QMainWindow):
         self._info_timer.stop()
         self._apply_timer.stop()
         self._apply_current = None
+        self._verify_timer.stop()
+        self._verify_pending = False
+        self._verify_lines = []
+        self._set_dialog_connected(False)
+        self._set_verify_result("")
         if self.recording is not None:
             self.stop_recording()
         worker = self.worker
@@ -2500,6 +2874,10 @@ class LiveRecorderWindow(QMainWindow):
             self.board_info["sd"] = stripped.split(":", 1)[1].strip()
         elif stripped.startswith("Firmware:"):
             self.board_info["firmware"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("SPI clock:"):
+            self.board_info["spi"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("SPI link limit:"):
+            self.board_info["spi_limit"] = stripped.split(":", 1)[1].strip()
         elif stripped.startswith("=== POST"):
             self.board_info["post"] = stripped
         elif stripped.startswith("Hardware") and ":" in stripped:
@@ -2538,6 +2916,8 @@ class LiveRecorderWindow(QMainWindow):
             parts.append(f"SD {self.board_info['sd']}")
         if "firmware" in self.board_info:
             parts.append(f"fw {self.board_info['firmware']}")
+        if "spi_limit" in self.board_info:
+            parts.append(f"SPI {self.board_info['spi_limit']}")
         self.board_info_label.setText(" | ".join(parts) if parts else "No board details received")
         self.board_info_label.setToolTip("\n".join(f"{key}: {value}" for key, value in self.board_info.items()))
 
@@ -2548,6 +2928,7 @@ class LiveRecorderWindow(QMainWindow):
         self.connect_button.setText("Disconnect" if connected else "Connect")
         self.stream_button.setEnabled(connected)
         self.record_button.setEnabled(connected)
+        self._set_dialog_connected(connected)
         self.port_combo.setEnabled(not connected)
         self.refresh_button.setEnabled(not connected)
         self.baud_combo.setEnabled(not connected)
@@ -2705,13 +3086,23 @@ class LiveRecorderWindow(QMainWindow):
             return
 
         requested_rate = self.hardware.packet_rate_hz
-        limit = self._link_packet_rate()
+        ba = self._current_baud()
+        serial_limit = max_sustained_packet_rate(ba)
+        spi_limit = self._spi_sample_rate()
+        limit = max_usable_sample_rate(ba, ADS_SPI_CLOCK_HZ, 2)
         if requested_rate > limit:
-            supported = [rate for rate, _code in supported_packet_rates(self._current_baud())]
+            supported = [rate for rate, _code in supported_packet_rates(ba) if rate <= spi_limit]
+            if spi_limit < serial_limit:
+                reason = (
+                    f"{spi_limit:g} SPS is the SPI limit "
+                    f"({spi_frame_microseconds(ADS_SPI_CLOCK_HZ, 2):.0f} us per sample at "
+                    f"{ADS_SPI_CLOCK_HZ / 1e6:g} MHz)"
+                )
+            else:
+                reason = f"{ba / 1000:.0f} kbit/s of serial carries {serial_limit:g} SPS"
             fallback = supported[-1] if supported else 250
             message = (
-                f"{requested_rate:g} SPS needs {requested_rate * 330 / 1000:.0f} kbit/s but the serial link "
-                f"carries {self._current_baud() / 1000:.0f} kbit/s; using {fallback:g} SPS instead."
+                f"{requested_rate:g} SPS is above the link budget: {reason}; using {fallback:g} SPS instead."
             )
             self._log("in", f"[settings] {message}", "error")
             self._set_apply_summary(message, error=True)
@@ -2719,7 +3110,10 @@ class LiveRecorderWindow(QMainWindow):
             self.hardware.sample_rate_code = CODE_BY_SAMPLE_RATE[fallback]
             self._save_settings()
             self._update_hardware_labels()
+            # The buffers, the FFT axis and the time base are sized from this.
+            self._rebuild_buffers()
 
+        self.hardware.sync_reference()
         indices = list(channels) if channels is not None else real_channel_indices(self.hardware.board_channels)
         indices = [index for index in indices if index < len(self.hardware.channels)]
         plan: list[tuple[Optional[int], bytes, str]] = [
@@ -2731,6 +3125,11 @@ class LiveRecorderWindow(QMainWindow):
         ]
         for index in indices:
             plan.append((index, build_channel_command(index, self.hardware.channels[index]), f"channel {index + 1}"))
+        # Last, so the SRB routing is always the final state on the chip and can
+        # never be left half applied by a per-channel write.
+        plan.append(
+            (None, build_reference_command(self.hardware.reference_mode), f"reference {self.hardware.reference_mode}")
+        )
 
         self._apply_plan = plan
         self._apply_index = 0
@@ -2822,13 +3221,148 @@ class LiveRecorderWindow(QMainWindow):
             color = "#475569"
         self.apply_status_label.setStyleSheet(f"color: {color};")
 
+    # -- configuration verification ---------------------------------------
+
+    def verify_configuration(self, hardware: Optional[HardwareSettings] = None) -> None:
+        """Ask the board to read every ADS1299 register back and compare it."""
+
+        if hardware is not None:
+            self._pending_verify_hardware = hardware
+        if not self.connected or self.worker is None:
+            self._set_verify_result("Connect the board before verifying the configuration.", error=True)
+            return
+        if self.recording is not None:
+            self._set_verify_result("Stop the recording before verifying the configuration.", error=True)
+            return
+        if self._verify_pending:
+            return
+        self._verify_lines = []
+        self._verify_pending = True
+        self._set_verify_busy(True)
+        self._set_verify_result("Reading the ADS1299 registers back...", state="busy")
+        self._send(b"P")
+        self._verify_timer.start(VERIFY_TIMEOUT_MS)
+
+    def _set_dialog_connected(self, connected: bool) -> None:
+        dialog = self._settings_dialog
+        if dialog is not None:
+            dialog.set_connected(connected)
+
+    def _set_verify_busy(self, busy: bool) -> None:
+        dialog = self._settings_dialog
+        if dialog is not None:
+            dialog.set_verify_busy(busy)
+
+    def _on_verify_line(self, text: str) -> bool:
+        """Consume one ``[CFG]`` line; returns True when the report is complete."""
+
+        self._verify_lines.append(text)
+        return "DONE=1" in text
+
+    def _on_verify_timeout(self) -> None:
+        if not self._verify_pending:
+            return
+        self._verify_pending = False
+        self._set_verify_busy(False)
+        message = "The board did not answer the register readback."
+        self._set_verify_result(message, error=True)
+        self._log("in", f"[verify] {message}", "error")
+
+    def _finish_verify(self) -> None:
+        self._verify_timer.stop()
+        self._verify_pending = False
+        self._set_verify_busy(False)
+
+        # Compare against the settings the verify was requested with (the dialog
+        # stages its edits), falling back to the saved ones.
+        expected = self._pending_verify_hardware or self.hardware
+        self._pending_verify_hardware = None
+
+        report = parse_configuration_report(self._verify_lines)
+        rate_line = next((line for line in self._verify_lines if "DONE=1" in line), "")
+        board_rate = self._int_field(rate_line, "SPS")
+        board_code = self._int_field(rate_line, "CODE")
+        board_spi = self._int_field(rate_line, "SPILIMIT")
+
+        if not report:
+            self._set_verify_result("No register data came back from the board.", error=True)
+            return
+
+        checks, notes = compare_configuration(report, expected)
+        checked_channels = sum(
+            len(expectation.channel_regs) for expectation in expected_device_registers(expected)
+        )
+        details: list[str] = []
+        for expectation in expected_device_registers(expected):
+            regs = report.get(expectation.name)
+            if not regs:
+                continue
+            mismatched = [check for check in checks if check.device == expectation.name]
+            channel_hits = sum(1 for check in mismatched if check.label.endswith("SET"))
+            details.append(
+                f"{expectation.name}: ID 0x{regs[0]:02X}, CONFIG1 0x{regs[0x01]:02X}, "
+                f"{len(expectation.channel_regs) - channel_hits}/{len(expectation.channel_regs)} channels match"
+            )
+
+        problems: list[str] = []
+        if board_code is not None and board_code != int(expected.sample_rate_code):
+            problems.append(
+                f"sample rate code is {board_code}, expected {int(expected.sample_rate_code)}"
+            )
+        if board_rate is not None and abs(board_rate - expected.packet_rate_hz) > 1e-6:
+            problems.append(f"board sample rate is {board_rate} SPS")
+        if board_spi is not None and board_spi != max_sample_rate_from_spi(ADS_SPI_CLOCK_HZ, 2):
+            notes.append(f"board SPI budget is {board_spi} SPS, firmware constant here differs")
+
+        all_good = not checks and not problems
+        lines = details + notes + problems
+        lines += [check.describe() for check in checks[:8]]
+        if len(checks) > 8:
+            lines.append(f"... {len(checks) - 8} more register mismatch(es), see the serial monitor")
+
+        if all_good:
+            summary = (
+                f"Configuration verified: all {checked_channels} channels and both converters match "
+                "the saved settings."
+            )
+            self._set_verify_result("\n".join([summary] + lines), success=True)
+        else:
+            summary = (
+                f"Configuration mismatch: {len(checks)} register(s)"
+                + (f" and {len(problems)} rate problem(s)" if problems else "")
+                + " differ from the saved settings."
+            )
+            self._set_verify_result("\n".join([summary] + lines), error=True)
+        self._log("in", f"[verify] {summary}", "info" if all_good else "error")
+
+    @staticmethod
+    def _int_field(line: str, key: str) -> Optional[int]:
+        match = re.search(rf"\b{re.escape(key)}=(\d+)", line or "")
+        return int(match.group(1)) if match else None
+
+    def _set_verify_result(
+        self, text: str, error: bool = False, success: bool = False, state: Optional[str] = None
+    ) -> None:
+        resolved = state or ("error" if error else ("success" if success else "info"))
+        self.verify_result_text = text
+        self.verify_result_state = resolved
+        dialog = self._settings_dialog
+        if dialog is not None:
+            dialog.set_verify_result(text, state=resolved)
+
     def _set_hardware(self, hardware: HardwareSettings) -> None:
         rate_changed = abs(hardware.sample_rate_hz - self.sample_rate) > 1e-9
         board_changed = hardware.board_channels != self.hardware.board_channels
+        hardware.sync_reference()
         self.hardware = hardware
         self.settings.hardware = hardware
         self.channel_count = 16 if hardware.board_channels > 8 else 8
         self.view.ensure_visibility(self.channel_count)
+        position = self.reference_combo.findData(hardware.normalised_reference_mode())
+        self.reference_combo.blockSignals(True)
+        self.reference_combo.setCurrentIndex(position if position >= 0 else 0)
+        self.reference_combo.blockSignals(False)
+        self._update_reference_note()
         self._save_settings()
         if self.worker is not None:
             self.worker.set_gains(hardware.physical_gains())
@@ -2842,14 +3376,29 @@ class LiveRecorderWindow(QMainWindow):
     def _link_packet_rate(self) -> int:
         return max_sustained_packet_rate(self._current_baud())
 
+    def _spi_sample_rate(self) -> int:
+        devices = 2
+        return max_sample_rate_from_spi(ADS_SPI_CLOCK_HZ, devices)
+
     def _update_hardware_labels(self) -> None:
         board = "16 channels (Cyton + Daisy)" if self.hardware.board_channels > 8 else "8 channels (Cyton)"
+        frame_us = spi_frame_microseconds(ADS_SPI_CLOCK_HZ, 2)
+        spi_limit = self._spi_sample_rate()
+        serial_limit = self._link_packet_rate()
+        binding = "SPI" if spi_limit < serial_limit else "serial"
         text = (
             f"Board: {board}\n"
             f"ADS rate {self.hardware.packet_rate_hz:g} SPS, {self.hardware.sample_rate_hz:g} Hz per channel\n"
-            f"Serial link supports up to {self._link_packet_rate():g} SPS at {self._current_baud()} baud"
+            f"SPI link ({ADS_SPI_CLOCK_HZ / 1e6:g} MHz, {frame_us:.0f} us/sample) supports up to {spi_limit:g} SPS\n"
+            f"Serial link ({self._current_baud()} baud) supports up to {serial_limit:g} SPS\n"
+            f"Limit in force: {binding}"
         )
         self.board_label.setText(text)
+        self.board_label.setToolTip(
+            "Each ADS1299 answers a 216-bit RDATAC frame and both converters are read inside the "
+            "same sample period, so one sample costs two frames on the SPI bus. Both budgets keep "
+            "10% headroom."
+        )
 
     def _apply_quick_settings(self) -> None:
         if self.recording is not None:
@@ -2858,8 +3407,6 @@ class LiveRecorderWindow(QMainWindow):
         gain = self.quick_gain.currentIndex()
         input_ordinal = self.quick_input.currentIndex()
         bias = self.quick_bias.currentIndex() == 0
-        srb2 = self.quick_srb2.currentIndex() == 0
-        srb1 = self.quick_srb1.currentIndex() == 1
         for index in real_channel_indices(self.hardware.board_channels):
             if index >= len(self.hardware.channels):
                 continue
@@ -2867,8 +3414,7 @@ class LiveRecorderWindow(QMainWindow):
             setting.gain_ordinal = gain
             setting.input_ordinal = input_ordinal
             setting.bias = bias
-            setting.srb2 = srb2
-            setting.srb1 = srb1
+        self.hardware.sync_reference()
         self._save_settings()
         self.apply_hardware()
 
@@ -2879,12 +3425,24 @@ class LiveRecorderWindow(QMainWindow):
             return
         dialog = HardwareSettingsDialog(self.hardware, self.apply_status, self, link_limit=self._link_packet_rate())
         dialog.applyRequested.connect(self._on_dialog_apply)
+        dialog.verifyRequested.connect(self._on_dialog_verify)
         dialog.finished.connect(self._on_settings_dialog_closed)
+        dialog.set_connected(self.connected)
+        if self.verify_result_text:
+            dialog.set_verify_result(self.verify_result_text, state=self.verify_result_state)
         self._settings_dialog = dialog
         dialog.show()
 
     def _on_settings_dialog_closed(self, *_args) -> None:
         self._settings_dialog = None
+
+    def _on_dialog_verify(self, hardware: HardwareSettings) -> None:
+        if self.recording is not None:
+            QMessageBox.information(
+                self, "Verify", "Stop the recording before verifying the configuration."
+            )
+            return
+        self.verify_configuration(hardware)
 
     def _on_dialog_apply(self, hardware: HardwareSettings, indices: list) -> None:
         if self.recording is not None:
@@ -2983,6 +3541,14 @@ class LiveRecorderWindow(QMainWindow):
         self.packet_loss = 0
         self._measured_rate = 0.0
         self._rate_history.clear()
+        self._dc_state = None
+        self._zero_seconds = np.zeros(self.channel_count, dtype=np.float64)
+        self._rail_seconds = np.zeros(self.channel_count, dtype=np.float64)
+        self._channel_states = {}
+        self._stalled_channels = set()
+        self._real_mask = None
+        self.time_panel.set_channel_states({})
+        self._update_channel_warning()
         self.time_panel.clear()
         self.spectrum_panel.clear()
     # -- data flow ---------------------------------------------------------
@@ -3003,6 +3569,7 @@ class LiveRecorderWindow(QMainWindow):
             self._rebuild_buffers()
             return
         self.display_ring.append(self.filter.process(samples))
+        self._track_signal_health(samples)
 
         if aux.ndim != 2 or aux.shape[1] != 3:
             aux = np.zeros((count, 3), dtype=np.float64)
@@ -3024,9 +3591,103 @@ class LiveRecorderWindow(QMainWindow):
             times = (np.arange(count, dtype=np.float64) + start_index - self.record_start_sample) / self.sample_rate
             self.recording.append(times, samples[:, usable], accel_g)
 
+    def _real_channel_mask(self) -> np.ndarray:
+        """True for GUI channels that map to a real ADS input."""
+
+        if self._real_mask is None or self._real_mask.shape[0] != self.channel_count:
+            mapping = physical_channel_map(self.hardware.board_channels)
+            mask = np.zeros(self.channel_count, dtype=bool)
+            for index in range(min(len(mapping), self.channel_count)):
+                mask[index] = mapping[index] is not None
+            self._real_mask = mask
+        return self._real_mask
+
+    def _channel_full_scale(self) -> np.ndarray:
+        """Full-scale amplitude in uV per GUI channel (VREF/gain)."""
+
+        limits = np.full(self.channel_count, VREF_VOLTS * 1e6 / 1.0)
+        mapping = physical_channel_map(self.hardware.board_channels)
+        for gui_index, real in enumerate(mapping):
+            if real is None or gui_index >= min(len(mapping), self.channel_count):
+                continue
+            if gui_index < len(self.hardware.channels):
+                gain = max(float(self.hardware.channels[gui_index].gain_scalar), 1.0)
+                limits[gui_index] = VREF_VOLTS * 1e6 / gain
+        return limits
+
+    def _track_signal_health(self, samples: np.ndarray) -> None:
+        """Track the sub-0.1 Hz mean and flag dead or saturated inputs."""
+
+        count = int(samples.shape[0])
+        if count <= 0 or self.sample_rate <= 0:
+            return
+        channels = int(samples.shape[1])
+        if self._dc_state is None or self._dc_state.shape[0] != channels:
+            self._dc_state = samples.mean(axis=0)
+            self._dc_alpha = 1.0 - float(np.exp(-2.0 * np.pi * DC_CUTOFF_HZ / self.sample_rate))
+            self._zero_seconds = np.zeros(channels, dtype=np.float64)
+            self._rail_seconds = np.zeros(channels, dtype=np.float64)
+        # Exponential average with a 0.1 Hz corner: one update per sample, so a
+        # whole batch is folded in with the closed-form weight.
+        decay = float((1.0 - self._dc_alpha) ** count)
+        batch_mean = samples.mean(axis=0)
+        self._dc_state = decay * self._dc_state + (1.0 - decay) * batch_mean
+
+        duration = count / float(self.sample_rate)
+        real = self._real_channel_mask()[:channels]
+        flat = np.all(samples == 0.0, axis=0) & real
+        limits = self._channel_full_scale()[:channels]
+        saturated = np.all(np.abs(samples) >= (RAIL_FRACTION * limits), axis=0) & real
+        self._zero_seconds = np.where(flat, self._zero_seconds + duration, 0.0)
+        self._rail_seconds = np.where(saturated, self._rail_seconds + duration, 0.0)
+
+        states: dict[int, str] = {}
+        for index in range(self.channel_count):
+            if index >= channels:
+                states[index] = "ok"
+            elif self._zero_seconds[index] >= STALL_SECONDS:
+                states[index] = "stall"
+            elif self._rail_seconds[index] >= RAIL_SECONDS:
+                states[index] = "rail"
+            else:
+                states[index] = "ok"
+        stalled = {index for index, state in states.items() if state != "ok"}
+        if states != self._channel_states or stalled != self._stalled_channels:
+            self._channel_states = states
+            self._stalled_channels = stalled
+            self.time_panel.set_channel_states(states)
+            self._update_channel_warning()
+
+    def _update_channel_warning(self) -> None:
+        label = getattr(self, "channel_warning_label", None)
+        if label is None:
+            return
+        stalled = sorted(index for index, state in self._channel_states.items() if state == "stall")
+        railed = sorted(index for index, state in self._channel_states.items() if state == "rail")
+        lines: list[str] = []
+        if stalled:
+            lines.append(
+                "No data from "
+                + ", ".join(channel_label(index) for index in stalled)
+                + ": the samples stay at exactly zero, so that input is not reaching the ADC."
+            )
+        if railed:
+            lines.append(
+                "Input saturated on "
+                + ", ".join(channel_label(index) for index in railed)
+                + ": the differential input is at the ADC rail (no valid reference or electrode off)."
+            )
+        text = "\n".join(lines)
+        label.setText(text)
+        label.setVisible(bool(text))
+
     def _on_text(self, lines) -> None:
         for line in lines:
             self._log("in", line.text, line.kind)
+            if self._verify_pending and line.text.strip().startswith("[CFG]"):
+                if self._on_verify_line(line.text):
+                    self._finish_verify()
+                continue
             self._absorb_board_info(line.text)
             health = STREAM_HEALTH_PATTERN.search(line.text)
             if health:
@@ -3046,6 +3707,16 @@ class LiveRecorderWindow(QMainWindow):
         visible = list(self.view.visible_channels)
         if len(visible) < self.channel_count:
             visible.extend([True] * (self.channel_count - len(visible)))
+
+        if self._dc_state is not None:
+            mask = self._real_channel_mask()
+            self.time_panel.set_dc(
+                {
+                    index: float(self._dc_state[index])
+                    for index in range(min(len(self._dc_state), self.channel_count))
+                    if index < mask.size and mask[index]
+                }
+            )
 
         window_count = int(self.time_panel.window_seconds * self.sample_rate)
         end_time = self.sample_total / self.sample_rate

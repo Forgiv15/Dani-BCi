@@ -26,6 +26,13 @@ WINDOW_MAP = {
 
 
 DEFAULT_INPUT_ATTENUATOR_RATIO = 100.0 / 1_000_100.0
+# Band used for the input-referred noise metric: what the live recorder shows
+# with its default 0.1 / 150 Hz display filters, capped at 100 Hz so mains
+# harmonics above the EEG band do not inflate it.
+BAND_NOISE_LOW_HZ = 0.1
+BAND_NOISE_HIGH_HZ = 100.0
+BAND_NOISE_LABEL = f"Band RMS {BAND_NOISE_LOW_HZ:g}-{BAND_NOISE_HIGH_HZ:g} Hz (uVrms)"
+CHANNEL_AVERAGE_LABEL = "All channels (mean)"
 EXAMPLE_ADC_GAIN_RESPONSE_FREQ_HZ = np.asarray([5.0, 10.0, 20.0, 30.0, 40.0, 60.0, 70.0, 80.0, 90.0, 110.0], dtype=np.float64)
 EXAMPLE_ADC_GAIN_RESPONSE_DB = np.asarray([0.0, 0.0, -0.2, -0.5, -1.0, -2.5, -3.5, -4.8, -6.0, -9.0], dtype=np.float64)
 
@@ -57,6 +64,7 @@ class SpectrumResult:
     enob: float
     time_domain_rms: float
     selection_avg_rms: float
+    band_rms_0p1_100hz: float
     pickup_50hz_rms: float
     cmrr_measured_db: Optional[float]
     cmrr_correction_gain_db: Optional[float]
@@ -181,6 +189,7 @@ def analyze_multichannel(
             {
                 "Channel": channel_name,
                 "Selection Avg RMS (uVrms)": result.selection_avg_rms,
+                BAND_NOISE_LABEL: result.band_rms_0p1_100hz,
                 "Fundamental (Hz)": result.fundamental_frequency_hz,
                 "Fundamental RMS (uVrms)": result.fundamental_rms,
                 "Fundamental Source": result.fundamental_source,
@@ -198,6 +207,7 @@ def analyze_multichannel(
         )
 
     metrics = pd.DataFrame(rows)
+    metrics = _append_channel_average(metrics)
     crosstalk = compute_crosstalk(
         data=data,
         channel_names=channel_names,
@@ -208,6 +218,28 @@ def analyze_multichannel(
         fft_length=fft_settings.fft_length,
     )
     return metrics, crosstalk, spectra
+
+
+def _append_channel_average(metrics: pd.DataFrame) -> pd.DataFrame:
+    """Add an "All channels (mean)" row so one number summarises the selection.
+
+    This is the row that answers "what is the 0.1-100 Hz noise of this
+    recording" without averaging the channels by hand.
+    """
+
+    if metrics.empty or "Channel" not in metrics.columns:
+        return metrics
+    summary: dict[str, object] = {"Channel": CHANNEL_AVERAGE_LABEL}
+    for column in metrics.columns:
+        if column == "Channel":
+            continue
+        series = metrics[column]
+        if pd.api.types.is_numeric_dtype(series):
+            summary[column] = series.mean(skipna=True)
+        else:
+            summary[column] = ""
+    average_row = pd.DataFrame([summary], columns=metrics.columns)
+    return pd.concat([metrics, average_row], ignore_index=True)
 
 
 def analyze_channel(
@@ -226,6 +258,8 @@ def analyze_channel(
     time_domain_rms = float(rms(signal_values))
     selection_avg_values = apply_bandpass_filter(signal_values, sample_rate, low_cut_hz=0.5, high_cut_hz=100.0, order=4)
     selection_avg_rms = float(rms(selection_avg_values))
+    band_values = apply_bandpass_filter(signal_values, sample_rate, low_cut_hz=BAND_NOISE_LOW_HZ, high_cut_hz=BAND_NOISE_HIGH_HZ, order=4)
+    band_rms = float(rms(band_values))
     analysis_values = _prepare_fft_segment(signal_values - np.mean(signal_values), int(fft_settings.fft_length))
     frequencies_hz, amplitude_rms = _compute_rms_spectrum_from_segment(analysis_values, sample_rate, fft_settings.window_name)
     fundamental_index = detect_fundamental_index(
@@ -314,6 +348,7 @@ def analyze_channel(
         enob=enob,
         time_domain_rms=time_domain_rms,
         selection_avg_rms=selection_avg_rms,
+        band_rms_0p1_100hz=band_rms,
         pickup_50hz_rms=pickup_50hz_rms,
         cmrr_measured_db=cmrr_measured_db,
         cmrr_correction_gain_db=cmrr_correction_gain_db,
