@@ -7,7 +7,8 @@ coherent gain.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from typing import Optional, Sequence
 
 import numpy as np
@@ -32,6 +33,10 @@ DEFAULT_INPUT_ATTENUATOR_RATIO = 100.0 / 1_000_100.0
 BAND_NOISE_LOW_HZ = 0.1
 BAND_NOISE_HIGH_HZ = 100.0
 BAND_NOISE_LABEL = f"Band RMS {BAND_NOISE_LOW_HZ:g}-{BAND_NOISE_HIGH_HZ:g} Hz (uVrms)"
+VREF_VOLTS = 4.5
+GAIN_ERROR_LABEL = "Gain Error (dB)"
+SNR_INPUT_LABEL = "SNR In-Referred (dB)"
+ENOB_FS_LABEL = "ENOB @ FS (bits)"
 CHANNEL_AVERAGE_LABEL = "All channels (mean)"
 EXAMPLE_ADC_GAIN_RESPONSE_FREQ_HZ = np.asarray([5.0, 10.0, 20.0, 30.0, 40.0, 60.0, 70.0, 80.0, 90.0, 110.0], dtype=np.float64)
 EXAMPLE_ADC_GAIN_RESPONSE_DB = np.asarray([0.0, 0.0, -0.2, -0.5, -1.0, -2.5, -3.5, -4.8, -6.0, -9.0], dtype=np.float64)
@@ -46,6 +51,12 @@ class FFTSettings:
     crosstalk_frequency_hz: Optional[float] = None
     cmrr_correction_enabled: bool = False
     cmrr_correction_fs_hz: float = 250.0
+    # RMS of the signal the user applied to the inputs, in volts. Zero means
+    # "not specified", in which case the input-referred columns stay empty.
+    applied_input_rms_v: float = 0.0
+    # Full-scale RMS of the channel (VREF / gain / sqrt(2)), in volts. Needed to
+    # express ENOB against the converter's full scale.
+    full_scale_rms_v: float = VREF_VOLTS / 24.0 / np.sqrt(2.0)
 
 
 @dataclass(slots=True)
@@ -65,6 +76,9 @@ class SpectrumResult:
     time_domain_rms: float
     selection_avg_rms: float
     band_rms_0p1_100hz: float
+    gain_error_db: Optional[float]
+    snr_input_db: Optional[float]
+    enob_full_scale: Optional[float]
     pickup_50hz_rms: float
     cmrr_measured_db: Optional[float]
     cmrr_correction_gain_db: Optional[float]
@@ -171,16 +185,30 @@ def analyze_multichannel(
     common_mode_voltage: Optional[float] = None,
     crosstalk_source_index: int = 0,
     signal_scale_to_volts: float = 1e-6,
+    mean_channel_names: Optional[Sequence[str]] = None,
+    channel_gains: Optional[Sequence[float]] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[SpectrumResult]]:
-    """Analyze each channel and derive a crosstalk summary."""
+    """Analyze each channel and derive a crosstalk summary.
+
+    ``mean_channel_names`` restricts the "All channels (mean)" row to the
+    channels the user actually has visible; it never changes the per-channel
+    metrics.
+    """
 
     spectra: list[SpectrumResult] = []
     rows: list[dict[str, object]] = []
     for index, channel_name in enumerate(channel_names):
+        settings_for_channel = fft_settings
+        if channel_gains is not None and index < len(channel_gains):
+            # ENOB is referenced to the full scale of *this* channel's PGA gain.
+            gain = max(float(channel_gains[index]), 1.0)
+            settings_for_channel = replace(
+                fft_settings, full_scale_rms_v=VREF_VOLTS / gain / np.sqrt(2.0)
+            )
         result = analyze_channel(
             data[:, index],
             sample_rate=sample_rate,
-            fft_settings=fft_settings,
+            fft_settings=settings_for_channel,
             common_mode_voltage=common_mode_voltage,
             signal_scale_to_volts=signal_scale_to_volts,
         )
@@ -198,6 +226,9 @@ def analyze_multichannel(
                 "THD (%)": result.thd_percent,
                 "THD (dB)": result.thd_db,
                 "ENOB (bits)": result.enob,
+                ENOB_FS_LABEL: result.enob_full_scale,
+                GAIN_ERROR_LABEL: result.gain_error_db,
+                SNR_INPUT_LABEL: result.snr_input_db,
                 "CMRR Freq (Hz)": result.cmrr_frequency_hz,
                 "CMRR Output (uVrms)": result.cmrr_output_rms,
                 "ADC Gain Corr (dB)": result.cmrr_correction_gain_db,
@@ -207,7 +238,7 @@ def analyze_multichannel(
         )
 
     metrics = pd.DataFrame(rows)
-    metrics = _append_channel_average(metrics)
+    metrics = _append_channel_average(metrics, mean_channel_names)
     crosstalk = compute_crosstalk(
         data=data,
         channel_names=channel_names,
@@ -220,20 +251,37 @@ def analyze_multichannel(
     return metrics, crosstalk, spectra
 
 
-def _append_channel_average(metrics: pd.DataFrame) -> pd.DataFrame:
+def _append_channel_average(
+    metrics: pd.DataFrame,
+    mean_channel_names: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
     """Add an "All channels (mean)" row so one number summarises the selection.
 
-    This is the row that answers "what is the 0.1-100 Hz noise of this
-    recording" without averaging the channels by hand.
+    Only the rows in ``mean_channel_names`` are averaged, so channels the user
+    switched off cannot move the summary value. The row label states the count
+    so the report is unambiguous.
     """
 
     if metrics.empty or "Channel" not in metrics.columns:
         return metrics
-    summary: dict[str, object] = {"Channel": CHANNEL_AVERAGE_LABEL}
+
+    frame = metrics
+    restricted = False
+    if mean_channel_names is not None:
+        wanted = [name for name in mean_channel_names if name in set(metrics["Channel"])]
+        if wanted:
+            frame = metrics[metrics["Channel"].isin(wanted)]
+            restricted = len(frame.index) != len(metrics.index)
+
+    label = CHANNEL_AVERAGE_LABEL
+    if restricted:
+        label = f"Mean of {len(frame.index)} visible"
+
+    summary: dict[str, object] = {"Channel": label}
     for column in metrics.columns:
         if column == "Channel":
             continue
-        series = metrics[column]
+        series = frame[column]
         if pd.api.types.is_numeric_dtype(series):
             summary[column] = series.mean(skipna=True)
         else:
@@ -285,11 +333,21 @@ def analyze_channel(
         else:
             fundamental_frequency_hz = _refine_peak_frequency(frequencies_hz, amplitude_rms, fundamental_index)
 
-        fundamental_rms = _fit_sine_component_rms(analysis_values, sample_rate, fundamental_frequency_hz)
+        # Refine around the detected peak: one FFT bin is 0.12 Hz here, and a
+        # fractional-bin error would otherwise dominate the residual.
+        bin_hz = float(frequencies_hz[1] - frequencies_hz[0]) if len(frequencies_hz) > 1 else 0.0
+        search_hz = bin_hz if fft_settings.manual_fundamental_hz is None else max(bin_hz * 0.5, 0.01)
+        fundamental_rms, residual_rms, fitted_frequency_hz = fit_sine_refined(
+            analysis_values, sample_rate, fundamental_frequency_hz, search_hz
+        )
+        if fitted_frequency_hz > 0:
+            fundamental_frequency_hz = float(fitted_frequency_hz)
         signal_power = float(fundamental_rms**2)
 
-        total_ac_power = float(rms(analysis_values) ** 2)
-        noise_power = max(total_ac_power - signal_power, 0.0)
+        # Noise = everything the fitted fundamental does not explain. This is the
+        # residual of the same least-squares fit, which stays accurate even when
+        # the tone is far above the noise floor.
+        noise_power = float(residual_rms**2)
         snr_db = _power_ratio_db(signal_power, noise_power)
 
         harmonic_power = 0.0
@@ -303,6 +361,31 @@ def analyze_channel(
         thd_percent = float(100.0 * np.sqrt(harmonic_power / signal_power)) if signal_power > 0 else 0.0
         thd_db = 20.0 * np.log10(thd_percent / 100.0) if thd_percent > 0 else float("-inf")
         enob = (snr_db - 1.76) / 6.02 if np.isfinite(snr_db) else float("-inf")
+
+    # Referred-to-input figures. These need the level that was actually applied,
+    # because the measured fundamental also contains the ADC gain error.
+    gain_error_db: Optional[float] = None
+    snr_input_db: Optional[float] = None
+    enob_full_scale: Optional[float] = None
+    applied_rms_uv = float(fft_settings.applied_input_rms_v) * 1e6
+    noise_rms_uv = float(np.sqrt(max(noise_power, 0.0)))
+    if applied_rms_uv > 0.0 and fundamental_rms > 0.0:
+        gain_error_db = float(20.0 * np.log10(fundamental_rms / applied_rms_uv))
+        if noise_rms_uv > 0.0:
+            snr_input_db = float(20.0 * np.log10(applied_rms_uv / noise_rms_uv))
+    if np.isfinite(snr_db) and snr_db > 0.0 and fundamental_rms > 0.0:
+        # ENOB is only defined for a full-scale input. Scale the measured SNR up
+        # by the headroom between the measured fundamental and full scale.
+        # A positive SNR is required: on a pure-noise record (shorted input) the
+        # "fundamental" is just the largest noise bin, and scaling that up would
+        # report an ENOB above the converter resolution.
+        full_scale_uv = float(fft_settings.full_scale_rms_v) * 1e6
+        if full_scale_uv > fundamental_rms > 0.0:
+            snr_full_scale = snr_db + 20.0 * math.log10(full_scale_uv / fundamental_rms)
+            candidate = (snr_full_scale - 1.76) / 6.02
+            # Never report more bits than the converter has.
+            if candidate <= 24.0:
+                enob_full_scale = float(candidate)
 
     cmrr_measured_db: Optional[float] = None
     cmrr_correction_gain_db: Optional[float] = None
@@ -349,6 +432,9 @@ def analyze_channel(
         time_domain_rms=time_domain_rms,
         selection_avg_rms=selection_avg_rms,
         band_rms_0p1_100hz=band_rms,
+        gain_error_db=gain_error_db,
+        snr_input_db=snr_input_db,
+        enob_full_scale=enob_full_scale,
         pickup_50hz_rms=pickup_50hz_rms,
         cmrr_measured_db=cmrr_measured_db,
         cmrr_correction_gain_db=cmrr_correction_gain_db,
@@ -464,6 +550,70 @@ def _prepare_measurement_segment(values: np.ndarray, fft_length: int) -> np.ndar
     signal_values = np.asarray(values, dtype=np.float64)
     prepared = _prepare_fft_segment(signal_values - np.mean(signal_values), int(fft_length))
     return prepared
+
+
+def _fit_sine_component(values: np.ndarray, sample_rate: float, frequency_hz: float) -> tuple[float, float]:
+    """Least-squares sine fit at one frequency.
+
+    Returns ``(rms, residual_rms)``. The residual is the part of the signal the
+    fitted tone and its DC term do not explain, i.e. the noise plus harmonics at
+    that frequency - a numerically stable noise estimate (``total - signal``
+    cancels catastrophically at high SNR).
+    """
+
+    if frequency_hz <= 0:
+        return 0.0, 0.0
+    signal_values = np.asarray(values, dtype=np.float64)
+    sample_count = signal_values.size
+    if sample_count == 0:
+        return 0.0, 0.0
+
+    time_s = np.arange(sample_count, dtype=np.float64) / float(sample_rate)
+    omega_t = 2.0 * np.pi * frequency_hz * time_s
+    design = np.column_stack((np.sin(omega_t), np.cos(omega_t), np.ones(sample_count, dtype=np.float64)))
+    coefficients, _, _, _ = np.linalg.lstsq(design, signal_values, rcond=None)
+    fitted = design @ coefficients
+    residual = signal_values - fitted
+    sine_coeff, cosine_coeff = float(coefficients[0]), float(coefficients[1])
+    peak_amplitude = np.hypot(sine_coeff, cosine_coeff)
+    return float(peak_amplitude / np.sqrt(2.0)), float(rms(residual))
+
+
+def fit_sine_refined(
+    values: np.ndarray,
+    sample_rate: float,
+    frequency_hz: float,
+    search_hz: float,
+) -> tuple[float, float, float]:
+    """Fit a sine, refining the frequency around ``frequency_hz``.
+
+    A parabolic FFT peak estimate is only accurate to a fraction of a bin; with a
+    long window that tiny error leaves a residual proportional to the *signal*
+    amplitude, which would make the noise (and therefore SNR and ENOB) look far
+    worse than it is. This does a shrinking grid search for the frequency that
+    minimises the least-squares residual and returns
+    ``(rms, residual_rms, frequency_hz)``.
+    """
+
+    best_freq = float(frequency_hz)
+    best_rms, best_residual = _fit_sine_component(values, sample_rate, best_freq)
+    span = abs(float(search_hz))
+    for _ in range(3):
+        if span <= 0.0:
+            break
+        improved = False
+        for step in range(-5, 6):
+            if step == 0:
+                continue
+            candidate_freq = best_freq + span * step / 5.0
+            if candidate_freq <= 0.0:
+                continue
+            candidate_rms, candidate_residual = _fit_sine_component(values, sample_rate, candidate_freq)
+            if candidate_residual < best_residual:
+                best_freq, best_rms, best_residual = candidate_freq, candidate_rms, candidate_residual
+                improved = True
+        span *= 0.25 if improved else 0.1
+    return best_rms, best_residual, best_freq
 
 
 def _fit_sine_component_rms(values: np.ndarray, sample_rate: float, frequency_hz: float) -> float:

@@ -305,7 +305,8 @@ A **section** is a named time range inside one recording. It is the way to keep
 "baseline", "eyes closed", "block 1", ... apart so each one can be analyzed on
 its own.
 
-1. Type a session name (it becomes part of the filename).
+1. Name the measurement with **Name...** (see below) or type a session name. It
+   becomes the file name and is reused by every export.
 2. **Start recording** - recording starts the stream if needed and writes
    `recordings/<YYYYmmdd_HHMMSS>_<session>.csv`. Unless `Record only checked
    channels` is enabled the file holds all real channels of the board.
@@ -323,18 +324,71 @@ its own.
 Sections can still be edited after the recording stops; the sidecar is rewritten
 each time.
 
+### Naming a measurement
+
+**Name...** next to the session field opens a builder instead of making you type
+a name. Every field describes the bench setup, so the name documents itself:
+
+| Field | Choices |
+|-------|---------|
+| Measurement | **Noise (input shorted to GND)**, **CMRR**, **Crosstalk**, **Gain** |
+| Connection | **Electrode**, **Coax**, **IC (internal)** |
+| Coax type (only for coax) | **GND**, **GND with OP**, **BIAS**, **ACTIVE** |
+| Applied voltage (only for CMRR / crosstalk / gain) | the external stimulus, e.g. `1` or `0.0005` V, with an optional source note |
+| Reference | **True differential**, **SRB1**, **SRB2** (pre-filled from the hardware setting) |
+| Note | optional free text |
+
+The dialog shows the resulting name live, for example:
+
+```
+cmrr_coax-gnd-op_1V_ref-srb1
+noise_coax-active_ref-diff
+gain_ic_2.5mV_ref-srb2
+```
+
+Those facts are written into the CSV header (`Measurement`, `Connection`,
+`Reference Mode`, `Applied Stimulus`, ...), so the analyzer picks them up
+automatically - you never retype them when exporting.
+
 ### Noise metric in the analyzer
 
 The analyzer reports the input-referred noise in the band you actually measure
 in: **`Band RMS 0.1-100 Hz (uVrms)`**, one value per channel (RMS of the selection
 after a 0.1-100 Hz zero-phase Butterworth bandpass), plus the
-**`All channels (mean)`** row at the bottom of the metrics table, whose cell in
-that column is the single averaged 0.1-100 Hz noise figure of the selection.
-Use at least ~10 s of data so the 0.1 Hz corner can settle, and analyze a section
-of shorted inputs to read the amplifier floor.
+**mean** row at the bottom of the metrics table (`All channels (mean)`, or
+`Mean of N visible` when channels are hidden), whose cell in that column is the
+single averaged 0.1-100 Hz noise figure of the selection.
+
+A channel that is switched off in **either** the time or the FFT channel list is
+excluded from that mean, so a noisy channel you are not looking at cannot move
+the summary number. Use at least ~10 s of data so the 0.1 Hz corner can settle,
+and analyze a section of shorted inputs to read the amplifier floor.
 
 `Selection Avg RMS (uVrms)` is the older metric and uses a 0.5-100 Hz band; it is
 still there, so the two can be compared directly.
+
+## Exporting from the analyzer
+
+`Export -> Export report...` (or any of the three older entries, which just
+preselect a format) opens one dialog:
+
+* **Format** - PDF report, PNG images, CSV tables. Any combination.
+* **Include** - a checklist of sections: measurement & settings, waveform plot,
+  FFT plot, metrics table, crosstalk table, crosstalk sweep, gain sweep, CMRR
+  sweep. Sweeps are greyed out until you have computed them.
+* **Measurement** - the description read from the recording header; *Edit
+  measurement details...* changes it.
+* **File name** - pre-filled with the recording name plus the measurement slug.
+
+The choice is stored in `settings/analyzer.json`, so the next time you export the
+same sections, formats and measurement text are already selected. The PDF is a
+real report: title and metadata block, the applied stimulus and analysis settings,
+figures at page width, and tables with a header band, grid lines, alternating row
+shading and right-aligned numbers. Tables wider than six data columns are split
+into labelled parts (1/2, 2/2) with the channel column repeated, so nothing is
+ever clipped.
+
+The page footer records when the report was generated.
 
 ## Files on disk
 
@@ -408,13 +462,63 @@ visible without opening the monitor.
 * display: scale, window, row height, FFT points/window/smoothing/scale/log,
   FFT trace selection and end frequency, filters, accelerometer settings,
   visible channels, record-only-checked-channels,
-* recording: session name and output folder.
+* recording: session name, output folder and the measurement description
+  (kind, connection, stimulus, reference mode).
 
-The file carries a `version` field. Version 2 introduced the 0.1 / 150 Hz
-default band and the auto-connect flag, so an older file adopts those defaults
-once and then keeps your choices.
+The analyzer keeps its own small store, `settings/analyzer.json`, holding the
+export sections/formats and the measurement text.
+
+The file carries a `version` field, so an older file adopts the newer defaults
+once and then keeps your choices:
+
+| Version | What it introduced |
+|---------|--------------------|
+| 2 | 0.1 / 150 Hz default band, auto-connect flag |
+| 4 | 921600 baud, 500 SPS (250 Hz per channel), gain x24, normal input, SRB2, FFT log + auto scale, record only checked channels |
 
 Delete the file to return to defaults.
+
+### Boot defaults
+
+A fresh install (and any file older than version 4) starts like this, because
+this is the setup the amplifier is normally used in:
+
+* **COM5, 921600 baud, auto-connect on.** The app scans the available ports,
+  opens the remembered one (or COM5) as soon as it appears and keeps scanning
+  every 2.5 s while it is disconnected, so plugging the board in later is enough.
+* **500 SPS** from the ADS1299, which is **250 Hz per channel** in Cyton+Daisy
+  mode. Gain **x24**, input **normal**, reference **SRB2**, 0.1 Hz high pass and
+  150 Hz low pass enabled.
+* **FFT** on the log amplitude axis with automatic full-scale tracking,
+  **Time series** showing all 12 real channels.
+* **Record only checked channels** enabled, so unticking a channel in the dock
+  keeps it out of the recording (and out of the FFT average).
+* Nothing is written to the board until you press **Write to board**, but the
+  saved settings are replayed automatically the moment a connection is made, and
+  the result of every write is shown as `confirmed` / `problem` per channel.
+
+If a requested rate does not fit the link (see
+[Link budgets](#link-budgets-serial-and-spi)) the app writes the fastest rate
+that does fit and says so, instead of silently dropping to the slowest option.
+
+### Scrolling cannot change a setting by accident
+
+Scrolling a long panel used to be able to change whatever combo box or spin box
+happened to be under the pointer. Now an unfocused value widget ignores the wheel
+and lets the panel scroll instead; the value only responds to the wheel once you
+have clicked it (so it has focus). This applies to both windows.
+
+### Recording name and reference mode stay in sync
+
+The reference mode is one hardware setting, and the measurement name records it,
+so the two are kept equal in both directions:
+
+* Choosing a name with a reference (**Name...** -> Reference) writes that
+  reference into the hardware settings and sends it to the board, so a
+  `ref-srb1` name always means the board really is in SRB1.
+* Changing the reference in **Hardware settings** renames the current session
+  automatically (`..._ref-srb1`), so a file cannot be labelled with a reference
+  it was not recorded with.
 
 ## Firmware notes that matter for this app
 

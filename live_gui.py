@@ -68,6 +68,13 @@ except ImportError:  # pragma: no cover - only hit without pyserial installed
     list_ports = None
 
 from fft_analysis import WINDOW_MAP
+from report_export import (
+    REFERENCE_MODE_CODES,
+    REFERENCE_MODE_SHORT,
+    MeasurementInfo,
+    MeasurementNameDialog,
+    install_wheel_guard,
+)
 from live_protocol import (
     ADS_SPI_CLOCK_HZ,
     BOARD_CHANNEL_CHOICES,
@@ -79,7 +86,6 @@ from live_protocol import (
     MixedStreamParser,
     OpenBCIRecording,
     PacketDecoder,
-    REFERENCE_MODE_CHOICES,
     REFERENCE_MODE_SRB1,
     REFERENCE_MODE_SRB2,
     RingBuffer,
@@ -186,6 +192,8 @@ RAIL_FRACTION = 0.98
 RAIL_SECONDS = 0.5
 # Port tried on startup when nothing was used before.
 AUTOCONNECT_FALLBACK_PORT = "COM5"
+# How often to look for the board while auto-connect is on and nothing is open.
+AUTOCONNECT_RETRY_MS = 2500
 DEMO_PORT = "__DEMO__"
 STREAM_HEALTH_PATTERN = re.compile(r"missed=(\d+)\s+dropped=(\d+)\s+corrupt=(\d+)")
 
@@ -197,6 +205,20 @@ def channel_label(index: int) -> str:
 def channel_pen(index: int, width: float = 1.2) -> QPen:
     color = pg.intColor(index, hues=16, values=1, maxValue=210)
     return pg.mkPen(color, width=width)
+
+
+def _shrinkable(label: QLabel) -> QLabel:
+    """Let a wrapping label shrink below its text width.
+
+    Without this a long line ("SPI link (2 MHz, ...) supports up to 4166 SPS")
+    makes the whole side panel demand more width than the dock has, which pushes
+    the buttons out of view.
+    """
+
+    label.setWordWrap(True)
+    label.setMinimumWidth(0)
+    label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+    return label
 
 
 class SerialWorker(QThread):
@@ -1492,7 +1514,7 @@ class HardwareSettingsDialog(QDialog):
         reference_layout = QVBoxLayout(reference_group)
         reference_row = QHBoxLayout()
         self.reference_combo = QComboBox()
-        for label, value in REFERENCE_MODE_CHOICES:
+        for label, value in REFERENCE_MODE_SHORT:
             self.reference_combo.addItem(label, value)
         self.reference_combo.setCurrentIndex(max(self.reference_combo.findData(self._reference_mode), 0))
         reference_row.addWidget(self.reference_combo, 1)
@@ -1655,7 +1677,7 @@ class HardwareSettingsDialog(QDialog):
         verify_group = QGroupBox("Configuration check")
         verify_layout = QVBoxLayout(verify_group)
         verify_row = QHBoxLayout()
-        self.verify_button = QPushButton("Verify board configuration")
+        self.verify_button = QPushButton("Verify configuration")
         self.verify_button.setToolTip(
             "Ask the board to clock every ADS1299 register back out over serial and compare it with "
             "the staged settings. Can be run as often as you like."
@@ -2047,6 +2069,7 @@ class LiveRecorderWindow(QMainWindow):
         self._record_channel_indices: list[int] = list(real_channel_indices(self.hardware.board_channels))
         self.record_start_sample = 0
         self.record_started_at: Optional[float] = None
+        self.measurement = MeasurementInfo.from_dict(self.settings.measurement)
         self.annotations: list[Annotation] = []
         self._open_annotation: Optional[Annotation] = None
         self.last_recording: Optional[Path] = None
@@ -2074,6 +2097,11 @@ class LiveRecorderWindow(QMainWindow):
         self.verify_result_text = ""
         self.verify_result_state = "info"
 
+        self._autoconnect_timer = QTimer(self)
+        self._autoconnect_timer.setInterval(AUTOCONNECT_RETRY_MS)
+        self._autoconnect_timer.timeout.connect(self._autoconnect)
+        self._autoconnect_idle = True
+
         self._probe_timer = QTimer(self)
         self._probe_timer.setSingleShot(True)
         self._probe_timer.timeout.connect(self._probe_board)
@@ -2095,7 +2123,7 @@ class LiveRecorderWindow(QMainWindow):
         self.spectrum_panel.ensure_channels(labels)
         self._refresh_annotations()
         self._ui_timer.start()
-        QTimer.singleShot(400, self._autoconnect)
+        QTimer.singleShot(400, self._start_autoconnect)
 
     # -- construction ------------------------------------------------------
 
@@ -2156,8 +2184,8 @@ class LiveRecorderWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(container)
-        scroll.setMinimumWidth(260)
-        scroll.setMaximumWidth(340)
+        scroll.setMinimumWidth(320)
+        scroll.setMaximumWidth(370)
         dock.setWidget(scroll)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
         self.device_dock = dock
@@ -2168,7 +2196,7 @@ class LiveRecorderWindow(QMainWindow):
 
         port_row = QHBoxLayout()
         self.port_combo = QComboBox()
-        self.port_combo.setMinimumWidth(180)
+        self.port_combo.setMinimumWidth(110)
         port_row.addWidget(self.port_combo, 1)
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self._refresh_ports)
@@ -2196,26 +2224,92 @@ class LiveRecorderWindow(QMainWindow):
         button_row.addWidget(self.stream_button)
         layout.addLayout(button_row)
 
-        self.auto_connect_check = QCheckBox("Auto-connect on start")
+        self.auto_connect_check = QCheckBox("Auto-connect")
         self.auto_connect_check.setToolTip(
             "On startup, connect to the port used last time (or COM5) without asking."
         )
         layout.addWidget(self.auto_connect_check)
 
-        self.connection_label = QLabel("Not connected")
-        self.connection_label.setWordWrap(True)
+        self.connection_label = _shrinkable(QLabel("Not connected"))
         layout.addWidget(self.connection_label)
 
-        self.board_info_label = QLabel("Board details appear here after connect.")
-        self.board_info_label.setWordWrap(True)
+        self.board_info_label = _shrinkable(QLabel("Board details appear here after connect."))
         self.board_info_label.setStyleSheet("color: #475569;")
         layout.addWidget(self.board_info_label)
 
-        self.warning_label = QLabel("")
-        self.warning_label.setWordWrap(True)
+        self.warning_label = _shrinkable(QLabel(""))
         self.warning_label.setStyleSheet("color: #b45309; font-weight: 600;")
         layout.addWidget(self.warning_label)
         return group
+
+    def open_name_dialog(self) -> None:
+        """Name the measurement with dropdowns instead of typing.
+
+        The reference mode is part of the name, so picking a name also drives the
+        hardware: choosing "true differential" here selects that reference mode
+        and writes it to the board if one is connected.
+        """
+
+        dialog = MeasurementNameDialog(self.measurement, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.measurement = dialog.measurement()
+        self.session_name_edit.setText(dialog.name_stem())
+        self.settings.session_name = self.session_name_edit.text()
+        self.settings.measurement = self.measurement.as_dict()
+        self._save_settings()
+        self._apply_measurement_reference(self.measurement.reference_mode)
+        self._update_measurement_label()
+
+    def _apply_measurement_reference(self, mode: str) -> None:
+        """Make the hardware reference follow the name (and the board if online)."""
+
+        if mode not in REFERENCE_MODE_CODES:
+            return
+        changed = mode != self.hardware.normalised_reference_mode()
+        self.hardware.set_reference_mode(mode)
+        self.measurement.reference_mode = mode
+        position = self.reference_combo.findData(mode)
+        self.reference_combo.blockSignals(True)
+        self.reference_combo.setCurrentIndex(position if position >= 0 else 0)
+        self.reference_combo.blockSignals(False)
+        self._update_reference_note()
+        self._save_settings()
+        if changed and self.connected and self.recording is None:
+            self._log("in", f"[settings] reference mode {mode} from the recording name", "info")
+            self.apply_hardware()
+
+    def _refresh_session_name_reference(self) -> None:
+        """Rewrite the ``ref-...`` token of the current name after a mode change."""
+
+        mode = self.hardware.normalised_reference_mode()
+        self.measurement.reference_mode = mode
+        current = self.session_name_edit.text().strip()
+        if not current:
+            return
+        token = f"ref-{mode}"
+        parts = current.split("_")
+        replaced = False
+        for index, part in enumerate(parts):
+            if part.startswith("ref-"):
+                parts[index] = token
+                replaced = True
+                break
+        updated = "_".join(parts) if replaced else f"{current}_{token}"
+        if updated != current:
+            self.session_name_edit.setText(updated)
+            self.settings.session_name = updated
+
+    def _update_measurement_label(self) -> None:
+        label = getattr(self, "measurement_label", None)
+        if label is None:
+            return
+        info = self.measurement.normalised()
+        info.reference_mode = self.hardware.normalised_reference_mode()
+        text = "  |  ".join(info.describe_lines())
+        if not self.session_name_edit.text().strip():
+            text = "Name this measurement with the Name... button.   |   " + text
+        label.setText(text)
 
     def _build_recording_group(self) -> QWidget:
         group = QGroupBox("Recording")
@@ -2225,8 +2319,19 @@ class LiveRecorderWindow(QMainWindow):
         name_row.addWidget(QLabel("Session"))
         self.session_name_edit = QLineEdit()
         self.session_name_edit.setPlaceholderText("session name")
+        self.session_name_edit.setToolTip(
+            "Used for the CSV file name and reused automatically when you export from the analyzer."
+        )
         name_row.addWidget(self.session_name_edit, 1)
+        self.name_button = QPushButton("Name...")
+        self.name_button.setToolTip("Build the name from dropdowns: measurement, connection, stimulus and reference")
+        self.name_button.clicked.connect(self.open_name_dialog)
+        name_row.addWidget(self.name_button)
         layout.addLayout(name_row)
+
+        self.measurement_label = _shrinkable(QLabel(""))
+        self.measurement_label.setStyleSheet("color: #475569; font-size: 11px;")
+        layout.addWidget(self.measurement_label)
 
         dir_row = QHBoxLayout()
         self.output_dir_label = QLabel("")
@@ -2238,7 +2343,7 @@ class LiveRecorderWindow(QMainWindow):
         dir_row.addWidget(browse)
         layout.addLayout(dir_row)
 
-        self.record_visible_check = QCheckBox("Record only checked channels")
+        self.record_visible_check = QCheckBox("Only checked channels")
         self.record_visible_check.setToolTip(
             "Off (default): the CSV always stores every channel of the board.\n"
             "On: only the channels ticked in the 'Channels' group are written, which keeps "
@@ -2246,8 +2351,7 @@ class LiveRecorderWindow(QMainWindow):
         )
         layout.addWidget(self.record_visible_check)
 
-        self.record_scope_label = QLabel("")
-        self.record_scope_label.setWordWrap(True)
+        self.record_scope_label = _shrinkable(QLabel(""))
         self.record_scope_label.setStyleSheet("color: #64748b; font-size: 11px;")
         layout.addWidget(self.record_scope_label)
 
@@ -2266,7 +2370,7 @@ class LiveRecorderWindow(QMainWindow):
         self.record_stats_label.setWordWrap(True)
         layout.addWidget(self.record_stats_label)
 
-        self.analyze_button = QPushButton("Analyze last recording")
+        self.analyze_button = QPushButton("Analyze last")
         self.analyze_button.setEnabled(False)
         self.analyze_button.clicked.connect(lambda: self.open_analyzer(load_last=True))
         layout.addWidget(self.analyze_button)
@@ -2276,11 +2380,10 @@ class LiveRecorderWindow(QMainWindow):
         group = QGroupBox("Sections")
         layout = QVBoxLayout(group)
 
-        hint = QLabel(
+        hint = _shrinkable(QLabel(
             "A section is a named time range inside the recording. Start one before each "
             "measurement condition, end it when you switch condition, then analyze a section on its own."
-        )
-        hint.setWordWrap(True)
+        ))
         hint.setStyleSheet("color: #64748b; font-size: 11px;")
         layout.addWidget(hint)
 
@@ -2322,9 +2425,8 @@ class LiveRecorderWindow(QMainWindow):
     def _build_channel_group(self) -> QWidget:
         group = QGroupBox("Channels")
         layout = QVBoxLayout(group)
-        hint = QLabel("Tick a channel to show it in the plots. Recording follows this only when "
-                      "'Record only checked channels' is enabled.")
-        hint.setWordWrap(True)
+        hint = _shrinkable(QLabel("Tick a channel to show it in the plots. Recording follows this "
+                                 "only when 'Record only checked channels' is enabled."))
         hint.setStyleSheet("color: #64748b; font-size: 11px;")
         layout.addWidget(hint)
         self.channel_check_container = QWidget()
@@ -2342,8 +2444,7 @@ class LiveRecorderWindow(QMainWindow):
         row.addWidget(none_button)
         layout.addLayout(row)
 
-        self.channel_warning_label = QLabel("")
-        self.channel_warning_label.setWordWrap(True)
+        self.channel_warning_label = _shrinkable(QLabel(""))
         self.channel_warning_label.setStyleSheet("color: #b91c1c; font-size: 11px; font-weight: 600;")
         self.channel_warning_label.setVisible(False)
         layout.addWidget(self.channel_warning_label)
@@ -2355,18 +2456,17 @@ class LiveRecorderWindow(QMainWindow):
         group = QGroupBox("Hardware settings")
         layout = QVBoxLayout(group)
 
-        self.board_label = QLabel("")
-        self.board_label.setWordWrap(True)
+        self.board_label = _shrinkable(QLabel(""))
         layout.addWidget(self.board_label)
 
         button_row = QHBoxLayout()
-        self.hardware_button = QPushButton("Hardware settings...")
+        self.hardware_button = QPushButton("Hardware settings")
         self.hardware_button.setToolTip(
             "Per-channel gain/input/bias, the reference mode and the Verify button live there."
         )
         self.hardware_button.clicked.connect(self.open_hardware_settings)
         button_row.addWidget(self.hardware_button)
-        self.reapply_button = QPushButton("Re-apply saved")
+        self.reapply_button = QPushButton("Re-apply")
         self.reapply_button.setToolTip("Send the saved sample rate, reference mode and channel settings again")
         self.reapply_button.clicked.connect(lambda: self.apply_hardware())
         button_row.addWidget(self.reapply_button)
@@ -2375,7 +2475,7 @@ class LiveRecorderWindow(QMainWindow):
         reference_row = QHBoxLayout()
         reference_row.addWidget(QLabel("Reference"))
         self.reference_combo = QComboBox()
-        for label, value in REFERENCE_MODE_CHOICES:
+        for label, value in REFERENCE_MODE_SHORT:
             self.reference_combo.addItem(label, value)
         self.reference_combo.setToolTip(
             "One setting for the whole board.\n"
@@ -2390,14 +2490,13 @@ class LiveRecorderWindow(QMainWindow):
         reference_row.addWidget(self.reference_combo, 1)
         layout.addLayout(reference_row)
 
-        self.reference_note = QLabel("")
-        self.reference_note.setWordWrap(True)
+        self.reference_note = _shrinkable(QLabel(""))
         self.reference_note.setStyleSheet("color: #64748b; font-size: 11px;")
         layout.addWidget(self.reference_note)
 
         quick = QGridLayout()
-        quick.setHorizontalSpacing(6)
-        quick.setVerticalSpacing(4)
+        quick.setHorizontalSpacing(4)
+        quick.setVerticalSpacing(3)
         self.quick_gain = QComboBox()
         self.quick_gain.addItems(list(GAIN_LABELS))
         self.quick_gain.setCurrentIndex(len(GAIN_LABELS) - 1)
@@ -2407,18 +2506,18 @@ class LiveRecorderWindow(QMainWindow):
         self.quick_bias.addItems(["Include", "Exclude"])
         quick.addWidget(QLabel("Gain"), 0, 0)
         quick.addWidget(self.quick_gain, 0, 1)
-        quick.addWidget(QLabel("Input"), 0, 2)
-        quick.addWidget(self.quick_input, 0, 3)
-        quick.addWidget(QLabel("Bias"), 1, 0)
-        quick.addWidget(self.quick_bias, 1, 1)
+        quick.addWidget(QLabel("Input"), 1, 0)
+        quick.addWidget(self.quick_input, 1, 1)
+        quick.addWidget(QLabel("Bias"), 2, 0)
+        quick.addWidget(self.quick_bias, 2, 1)
+        quick.setColumnStretch(1, 1)
         layout.addLayout(quick)
 
-        self.quick_apply_button = QPushButton("Apply these to all channels")
+        self.quick_apply_button = QPushButton("Apply to all")
         self.quick_apply_button.clicked.connect(self._apply_quick_settings)
         layout.addWidget(self.quick_apply_button)
 
-        self.apply_status_label = QLabel("Saved settings are written automatically after connect.")
-        self.apply_status_label.setWordWrap(True)
+        self.apply_status_label = _shrinkable(QLabel("Saved settings are written automatically after connect."))
         self.apply_status_label.setStyleSheet("color: #475569;")
         layout.addWidget(self.apply_status_label)
         return group
@@ -2451,8 +2550,7 @@ class LiveRecorderWindow(QMainWindow):
             self.low_pass_combo.addItem(label, value)
         self.low_pass_combo.currentIndexChanged.connect(self._on_filter_changed)
         layout.addWidget(self.low_pass_combo, 3, 1)
-        note = QLabel("Filters affect the live traces and FFT only; recordings stay raw.")
-        note.setWordWrap(True)
+        note = _shrinkable(QLabel("Filters affect the live traces and FFT only; recordings stay raw."))
         note.setStyleSheet("color: #64748b; font-size: 11px;")
         layout.addWidget(note, 4, 0, 1, 2)
         return group
@@ -2503,6 +2601,9 @@ class LiveRecorderWindow(QMainWindow):
         if index >= 0:
             self.baud_combo.setCurrentIndex(index)
         self.session_name_edit.setText(self.settings.session_name)
+        self.measurement = MeasurementInfo.from_dict(self.settings.measurement)
+        self.measurement.reference_mode = self.hardware.normalised_reference_mode()
+        self._update_measurement_label()
         self._update_output_dir_label()
 
         view = self.view.as_dict()
@@ -2593,6 +2694,12 @@ class LiveRecorderWindow(QMainWindow):
 
     def _on_auto_connect_changed(self, checked: bool) -> None:
         self.settings.auto_connect = bool(checked)
+        if checked:
+            self._autoconnect_timer.start()
+            if not self.connected:
+                self._autoconnect()
+        else:
+            self._autoconnect_timer.stop()
         self._save_settings()
 
     def _on_reference_changed(self, *_args) -> None:
@@ -2617,6 +2724,9 @@ class LiveRecorderWindow(QMainWindow):
             if position >= 0:
                 self._settings_dialog.reference_combo.setCurrentIndex(position)
         self._update_reference_note()
+        # The name carries the reference, so it has to follow a hardware change.
+        self._refresh_session_name_reference()
+        self._update_measurement_label()
         self._save_settings()
         if self.connected:
             self.apply_hardware()
@@ -2692,6 +2802,7 @@ class LiveRecorderWindow(QMainWindow):
         self.view.low_pass_hz = float(self.low_pass_combo.currentData() or 0.0)
         self.settings.hardware = self.hardware
         self.settings.session_name = self.session_name_edit.text().strip() or "session"
+        self.settings.measurement = self.measurement.as_dict()
         port = str(self.port_combo.currentData() or "")
         self.settings.last_port = "" if port == DEMO_PORT else port
         self.settings.baud_rate = int(self.baud_combo.currentData() or DEFAULT_BAUD)
@@ -2741,7 +2852,11 @@ class LiveRecorderWindow(QMainWindow):
         self._save_settings()
 
     def _autoconnect_port(self) -> Optional[str]:
-        """Port to open on startup: the last one used, else the saved default."""
+        """Port to open: the last one used, else COM5, else the only candidate.
+
+        The board may be plugged in after the application started, so this is
+        evaluated again on every retry rather than once at startup.
+        """
 
         candidates: list[str] = []
         if self.settings.last_port and self.settings.last_port != DEMO_PORT:
@@ -2750,14 +2865,44 @@ class LiveRecorderWindow(QMainWindow):
         for candidate in candidates:
             if candidate and candidate != DEMO_PORT and self.port_combo.findData(candidate) >= 0:
                 return candidate
+        # Nothing preferred is present: if exactly one real port exists, that is
+        # unambiguous enough to use.
+        real_ports = [
+            str(self.port_combo.itemData(index))
+            for index in range(self.port_combo.count())
+            if self.port_combo.itemData(index) != DEMO_PORT
+        ]
+        if len(real_ports) == 1:
+            return real_ports[0]
         return None
 
+    def _start_autoconnect(self) -> None:
+        self._autoconnect()
+        if self.auto_connect_check.isChecked():
+            self._autoconnect_timer.start()
+
     def _autoconnect(self) -> None:
-        if not self.auto_connect_check.isChecked() or self.connected or self.worker is not None:
+        """Try to open the board; keep retrying while auto-connect stays on."""
+
+        if not self.auto_connect_check.isChecked():
+            self._autoconnect_idle = True
             return
+        if self.connected or self.worker is not None:
+            self._autoconnect_idle = True
+            return
+        self._autoconnect_idle = False
+        # Re-scan first: the board is often plugged in after the app starts.
+        known = [self.port_combo.itemData(index) for index in range(self.port_combo.count())]
+        self._refresh_ports_silent()
         port = self._autoconnect_port()
-        if not port:
+        if port is None:
+            self.connection_label.setText(
+                f"Waiting for the board (looking for {AUTOCONNECT_FALLBACK_PORT}) - it connects automatically"
+            )
+            self.connection_label.setStyleSheet("color: #b45309;")
             return
+        if port not in known:
+            self._log("in", f"[connection] found {port} on rescan", "info")
         index = self.port_combo.findData(port)
         if index < 0:
             return
@@ -2765,6 +2910,36 @@ class LiveRecorderWindow(QMainWindow):
         self.connection_label.setText(f"Auto-connecting to {port}...")
         self._log("in", f"[connection] auto-connecting to {port}", "info")
         self.connect_button.setChecked(True)
+
+    def _refresh_ports_silent(self) -> None:
+        """Rescan the serial ports without disturbing the current selection."""
+
+        if list_ports is None:
+            return
+        current = self.port_combo.currentData()
+        discovered: list[tuple[str, str]] = []
+        for info in sorted(list_ports.comports(), key=lambda port: port.device):
+            description = (info.description or "").strip()
+            label = f"{info.device}  {description}" if description else info.device
+            discovered.append((label, info.device))
+        existing = [
+            (self.port_combo.itemText(index), str(self.port_combo.itemData(index)))
+            for index in range(self.port_combo.count())
+            if self.port_combo.itemData(index) != DEMO_PORT
+        ]
+        if discovered == existing:
+            return
+        self.port_combo.blockSignals(True)
+        self.port_combo.clear()
+        for label, device in discovered:
+            self.port_combo.addItem(label, device)
+        self.port_combo.addItem("DEMO  synthetic board (no hardware)", DEMO_PORT)
+        target = current if current is not None else self.settings.last_port
+        index = self.port_combo.findData(target) if target else -1
+        if index >= 0:
+            self.port_combo.setCurrentIndex(index)
+        self.port_combo.blockSignals(False)
+        self.port_combo.setEnabled(not self.connected)
 
     def _on_connect_toggled(self, checked: bool) -> None:
         if checked:
@@ -2833,6 +3008,9 @@ class LiveRecorderWindow(QMainWindow):
             worker.stop()
         self.connected = False
         self._set_streaming(False)
+        if self.auto_connect_check.isChecked():
+            # Keep looking: the user unplugged the board or closed the port.
+            self._autoconnect_timer.start()
         self._set_connection_state(False, "Not connected")
         self.board_info_label.setText("Board details appear here after connect.")
 
@@ -3100,7 +3278,9 @@ class LiveRecorderWindow(QMainWindow):
                 )
             else:
                 reason = f"{ba / 1000:.0f} kbit/s of serial carries {serial_limit:g} SPS"
-            fallback = supported[-1] if supported else 250
+            # SAMPLE_RATES is ordered fastest-first, so the first supported
+            # entry is the fastest rate that still fits the link.
+            fallback = max(supported) if supported else 250
             message = (
                 f"{requested_rate:g} SPS is above the link budget: {reason}; using {fallback:g} SPS instead."
             )
@@ -3111,6 +3291,11 @@ class LiveRecorderWindow(QMainWindow):
             self._save_settings()
             self._update_hardware_labels()
             # The buffers, the FFT axis and the time base are sized from this.
+            self._rebuild_buffers()
+
+        if abs(self.sample_rate - self.hardware.sample_rate_hz) > 1e-9:
+            # The write above changed the rate, and the time base, FFT axis and
+            # ring buffers are all sized from it.
             self._rebuild_buffers()
 
         self.hardware.sync_reference()
@@ -3449,7 +3634,10 @@ class LiveRecorderWindow(QMainWindow):
             QMessageBox.information(self, "Hardware settings", "Stop the recording before changing hardware settings.")
             return
         profile_changed = int(hardware.board_channels) != int(self.hardware.board_channels)
+        previous_reference = self.hardware.normalised_reference_mode()
         self._set_hardware(hardware)
+        if hardware.normalised_reference_mode() != previous_reference:
+            self._refresh_session_name_reference()
         if profile_changed:
             self._apply_profile_change()
             return
@@ -3508,9 +3696,15 @@ class LiveRecorderWindow(QMainWindow):
                 checkbox.setEnabled(False)
                 checkbox.setToolTip("Padding channel - no ADS input in this build")
             checkbox.toggled.connect(self._on_channel_visibility_changed)
-            self.channel_check_layout.addWidget(checkbox, index // 4, index % 4)
+            self.channel_check_layout.addWidget(checkbox, index // 3, index % 3)
             self.channel_checkboxes.append(checkbox)
+        # The checkboxes are the truth (padding channels were forced off above),
+        # so publish their state. Without this, padding channels could stay
+        # "visible" from an older settings file and would be averaged into the
+        # FFT as flat zero traces.
+        self.view.visible_channels = [checkbox.isChecked() for checkbox in self.channel_checkboxes]
         self._update_record_scope_label()
+        self._update_measurement_label()
 
     def _on_channel_visibility_changed(self, *_args) -> None:
         self.view.visible_channels = [checkbox.isChecked() for checkbox in self.channel_checkboxes]
@@ -3707,6 +3901,10 @@ class LiveRecorderWindow(QMainWindow):
         visible = list(self.view.visible_channels)
         if len(visible) < self.channel_count:
             visible.extend([True] * (self.channel_count - len(visible)))
+        # Padding channels of the daisy emulation carry no data; never let them
+        # into the plots or into the FFT average.
+        real_mask = self._real_channel_mask()
+        visible = [flag and index < real_mask.size and bool(real_mask[index]) for index, flag in enumerate(visible)]
 
         if self._dc_state is not None:
             mask = self._real_channel_mask()
@@ -3853,6 +4051,12 @@ class LiveRecorderWindow(QMainWindow):
             "Channel Map": ",".join(str(number) for number in channel_numbers),
             "Board Channel Gains": gains,
         }
+        # Document the bench setup in the file itself so the analyzer never has
+        # to ask for it again.
+        measurement = self.measurement.normalised()
+        measurement.reference_mode = self.hardware.normalised_reference_mode()
+        self.measurement = measurement
+        metadata.update(measurement.metadata())
         self.recording = OpenBCIRecording(path, labels, channel_numbers, self.sample_rate, metadata)
         try:
             self.recording.start()
@@ -4052,6 +4256,7 @@ class LiveRecorderWindow(QMainWindow):
             self._analyzer_window.open_csv_path(self.last_recording, selection=selection)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        self._autoconnect_timer.stop()
         self._save_settings()
         if self.recording is not None:
             self.stop_recording()
@@ -4113,6 +4318,7 @@ class AnnotationDialog(QDialog):
 def main() -> int:
     pg.setConfigOptions(antialias=False, background="w", foreground="k")
     app = QApplication.instance() or QApplication(sys.argv)
+    install_wheel_guard(app)
     window = LiveRecorderWindow()
     window.show()
     return int(app.exec())

@@ -12,14 +12,14 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 import pyqtgraph.exporters
-from PyQt6.QtCore import QRect, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QFont, QPainter, QPageLayout, QPageSize, QPdfWriter
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QAction, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -42,10 +43,21 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
+from report_export import (
+    ExportOptions,
+    MeasurementNameDialog,
+    ExportSelectionDialog,
+    MeasurementInfo,
+    ReportSettingsStore,
+    ReportWriter,
+    full_export_stem,
+    install_wheel_guard,
+)
 from data_loader import (
     CsvPreview,
     SignalDataset,
@@ -56,6 +68,7 @@ from data_loader import (
 )
 from fft_analysis import (
     CHANNEL_AVERAGE_LABEL,
+    VREF_VOLTS,
     DEFAULT_INPUT_ATTENUATOR_RATIO,
     FFTSettings,
     SpectrumResult,
@@ -205,11 +218,73 @@ class ImportOptionsDialog(QDialog):
         self.accept()
 
 
+METRICS_HELP_HTML = """
+<style>
+  h3 { margin: 14px 0 4px 0; font-size: 11pt; }
+  p  { margin: 2px 0 4px 0; }
+  code { font-family: Consolas, monospace; background: #f0f0f0; }
+  table { border-collapse: collapse; margin-top: 4px; }
+  td, th { border: 1px solid #ccc; padding: 3px 8px; font-size: 9.5pt; }
+  th { background: #eef2f7; }
+</style>
+<h2>Metric definitions</h2>
+<p>Amplitudes are always <b>uVrms</b>. Every derivative below is computed from the data inside the
+selection region, using only the channels ticked in both channel lists.</p>
+
+<h3>Fundamental</h3>
+<p>The <b>largest spectral peak</b> inside the selected region (Auto detect), or the exact frequency you type
+in Manual Hz. Its level comes from a least-squares sine fit at that frequency. The fit refines the frequency
+around the peak first, because a peak estimate that is off by a fraction of a bin would leave a residue that
+looks like noise and would make SNR and ENOB far too pessimistic.</p>
+<p>Use Manual Hz when a mains harmonic or a drift peak is taller than the signal you care about.</p>
+
+<h3>SNR (dB)</h3>
+<p><code>10 log10(fundamental power / residual power)</code></p>
+<p>The residual is everything the fitted fundamental does <i>not</i> explain: broadband noise, hum,
+harmonics, drift. It needs no values from outside the recording - it describes the measured spectrum.</p>
+
+<h3>THD (%) and THD (dB)</h3>
+<p><code>THD% = 100 sqrt((h2^2 + h3^2 + h4^2 + h5^2) / fundamental^2)</code>,
+<code>THD dB = 20 log10(THD% / 100)</code></p>
+<p>Harmonics 2f..5f are each measured with the same sine fit. THD is relative to the detected fundamental,
+so it never needs the applied signal either.</p>
+
+<h3>ENOB (bits)</h3>
+<p><code>(SNR - 1.76) / 6.02</code></p>
+<p>This is the true resolution of the converter only when the input actually reaches full scale. For a small
+input it describes the measured signal-to-noise ratio, not the ADC, so compare it with ENOB @ FS.</p>
+
+<h3>Applied signal and the derived columns</h3>
+<p>Enter the RMS you really fed into the board in <b>Derived Metrics</b>. The table then adds:</p>
+<table>
+<tr><th>Column</th><th>Formula</th><th>Meaning</th></tr>
+<tr><td>Gain Error (dB)</td><td><code>20 log10(measured / applied)</code></td><td>Deviation of the measured
+fundamental from the level you applied.</td></tr>
+<tr><td>SNR In-Referred (dB)</td><td><code>20 log10(applied / residual)</code></td><td>SNR seen by the
+source: noise referred to the input instead of to the measured fundamental.</td></tr>
+<tr><td>ENOB @ FS (bits)</td><td><code>((SNR + 20 log10(FS / fundamental)) - 1.76) / 6.02</code></td>
+<td>SNR scaled up to full scale using the channel PGA gain from the recording header, which is what makes
+it comparable between gain settings. A pure-noise record reports none, because scaling up the largest noise
+bin would exceed the converter resolution.</td></tr>
+</table>
+
+<h3>The other columns</h3>
+<p><b>Selection Avg RMS</b> uses a fixed 0.5-100 Hz band; <b>Band RMS 0.1-100 Hz</b> is the input-referred
+noise figure and is the one to compare between builds.</p>
+<p><b>Mean rows</b> average only the channels ticked in both the time and the FFT lists, so a hidden channel
+cannot move the summary.</p>
+<p><b>50 Hz pickup</b> is the exact 50 Hz RMS. <b>CMRR</b> uses the selected CMRR frequency or the
+fundamental; with the ADS1299 sinc3 correction enabled,
+<code>CMRR corrected(f) = CMRR measured(f) + G_ADC(f)</code>. <b>Crosstalk</b> is the target/source ratio at
+the selected frequency.</p>
+"""
+
+
 class ScientificSignalAnalyzerWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Scientific EEG/ADC Signal Analyzer")
-        self.resize(1680, 980)
+        self.resize(self._default_window_size())
 
         self.dataset: Optional[SignalDataset] = None
         self.original_dataset: Optional[SignalDataset] = None
@@ -234,9 +309,31 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self._setting_region = False
         self._last_selection_matrix: Optional[np.ndarray] = None
         self._last_enabled_names: list[str] = []
+        self._last_mean_names: list[str] = []
+        self.source_metadata: dict[str, str] = {}
+        self.recording_name = ""
+        self.export_store = ReportSettingsStore()
+        self.export_options = self.export_store.load()
+        self.measurement = MeasurementInfo()
 
         self._build_ui()
         self._build_menu()
+
+    @staticmethod
+    def _default_window_size() -> "QSize":
+        """Largest useful window that still fits the screen it opens on.
+
+        A fixed 1680x980 does not fit a 150% scaled 1600p display, and the left
+        panel then squeezes its rows on top of each other.
+        """
+
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return QSize(1400, 900)
+        available = screen.availableGeometry()
+        width = max(1180, min(available.width() - 40, 1720))
+        height = max(720, min(available.height() - 70, 1060))
+        return QSize(width, height)
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("File")
@@ -256,6 +353,11 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         export_pdf_action = QAction("Export PDF", self)
         export_pdf_action.triggered.connect(self.export_pdf)
         export_menu.addAction(export_pdf_action)
+
+        export_menu.addSeparator()
+        export_report_action = QAction("Export report (choose sections)...", self)
+        export_report_action.triggered.connect(lambda: self.open_export_dialog("pdf"))
+        export_menu.addAction(export_report_action)
 
         edit_menu = self.menuBar().addMenu("Edit")
         undo_action = QAction("Undo Last Edit", self)
@@ -291,8 +393,18 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
 
+        # The controls need more height than a laptop screen has, and a plain
+        # widget squashes its rows instead of scrolling. Wrap it like the live
+        # window does so every row keeps its natural height.
         self.controls_panel = self._build_controls_panel()
-        splitter.addWidget(self.controls_panel)
+        self.controls_scroll = QScrollArea()
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.controls_scroll.setWidget(self.controls_panel)
+        self.controls_scroll.setMinimumWidth(300)
+        self.controls_scroll.setMaximumWidth(430)
+        splitter.addWidget(self.controls_scroll)
 
         right_splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(right_splitter)
@@ -358,7 +470,7 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         result_tabs.addTab(self._build_cmrr_sweep_page(), "CMRR Sweep")
         bottom_splitter.addWidget(result_tabs)
 
-        splitter.setSizes([340, 1340])
+        splitter.setSizes([360, self._default_window_size().width() - 380])
         right_splitter.setSizes([600, 340])
         bottom_splitter.setSizes([740, 540])
 
@@ -431,6 +543,26 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         layout.addStretch(1)
         return footer
 
+    def show_metrics_description(self) -> None:
+        """Open the metric definitions in a scrollable popup."""
+
+        dialog = getattr(self, "_metrics_help_dialog", None)
+        if dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Metric definitions")
+            dialog.resize(860, 640)
+            dialog_layout = QVBoxLayout(dialog)
+            browser = QTextBrowser(dialog)
+            browser.setHtml(METRICS_HELP_HTML)
+            dialog_layout.addWidget(browser, 1)
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            buttons.rejected.connect(dialog.reject)
+            dialog_layout.addWidget(buttons)
+            self._metrics_help_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def _build_metrics_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -452,18 +584,13 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.manual_fundamental_spin.valueChanged.connect(self._refresh_analysis)
         controls.addWidget(self.manual_fundamental_spin)
         controls.addStretch(1)
-        layout.addLayout(controls)
-
-        self.metrics_formula_label = QLabel(
-            "Units: EEG amplitudes are treated as uVrms. Selection Avg RMS is the RMS of each channel over the full selected region after exclusions, active filters, and a fixed 0.5-100 Hz bandpass filter. "
-            "Band RMS 0.1-100 Hz is the same RMS computed over the full EEG band and is the input-referred noise number: with shorted inputs it should sit at the amplifier noise floor, and it is what the live recorder shows with its default 0.1 / 150 Hz display filters (use a selection of at least ~10 s so the 0.1 Hz corner can settle). "
-            f"The '{CHANNEL_AVERAGE_LABEL}' row averages every channel, so that cell is the single 0.1-100 Hz noise value of the selection. "
-            "Auto mode finds the dominant spectral tone; Manual Hz measures the exact user-entered frequency with a sine-fit RMS estimator. "
-            "50 Hz pickup is the exact 50 Hz RMS. SNR = 10 log10(Pfund / Pnoise). THD uses harmonics 2f through 5f. ENOB = (SNR - 1.76) / 6.02. "
-            "CMRR uses the selected CMRR frequency or the fundamental if no CMRR frequency is specified. When ADS1299 sinc3 correction is enabled, the app applies the sinc3 gain to the user-entered common-mode input, so CMRR_corrected(f) = CMRR_measured(f) + G_ADC(f), where G_ADC(f) is typically negative at higher frequency. Crosstalk uses the selected Crosstalk frequency or the fundamental if no Crosstalk frequency is specified."
+        self.metrics_help_button = QPushButton("Description")
+        self.metrics_help_button.setToolTip(
+            "How every metric in this table is calculated. Amplitudes are uVrms throughout."
         )
-        self.metrics_formula_label.setWordWrap(True)
-        layout.addWidget(self.metrics_formula_label)
+        self.metrics_help_button.clicked.connect(self.show_metrics_description)
+        controls.addWidget(self.metrics_help_button)
+        layout.addLayout(controls)
 
         layout.addWidget(self.metrics_table)
         self._on_fundamental_mode_changed()
@@ -633,6 +760,25 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         import_layout.addWidget(self.file_label)
         layout.addWidget(import_group)
 
+        session_group = QGroupBox("Recording")
+        session_layout = QVBoxLayout(session_group)
+        self.session_label = QLabel("Recording: -")
+        self.session_label.setWordWrap(True)
+        self.session_label.setStyleSheet("font-weight: 600;")
+        session_layout.addWidget(self.session_label)
+        self.measurement_label = QLabel("")
+        self.measurement_label.setWordWrap(True)
+        self.measurement_label.setStyleSheet("color: #475569; font-size: 11px;")
+        session_layout.addWidget(self.measurement_label)
+        measurement_button = QPushButton("Edit measurement details...")
+        measurement_button.setToolTip(
+            "Describe what you measured (noise / CMRR / crosstalk / gain, the connection and the "
+            "applied voltage). Used for the report, the file names and the CSV export."
+        )
+        measurement_button.clicked.connect(self.edit_measurement)
+        session_layout.addWidget(measurement_button)
+        layout.addWidget(session_group)
+
         navigation_group = QGroupBox("Navigation")
         navigation_group.setMaximumHeight(150)
         navigation_layout = QVBoxLayout(navigation_group)
@@ -709,6 +855,19 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.common_mode_spin.setSuffix(" V")
         self.common_mode_spin.valueChanged.connect(self._refresh_analysis)
         metrics_layout.addRow("Common-mode input", self.common_mode_spin)
+        # The applied signal makes SNR/THD/ENOB meaningful: without it the app can
+        # only describe the measured spectrum, not refer it to what you fed in.
+        self.input_amplitude_spin = QDoubleSpinBox()
+        self.input_amplitude_spin.setRange(0.0, 1_000_000_000.0)
+        self.input_amplitude_spin.setDecimals(9)
+        self.input_amplitude_spin.setValue(0.0)
+        self.input_amplitude_spin.setSuffix(" Vrms")
+        self.input_amplitude_spin.setToolTip(
+            "RMS of the signal you actually applied to the inputs. Used to report gain error, "
+            "input-referred SNR and a full-scale-referenced ENOB."
+        )
+        self.input_amplitude_spin.valueChanged.connect(self._refresh_analysis)
+        metrics_layout.addRow("Applied signal", self.input_amplitude_spin)
         self.cmrr_frequency_mode_combo = QComboBox()
         self.cmrr_frequency_mode_combo.addItems(["Use fundamental", "Manual Hz"])
         self.cmrr_frequency_mode_combo.currentIndexChanged.connect(self._on_cmrr_mode_changed)
@@ -773,9 +932,17 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             return
 
         try:
-            default_sample_rate = openbci_sample_rate(read_openbci_metadata(file_path))
+            metadata = read_openbci_metadata(file_path)
         except OSError:
-            default_sample_rate = None
+            metadata = {}
+        default_sample_rate = openbci_sample_rate(metadata)
+        self.source_metadata = dict(metadata)
+        self.recording_name = str(metadata.get("Session", "") or "").strip()
+        self.measurement = MeasurementInfo.from_metadata(metadata)
+        if self.recording_name:
+            self.export_options.last_stem = full_export_stem(self.recording_name, self.measurement)
+        if str(file_path.parent) and not self.export_options.output_dir:
+            self.export_options.output_dir = str(file_path.parent)
 
         dialog = ImportOptionsDialog(file_path, preview, self, default_sample_rate=default_sample_rate)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -811,6 +978,7 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self._invalidate_filter_cache()
         self.file_label.setText(file_path.name)
         self.file_label.setToolTip(str(file_path))
+        self._update_session_label()
         self._rebuild_channel_controls()
         self._rebuild_waveform_items()
         self._initialize_selection()
@@ -1155,6 +1323,7 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             self.selection_summary.setText("Selection: no enabled channels")
             self._last_selection_matrix = None
             self._last_enabled_names = []
+            self._last_mean_names = []
             return
 
         filtered_data = self._get_filtered_data()
@@ -1179,12 +1348,23 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             self.fft_marker.hide()
             self._last_selection_matrix = None
             self._last_enabled_names = []
+            self._last_mean_names = []
             return
 
         enabled_names = [self.dataset.channel_names[index] for index in enabled_indices]
+        # The averaged row must only contain channels that are actually shown:
+        # a channel switched off in either the time or the FFT list is not part
+        # of the mean, so a hidden noisy channel cannot skew it.
+        fft_visible = {
+            self.dataset.channel_names[index] for index in self._fft_visible_channel_indices()
+        }
+        mean_names = [name for name in enabled_names if name in fft_visible] or list(enabled_names)
         self._last_selection_matrix = selection_matrix.copy()
         self._last_enabled_names = list(enabled_names)
+        self._last_mean_names = list(mean_names)
         fft_length = min(int(self.fft_length_spin.value()), max(selection_matrix.shape[0], 128))
+        applied_rms = float(self.input_amplitude_spin.value())
+        channel_gains = self._header_channel_gains(enabled_names)
         fft_settings = FFTSettings(
             fft_length=fft_length,
             window_name=self.window_combo.currentText(),
@@ -1193,6 +1373,8 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             crosstalk_frequency_hz=self._manual_crosstalk_frequency_hz(),
             cmrr_correction_enabled=self.cmrr_correction_check.isChecked(),
             cmrr_correction_fs_hz=float(self.cmrr_correction_fs_spin.value()),
+            applied_input_rms_v=applied_rms,
+            full_scale_rms_v=VREF_VOLTS / max(channel_gains[0], 1.0) / np.sqrt(2.0),
         )
         common_mode_voltage = float(self.common_mode_spin.value()) if self.common_mode_spin.value() > 0 else None
         source_name = self.crosstalk_source_combo.currentText()
@@ -1207,6 +1389,8 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
                 common_mode_voltage=common_mode_voltage,
                 crosstalk_source_index=crosstalk_source_index,
                 signal_scale_to_volts=1e-6,
+                mean_channel_names=mean_names,
+                channel_gains=channel_gains,
             )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Analysis", f"Analysis failed for the current selection.\n\n{exc}")
@@ -1230,6 +1414,37 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.selection_summary.setText(
             f"Selection: {duration:.3f} s, {selection_time.size:,} samples, {excluded_count:,} excluded sample(s)"
         )
+
+    def _header_channel_gains(self, channel_names: Sequence[str]) -> list[float]:
+        """PGA gain per channel, read from the recording header.
+
+        The header stores ``Board Channel Gains = x24,x24,...`` for all real
+        channels, so the full-scale reference for ENOB can be computed per
+        channel instead of assuming x24.
+        """
+
+        raw = self.source_metadata.get("Board Channel Gains", "")
+        parsed = [float(token.strip().lstrip("xX") or 24.0) for token in raw.split(",") if token.strip()]
+        board_order = self._board_channel_order(channel_names)
+        gains: list[float] = []
+        for position, _name in enumerate(channel_names):
+            index = board_order[position] if position < len(board_order) else position
+            gains.append(parsed[index] if 0 <= index < len(parsed) else 24.0)
+        return gains or [24.0] * len(channel_names)
+
+    def _board_channel_order(self, channel_names: Sequence[str]) -> list[int]:
+        """Map the analysed channels onto the ``Board Channel Gains`` order."""
+
+        mapping = self.source_metadata.get("Channel Map", "")
+        if not mapping:
+            return list(range(len(channel_names)))
+        numbers = [int(token.strip()) for token in mapping.split(",") if token.strip().isdigit()]
+        order: list[int] = []
+        for name in channel_names:
+            digits = "".join(character for character in str(name) if character.isdigit())
+            number = int(digits) if digits else 0
+            order.append(numbers.index(number) if number in numbers else len(order))
+        return order
 
     def _plot_fft(
         self,
@@ -1682,131 +1897,354 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         }.get(last_action, "Edit applied.")
         self.statusBar().showMessage(action_message)
 
-    def export_csv(self) -> None:
+    # -- export ------------------------------------------------------------
+
+    def edit_measurement(self) -> None:
+        """Edit the measurement description that goes into every export."""
+
+        dialog = MeasurementNameDialog(self.measurement, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.measurement = dialog.measurement()
+        self.export_options.measurement = self.measurement
+        if self.recording_name:
+            self.export_options.last_stem = full_export_stem(self.recording_name, self.measurement)
+        else:
+            self.export_options.last_stem = self.measurement.slug()
+        self.export_store.save(self.export_options)
+        self._update_session_label()
+
+    def _update_session_label(self) -> None:
+        """Show which recording name exports will reuse."""
+
+        label = getattr(self, "session_label", None)
+        if label is None:
+            return
+        if self.recording_name:
+            label.setText(f"Recording: {self.recording_name}")
+        elif self.dataset is not None and self.dataset.file_path is not None:
+            label.setText(f"Recording: {self.dataset.file_path.stem}")
+        else:
+            label.setText("Recording: -")
+        label.setToolTip(
+            "This name comes from the recording header (the name you gave it in the live recorder) "
+            "and is used by default when exporting."
+        )
+        measurement_label = getattr(self, "measurement_label", None)
+        if measurement_label is not None:
+            measurement_label.setText("   |   ".join(self.measurement.describe_lines()))
+
+    def _available_export_sections(self) -> list[str]:
+        """Sections that currently have data behind them."""
+
+        available = ["info"]
+        if self.dataset is not None:
+            available += ["waveform", "fft", "metrics", "crosstalk"]
+        if not self.crosstalk_sweep_df.empty:
+            available.append("crosstalk_sweep")
+        if not self.gain_sweep_df.empty:
+            available.append("gain_sweep")
+        if not self.cmrr_sweep_df.empty:
+            available.append("cmrr_sweep")
+        return available
+
+    def open_export_dialog(self, focus_format: str = "pdf") -> None:
+        """Ask what to include, remember the answer, then write the files."""
+
+        if self.dataset is None:
+            QMessageBox.information(self, "Export", "Load a recording before exporting.")
+            return
         if self.metrics_df.empty:
             self._refresh_analysis()
         if self.metrics_df.empty:
             QMessageBox.information(self, "Export", "No analysis results are available to export.")
             return
 
-        file_name, _ = QFileDialog.getSaveFileName(self, "Export CSV", "analysis_results.csv", "CSV files (*.csv)")
-        if not file_name:
+        if not self.export_options.last_stem:
+            self.export_options.last_stem = self._default_export_stem()
+        dialog = ExportSelectionDialog(
+            self.export_options,
+            self,
+            available=self._available_export_sections(),
+            focus_format=focus_format,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        options = dialog.options()
+        if not (options.pdf or options.png or options.csv):
+            QMessageBox.information(self, "Export", "Pick at least one format (PDF, PNG or CSV).")
+            return
+        self.export_options = options
+        self.measurement = options.measurement
+        self.export_store.save(options)
+        self._run_export(options)
 
-        base_path = Path(file_name)
-        metrics_path = base_path.with_name(f"{base_path.stem}_metrics.csv")
-        crosstalk_path = base_path.with_name(f"{base_path.stem}_crosstalk.csv")
-        self.metrics_df.to_csv(metrics_path, index=False)
-        self.crosstalk_df.to_csv(crosstalk_path, index=False)
-        extra_paths = [str(metrics_path), str(crosstalk_path)]
-        if not self.crosstalk_sweep_df.empty:
-            crosstalk_sweep_path = base_path.with_name(f"{base_path.stem}_crosstalk_sweep.csv")
-            self.crosstalk_sweep_df.to_csv(crosstalk_sweep_path, index=False)
-            extra_paths.append(str(crosstalk_sweep_path))
-        if not self.gain_sweep_df.empty:
-            gain_sweep_path = base_path.with_name(f"{base_path.stem}_gain_sweep.csv")
-            self.gain_sweep_df.to_csv(gain_sweep_path, index=False)
-            extra_paths.append(str(gain_sweep_path))
-        if not self.cmrr_sweep_df.empty:
-            cmrr_sweep_path = base_path.with_name(f"{base_path.stem}_cmrr_sweep.csv")
-            self.cmrr_sweep_df.to_csv(cmrr_sweep_path, index=False)
-            extra_paths.append(str(cmrr_sweep_path))
-        QMessageBox.information(self, "Export", "Saved:\n" + "\n".join(extra_paths))
+    def _default_export_stem(self) -> str:
+        if self.recording_name:
+            return full_export_stem(self.recording_name, self.measurement)
+        if self.dataset is not None and self.dataset.file_path is not None:
+            return self.dataset.file_path.stem
+        return "analysis"
+
+    def _prompt_export_base(self, options: ExportOptions) -> Optional[Path]:
+        stem = options.last_stem.strip() or self._default_export_stem()
+        if self.dataset is not None and self.dataset.file_path is not None:
+            default_path = Path(options.output_dir or self.dataset.file_path.parent) / stem
+        else:
+            default_path = Path(options.output_dir or Path.cwd()) / stem
+        pattern = (
+            "*.pdf" if options.pdf and not (options.png or options.csv)
+            else "*.png" if options.png and not (options.pdf or options.csv)
+            else "*.csv" if options.csv and not (options.pdf or options.png)
+            else "*"
+        )
+        file_name, _ = QFileDialog.getSaveFileName(
+            self, "Export report", str(default_path) + (".pdf" if options.pdf else ""), f"Files ({pattern})"
+        )
+        if not file_name:
+            return None
+        return Path(file_name)
+
+    def _run_export(self, options: ExportOptions) -> None:
+        base = self._prompt_export_base(options)
+        if base is None:
+            return
+        options.output_dir = str(base.parent)
+        options.last_stem = base.stem
+        self.export_store.save(options)
+
+        written: list[str] = []
+        try:
+            if options.pdf:
+                written.append(str(self._write_pdf(base.with_suffix(".pdf"), options)))
+            if options.png:
+                written.extend(self._write_png(base, options))
+            if options.csv:
+                written.extend(self._write_csv(base, options))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Export", f"Export failed.\n\n{exc}")
+            return
+        if not written:
+            QMessageBox.information(self, "Export", "Nothing matched the selected sections.")
+            return
+        QMessageBox.information(self, "Export", "Saved:\n" + "\n".join(written))
+
+    # -- report content ----------------------------------------------------
+
+    def _report_title(self, options: ExportOptions) -> str:
+        stem = options.last_stem or self._default_export_stem()
+        return stem
+
+    def _report_subtitle(self) -> str:
+        parts: list[str] = []
+        if self.dataset is not None:
+            parts.append(f"File: {self.dataset.file_path.name}")
+            parts.append(f"Sample rate: {self.dataset.sample_rate:.3f} Hz")
+            parts.append(f"{self.dataset.channel_count} channel(s)")
+        parts.append(f"Filters: 50 Hz={'on' if self.notch_50_check.isChecked() else 'off'}")
+        parts.append(f"100 Hz={'on' if self.notch_100_check.isChecked() else 'off'}")
+        return "   |   ".join(parts)
+
+    def _analysis_settings_lines(self) -> list[str]:
+        """Everything the user typed in, so the report documents the setup."""
+
+        selection_text = self.selection_summary.text()
+        lines = [selection_text if selection_text.lower().startswith("selection") else f"Selection: {selection_text}"]
+        lines.append(f"FFT length: {int(self.fft_length_spin.value())}   Window: {self.window_combo.currentText()}")
+        lines.append(
+            f"Notch filters: 50 Hz={'on' if self.notch_50_check.isChecked() else 'off'}, "
+            f"100 Hz={'on' if self.notch_100_check.isChecked() else 'off'} (Q={self.filter_q_spin.value():g})"
+        )
+        common_mode = float(self.common_mode_spin.value())
+        lines.append(
+            "Common-mode input: " + (f"{common_mode:.6g} V" if common_mode > 0 else "not specified")
+        )
+        if self.cmrr_frequency_mode_combo.currentIndex() == 1:
+            lines.append(f"CMRR frequency: {self.cmrr_frequency_spin.value():g} Hz (manual)")
+        else:
+            lines.append("CMRR frequency: from the detected fundamental")
+        lines.append(
+            "ADS1299 sinc3 correction: "
+            + (f"on (fs = {self.cmrr_correction_fs_spin.value():g} Hz)" if self.cmrr_correction_check.isChecked() else "off")
+        )
+        if self.gain_sweep_input_spin.value() > 0:
+            lines.append(f"Gain-sweep stimulus: {self.gain_sweep_input_spin.value():.6g} V")
+        lines.append(
+            f"Crosstalk source: {self.crosstalk_source_combo.currentText() or '-'}   "
+            f"Channels in analysis: {len(self._last_enabled_names)}"
+        )
+        if self._last_mean_names:
+            lines.append("Averaged channels: " + ", ".join(self._last_mean_names))
+        return lines
+
+    def _plot_pixmap(self, plot_widget, aspect: Optional[float] = None):
+        """Render a plot for the report at high resolution.
+
+        ``grab()`` copies whatever size the widget happens to have, so the report
+        would depend on the window layout. ImageExporter re-renders the scene and
+        keeps the plot's own proportions, which is what makes the figure legible
+        instead of squashed. ``aspect`` (height / width) overrides those
+        proportions so a wide on-screen plot can still fill a page in the report.
+        """
+
+        target_width = 2000
+        width = max(plot_widget.width(), 1)
+        height = max(plot_widget.height(), 1)
+        restored = None
+        if aspect:
+            # The exporter keeps the scene's own proportions, so the only way to
+            # get a taller figure is to lay the plot out taller for the render.
+            # Updates stay off so the reflow never reaches the screen.
+            width = max(width, 640)
+            restored = (plot_widget.minimumSize(), plot_widget.maximumSize(), plot_widget.size())
+            plot_widget.setUpdatesEnabled(False)
+            plot_widget.setFixedSize(width, max(int(width * float(aspect)), 480))
+            QApplication.instance().processEvents()
+            height = max(plot_widget.height(), 1)
+        target_height = max(int(target_width * height / width), 600)
+        exporter = pyqtgraph.exporters.ImageExporter(plot_widget.plotItem)
+        params = exporter.parameters()
+        try:
+            # ParameterTree does not support membership tests, so assign directly.
+            params["width"] = target_width
+            params["height"] = target_height
+        except (KeyError, TypeError):
+            pass
+        rendered = exporter.export(toBytes=True)
+        if restored is not None:
+            plot_widget.setMinimumSize(restored[0])
+            plot_widget.setMaximumSize(restored[1])
+            plot_widget.resize(restored[2])
+            plot_widget.setUpdatesEnabled(True)
+            QApplication.instance().processEvents()
+        if isinstance(rendered, QImage):
+            image = rendered
+        else:
+            image = QImage.fromData(rendered, "PNG")
+        if image.isNull():
+            return plot_widget.grab()
+        return QPixmap.fromImage(image)
+
+    def _write_pdf(self, path: Path, options: ExportOptions) -> Path:
+        writer = ReportWriter(path, self._report_title(options), self._report_subtitle())
+        if options.enabled("info"):
+            writer.heading("Measurement")
+            writer.paragraph(self.measurement.describe_lines())
+            writer.heading("Analysis settings", level=2)
+            writer.paragraph(self._analysis_settings_lines(), size=8.5)
+            if self.source_metadata:
+                writer.heading("Recording metadata", level=2)
+                writer.paragraph(
+                    [f"{key}: {value}" for key, value in self.source_metadata.items() if key != "format"],
+                    size=8,
+                )
+        if options.enabled("waveform") and self.dataset is not None:
+            # A tall waveform is what makes a multi-channel trace readable, and it
+            # only fits on a page of its own.
+            writer.new_page()
+            writer.heading("Waveform", keep_with_next=0.86)
+            writer.image(
+                self._plot_pixmap(self.waveform_plot, aspect=0.62),
+                "Selected analysis region",
+                max_height=0.80,
+            )
+        if options.enabled("fft"):
+            writer.heading("FFT", keep_with_next=0.54)
+            writer.image(self._plot_pixmap(self.fft_plot), "RMS spectrum of the analysed channel", max_height=0.46)
+        if options.enabled("metrics"):
+            writer.heading("Metrics", keep_with_next=0.14)
+            writer.table(self.metrics_df, caption="Per-channel metrics")
+        if options.enabled("crosstalk") and not self.crosstalk_df.empty:
+            writer.heading("Crosstalk", keep_with_next=0.14)
+            writer.table(self.crosstalk_df, caption="Crosstalk from the selected source")
+        if options.enabled("crosstalk_sweep") and not self.crosstalk_sweep_df.empty:
+            writer.heading("Crosstalk sweep", keep_with_next=0.42)
+            writer.image(self._plot_pixmap(self.crosstalk_sweep_plot), "Crosstalk versus frequency")
+            writer.table(self.crosstalk_sweep_df, max_rows=400, caption="Crosstalk sweep data")
+        if options.enabled("gain_sweep") and not self.gain_sweep_df.empty:
+            writer.heading("Gain sweep", keep_with_next=0.42)
+            writer.image(self._plot_pixmap(self.gain_sweep_plot), "Response versus applied level")
+            writer.table(self.gain_sweep_df, max_rows=400, caption="Gain sweep data")
+        if options.enabled("cmrr_sweep") and not self.cmrr_sweep_df.empty:
+            writer.heading("CMRR sweep", keep_with_next=0.42)
+            writer.image(self._plot_pixmap(self.cmrr_sweep_plot), "CMRR versus frequency")
+            writer.table(self.cmrr_sweep_df, max_rows=400, caption="CMRR sweep data")
+        return writer.close()
+
+    def _write_png(self, base: Path, options: ExportOptions) -> list[str]:
+        written: list[str] = []
+        targets = (
+            ("waveform", self.waveform_plot, "waveform"),
+            ("fft", self.fft_plot, "fft"),
+            ("crosstalk_sweep", self.crosstalk_sweep_plot, "crosstalk_sweep"),
+            ("gain_sweep", self.gain_sweep_plot, "gain_sweep"),
+            ("cmrr_sweep", self.cmrr_sweep_plot, "cmrr_sweep"),
+        )
+        for key, plot_widget, suffix in targets:
+            if not options.enabled(key):
+                continue
+            suffix_name = suffix if key in ("crosstalk_sweep", "gain_sweep", "cmrr_sweep") else suffix
+            if key in ("crosstalk_sweep", "gain_sweep", "cmrr_sweep"):
+                frame = {
+                    "crosstalk_sweep": self.crosstalk_sweep_df,
+                    "gain_sweep": self.gain_sweep_df,
+                    "cmrr_sweep": self.cmrr_sweep_df,
+                }[key]
+                if frame.empty:
+                    continue
+            target = base.with_name(f"{base.stem}_{suffix_name}.png")
+            exporter = pyqtgraph.exporters.ImageExporter(plot_widget.plotItem)
+            try:
+                exporter.parameters()["width"] = 2200
+            except (KeyError, TypeError):
+                pass
+            exporter.export(str(target))
+            written.append(str(target))
+        return written
+
+    def _write_csv(self, base: Path, options: ExportOptions) -> list[str]:
+        written: list[str] = []
+
+        def dump(frame: pd.DataFrame, suffix: str) -> None:
+            if frame is None or frame.empty:
+                return
+            target = base.with_name(f"{base.stem}_{suffix}.csv")
+            frame.to_csv(target, index=False)
+            written.append(str(target))
+
+        if options.enabled("info"):
+            rows: list[dict[str, str]] = []
+            for line in self.measurement.describe_lines():
+                key, _, value = line.partition(":")
+                rows.append({"Section": "Measurement", "Key": key.strip(), "Value": value.strip()})
+            for line in self._analysis_settings_lines():
+                key, _, value = line.partition(":")
+                rows.append({"Section": "Analysis", "Key": key.strip(), "Value": value.strip()})
+            for key, value in self.source_metadata.items():
+                rows.append({"Section": "Recording", "Key": key, "Value": value})
+            dump(pd.DataFrame(rows), "info")
+        if options.enabled("metrics"):
+            dump(self.metrics_df, "metrics")
+        if options.enabled("crosstalk"):
+            dump(self.crosstalk_df, "crosstalk")
+        if options.enabled("crosstalk_sweep"):
+            dump(self.crosstalk_sweep_df, "crosstalk_sweep")
+        if options.enabled("gain_sweep"):
+            dump(self.gain_sweep_df, "gain_sweep")
+        if options.enabled("cmrr_sweep"):
+            dump(self.cmrr_sweep_df, "cmrr_sweep")
+        return written
+
+    # -- menu entry points (kept for muscle memory) ------------------------
+
+    def export_csv(self) -> None:
+        self.open_export_dialog("csv")
 
     def export_png(self) -> None:
-        if not self.dataset:
-            QMessageBox.information(self, "Export", "Load data before exporting plots.")
-            return
-
-        file_name, _ = QFileDialog.getSaveFileName(self, "Export PNG", "analysis_plots.png", "PNG files (*.png)")
-        if not file_name:
-            return
-
-        base_path = Path(file_name)
-        waveform_path = base_path.with_name(f"{base_path.stem}_waveform.png")
-        fft_path = base_path.with_name(f"{base_path.stem}_fft.png")
-        extra_paths = [str(waveform_path), str(fft_path)]
-        pyqtgraph.exporters.ImageExporter(self.waveform_plot.plotItem).export(str(waveform_path))
-        pyqtgraph.exporters.ImageExporter(self.fft_plot.plotItem).export(str(fft_path))
-        if not self.crosstalk_sweep_df.empty:
-            crosstalk_sweep_path = base_path.with_name(f"{base_path.stem}_crosstalk_sweep.png")
-            pyqtgraph.exporters.ImageExporter(self.crosstalk_sweep_plot.plotItem).export(str(crosstalk_sweep_path))
-            extra_paths.append(str(crosstalk_sweep_path))
-        if not self.gain_sweep_df.empty:
-            gain_sweep_path = base_path.with_name(f"{base_path.stem}_gain_sweep.png")
-            pyqtgraph.exporters.ImageExporter(self.gain_sweep_plot.plotItem).export(str(gain_sweep_path))
-            extra_paths.append(str(gain_sweep_path))
-        if not self.cmrr_sweep_df.empty:
-            cmrr_sweep_path = base_path.with_name(f"{base_path.stem}_cmrr_sweep.png")
-            pyqtgraph.exporters.ImageExporter(self.cmrr_sweep_plot.plotItem).export(str(cmrr_sweep_path))
-            extra_paths.append(str(cmrr_sweep_path))
-        QMessageBox.information(self, "Export", "Saved:\n" + "\n".join(extra_paths))
+        self.open_export_dialog("png")
 
     def export_pdf(self) -> None:
-        if self.metrics_df.empty:
-            self._refresh_analysis()
-        if self.metrics_df.empty:
-            QMessageBox.information(self, "Export", "No analysis results are available to export.")
-            return
-
-        file_name, _ = QFileDialog.getSaveFileName(self, "Export PDF", "analysis_report.pdf", "PDF files (*.pdf)")
-        if not file_name:
-            return
-
-        pdf_path = Path(file_name)
-        writer = QPdfWriter(str(pdf_path))
-        writer.setResolution(150)
-        writer.setPageOrientation(QPageLayout.Orientation.Landscape)
-        writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
-
-        painter = QPainter(writer)
-        try:
-            page_rect = writer.pageLayout().paintRectPixels(writer.resolution())
-            left_margin = 40
-            top_margin = 30
-            content_width = page_rect.width() - 2 * left_margin
-
-            painter.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
-            painter.drawText(left_margin, top_margin + 20, "Scientific EEG/ADC Analysis Report")
-
-            painter.setFont(QFont("Segoe UI", 9))
-            metadata_line = (
-                f"File: {self.dataset.file_path.name if self.dataset else 'N/A'}    "
-                f"Sampling rate: {self.dataset.sample_rate:.3f} Hz    "
-                f"Filters: 50 Hz={'on' if self.notch_50_check.isChecked() else 'off'}, "
-                f"100 Hz={'on' if self.notch_100_check.isChecked() else 'off'}"
-            )
-            painter.drawText(left_margin, top_margin + 46, metadata_line)
-            painter.drawText(left_margin, top_margin + 64, self.selection_summary.text())
-
-            waveform_pixmap = self.waveform_plot.grab()
-            fft_pixmap = self.fft_plot.grab()
-            plot_top = top_margin + 78
-            plot_height = 280
-            half_width = (content_width - 20) // 2
-            painter.drawPixmap(left_margin, plot_top, half_width, plot_height, waveform_pixmap)
-            painter.drawPixmap(left_margin + half_width + 20, plot_top, half_width, plot_height, fft_pixmap)
-
-            painter.setFont(QFont("Consolas", 8))
-            metrics_text = self.metrics_df.round(6).to_string(index=False)
-            crosstalk_text = self.crosstalk_df.round(6).to_string(index=False) if not self.crosstalk_df.empty else "No crosstalk result available"
-            text_top = plot_top + plot_height + 25
-            painter.drawText(left_margin, text_top, "Metrics")
-            painter.drawText(
-                QRect(left_margin, text_top + 16, content_width // 2 - 10, page_rect.height() - text_top - 40),
-                int(Qt.TextFlag.TextExpandTabs | Qt.TextFlag.TextWordWrap),
-                metrics_text,
-            )
-            painter.drawText(left_margin + content_width // 2, text_top, "Crosstalk")
-            painter.drawText(
-                QRect(left_margin + content_width // 2, text_top + 16, content_width // 2 - 10, page_rect.height() - text_top - 40),
-                int(Qt.TextFlag.TextExpandTabs | Qt.TextFlag.TextWordWrap),
-                crosstalk_text,
-            )
-        finally:
-            painter.end()
-
-        QMessageBox.information(self, "Export", f"Saved report to:\n{pdf_path}")
+        self.open_export_dialog("pdf")
 
     @staticmethod
     def _format_table_value(value: object) -> str:
@@ -1824,6 +2262,7 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
 def main() -> None:
     pg.setConfigOptions(antialias=False, background="w", foreground="k")
     app = QApplication(sys.argv)
+    install_wheel_guard(app)
     if "--live" in sys.argv:
         from live_gui import LiveRecorderWindow
 

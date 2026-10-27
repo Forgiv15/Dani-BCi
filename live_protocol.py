@@ -70,7 +70,7 @@ ADS_SPI_FRAME_BITS = 3 * 8 + 8 * 8 * 3  # 3 status bytes + 8 x 24-bit samples = 
 DEFAULT_HIGH_PASS_HZ = 0.1
 DEFAULT_LOW_PASS_HZ = 150.0
 # Bumped whenever a stored settings file needs to adopt a new default.
-SETTINGS_VERSION = 3
+SETTINGS_VERSION = 4
 
 # Reference ("SRB") routing. SRB1 is a single switch inside each ADS1299
 # (MISC1 bit 5) that ties the negative input of every channel to the SRB1 pin,
@@ -647,7 +647,9 @@ class HardwareSettings:
     """Persisted board configuration that is replayed on every connect."""
 
     board_channels: int = 16
-    sample_rate_code: int = 6
+    # 500 SPS with Cyton+Daisy interleaving = 250 Hz per channel, the fastest
+    # rate that still fits the serial link comfortably at 921600 baud.
+    sample_rate_code: int = 5
     reference_mode: str = REFERENCE_MODE_SRB2
     channels: list[ChannelSetting] = field(default_factory=list)
 
@@ -973,10 +975,10 @@ class ViewSettings:
     fft_window: str = "Hann"
     fft_smoothing: float = 0.0
     fft_scale_mode: float = 0.0
-    fft_log_scale: bool = False
+    fft_log_scale: bool = True
     fft_channel: str = "all"
     fft_end_hz: float = 0.0
-    record_visible_only: bool = False
+    record_visible_only: bool = True
     accel_full_scale_g: float = 2.0
     accel_motion_threshold_g: float = 0.08
     accel_baseline_seconds: float = 2.0
@@ -1026,10 +1028,11 @@ class AppSettings:
     hardware: HardwareSettings = field(default_factory=HardwareSettings)
     view: ViewSettings = field(default_factory=ViewSettings)
     last_port: str = ""
-    baud_rate: int = 115200
+    baud_rate: int = 921600
     session_name: str = "session"
     output_dir: str = "recordings"
     auto_connect: bool = True
+    measurement: dict[str, object] = field(default_factory=dict)
     version: int = SETTINGS_VERSION
 
     def as_dict(self) -> dict[str, object]:
@@ -1042,7 +1045,11 @@ class AppSettings:
                 "baud_rate": int(self.baud_rate),
                 "auto_connect": bool(self.auto_connect),
             },
-            "recording": {"session_name": self.session_name, "output_dir": self.output_dir},
+            "recording": {
+                "session_name": self.session_name,
+                "output_dir": self.output_dir,
+                "measurement": dict(self.measurement),
+            },
         }
 
     @classmethod
@@ -1063,6 +1070,7 @@ class AppSettings:
             session_name=str(recording.get("session_name", "session")),
             output_dir=str(recording.get("output_dir", "recordings")),
             auto_connect=bool(connection.get("auto_connect", True)),
+            measurement=dict(recording.get("measurement") or {}) if isinstance(recording.get("measurement"), dict) else {},
             version=version,
         )
         settings.migrate()
@@ -1075,6 +1083,19 @@ class AppSettings:
             # Version 2 turned the display band on by default (0.1 Hz / 150 Hz).
             self.view.high_pass_hz = DEFAULT_HIGH_PASS_HZ
             self.view.low_pass_hz = DEFAULT_LOW_PASS_HZ
+        if self.version < 4:
+            # Version 4 changed the boot defaults: 921600 baud, a logarithmic
+            # FFT axis on auto scale, recording only the ticked channels, and
+            # 500 SPS (250 Hz per channel) at gain x24 with a normal input.
+            self.baud_rate = 921600
+            self.view.fft_log_scale = True
+            self.view.fft_scale_mode = 0.0
+            self.view.record_visible_only = True
+            self.hardware.sample_rate_code = 5
+            for channel in self.hardware.channels:
+                channel.active = True
+                channel.gain_ordinal = 6
+                channel.input_ordinal = 0
         self.hardware.sync_reference()
         self.version = SETTINGS_VERSION
 
@@ -1477,8 +1498,17 @@ class DemoBoardPort:
         )
         return "\n".join(lines) + "\n"
 
+    def _packet_rate_hz(self) -> float:
+        """Conversions per second on the wire (one packet each).
+
+        In 16-channel daisy mode the two chips take turns, so this is twice the
+        per-channel rate; with a single chip it is the per-channel rate.
+        """
+
+        return float(SAMPLE_RATE_BY_CODE.get(self.sample_rate_code, 250))
+
     def _run(self) -> None:
-        period = 1.0 / 250.0
+        period = 1.0 / self._packet_rate_hz()
         if self.notify_boot:
             boot = (
                 "=== OpenBCI ESP32 power-on self test ===\n"
@@ -1508,7 +1538,7 @@ class DemoBoardPort:
     def _build_packet(self, elapsed: float) -> bytes:
         index = self._counter & 0xFF
         self._counter += 1
-        t = self._counter / 250.0
+        t = self._counter / self._packet_rate_hz()
         slots = np.zeros(8, dtype=np.int64)
         mapping = physical_channel_map(self.board_channels)
         board_packet = (index & 1) != 0
