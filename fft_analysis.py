@@ -8,8 +8,9 @@ coherent gain.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, replace
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -684,6 +685,254 @@ def _power_ratio_db(signal_power: float, noise_power: float) -> float:
     return float(10.0 * np.log10(signal_power / noise_power))
 
 
+def spectrum_peak_indices(
+    frequencies_hz: np.ndarray,
+    amplitude_rms: np.ndarray,
+) -> list[int]:
+    """Indices of the local maxima of a one-sided spectrum.
+
+    Sweep analysis needs *candidates*, not just the global maximum: when the tone
+    is small, the largest peak is often an intermodulation product rather than the
+    tone itself.
+    """
+
+    amplitudes = np.asarray(amplitude_rms, dtype=np.float64)
+    if amplitudes.size == 0:
+        return []
+    if amplitudes.size < 3:
+        return [int(np.argmax(amplitudes))]
+    middle = amplitudes[1:-1]
+    is_peak = (middle > amplitudes[:-2]) & (middle >= amplitudes[2:]) & (middle > 0)
+    indices = [int(position + 1) for position in np.flatnonzero(is_peak)]
+    if not indices:
+        indices = [int(np.argmax(amplitudes))]
+    return indices
+
+
+class SweepFundamentalTracker:
+    """Follow a stepped, downward frequency sweep without being fooled by mixing.
+
+    A bench CMRR/crosstalk sweep walks the generator down from ~110 Hz to a few
+    hertz and holds each step for a second or more. Below roughly 70 Hz the
+    differential signal is so small that the *intermodulation products* of the
+    applied tone with the mains are louder than the tone itself: 15 Hz produces
+    strong lines at 85 and 115 Hz, 30 Hz at 70 and 130 Hz. Picking the strongest
+    peak then reports a frequency the generator was never set to.
+
+    Three facts about a real sweep make the tone identifiable:
+
+    * it only ever moves **down** between steps, while a mixing product of the
+      current tone sits at ``n * 50 +/- f`` - at or above it, never below the
+      previous step by much;
+    * the previous tone **disappears** when the generator steps away, so a peak
+      that is still at the old frequency at full strength means "not moved yet";
+    * a step is only real once **several consecutive windows agree**, which is the
+      same minimum-hold rule the sweep already uses to reject transitions.
+
+    So: never accept a frequency above the last committed one, hold the committed
+    frequency while it is still present, and only move the lock after
+    ``windows_needed`` agreeing windows.
+    """
+
+    def __init__(
+        self,
+        window_boundary_hz: float = 0.5,
+        windows_needed: int = 2,
+        release_drop_db: float = 6.0,
+        downward_only: bool = True,
+        enabled: bool = True,
+        mains_guard_hz: float = 2.0,
+    ) -> None:
+        self.window_boundary_hz = max(float(window_boundary_hz), 1e-3)
+        self.windows_needed = max(int(windows_needed), 1)
+        self.release_ratio = float(10.0 ** (-abs(float(release_drop_db)) / 20.0))
+        self.downward_only = bool(downward_only)
+        self.enabled = bool(enabled)
+        self.mains_guard_hz = max(float(mains_guard_hz), 0.0)
+        self.locked_hz: Optional[float] = None
+        self.locked_amplitude = 0.0
+        self.rejected_upward = 0
+        self._pending: list[float] = []
+
+    def choose(self, frequencies_hz: np.ndarray, amplitude_rms: np.ndarray) -> Optional[int]:
+        """Index of the candidate peak that should be treated as the fundamental."""
+
+        peaks = spectrum_peak_indices(frequencies_hz, amplitude_rms)
+        if not peaks:
+            return None
+        peaks = self._without_mains(frequencies_hz, peaks)
+        if not peaks:
+            # Every candidate sits on a mains multiple, so there is no evidence of
+            # the applied tone in this window; rejecting is honest.
+            return None
+        if not self.enabled or self.locked_hz is None:
+            return int(max(peaks, key=lambda index: amplitude_rms[index]))
+
+        allowed = peaks
+        if self.downward_only:
+            allowed = [
+                index
+                for index in peaks
+                if frequencies_hz[index] <= self.locked_hz + self.window_boundary_hz
+            ]
+            self.rejected_upward += len(peaks) - len(allowed)
+            if not allowed:
+                return None
+
+        if self.locked_hz is not None:
+            held = [
+                index
+                for index in allowed
+                if abs(frequencies_hz[index] - self.locked_hz) <= self.window_boundary_hz
+            ]
+            if held:
+                best = int(max(held, key=lambda index: amplitude_rms[index]))
+                # Still there at the level it had when it was committed: the
+                # generator has not stepped yet, so keep reporting the same tone.
+                if amplitude_rms[best] >= self.locked_amplitude * self.release_ratio:
+                    return best
+        return int(max(allowed, key=lambda index: amplitude_rms[index]))
+
+    def _without_mains(self, frequencies_hz: np.ndarray, peaks: list[int]) -> list[int]:
+        """Drop peaks sitting on a mains multiple when a better candidate exists.
+
+        The generator is never set to exactly 50 or 100 Hz during a CMRR sweep -
+        it would be indistinguishable from the mains it is measured against - so a
+        peak there is pickup. Leaving it in is what made the tracker stop at
+        100 Hz on its way down from 110 Hz.
+        """
+
+        if self.mains_guard_hz <= 0:
+            return peaks
+        return [
+            index
+            for index in peaks
+            if all(abs(frequencies_hz[index] - mains) > self.mains_guard_hz for mains in MAINS_EXCLUDE_HZ[:2])
+        ]
+
+    def observe(self, frequency_hz: float, amplitude: float) -> Optional[float]:
+        """Feed one accepted window; return the frequency if the lock moved."""
+
+        if not self.enabled:
+            return None
+        if frequency_hz <= 0:
+            return None
+        if self._pending and abs(frequency_hz - float(np.median(self._pending))) <= self.window_boundary_hz:
+            self._pending.append(float(frequency_hz))
+        else:
+            self._pending = [float(frequency_hz)]
+        if len(self._pending) < self.windows_needed:
+            return None
+        committed = float(np.median(self._pending))
+        if self.locked_hz is not None and abs(committed - self.locked_hz) <= self.window_boundary_hz:
+            # Same step as before: refresh the reference level and stay put.
+            self.locked_amplitude = float(amplitude)
+            return None
+        if self.downward_only and self.locked_hz is not None and committed > self.locked_hz + self.window_boundary_hz:
+            return None
+        self.locked_hz = committed
+        self.locked_amplitude = float(amplitude)
+        self._pending = []
+        return committed
+
+
+CMRR_SWEEP_COLUMNS = [
+    "Frequency (Hz)",
+    "CMRR Measured (dB)",
+    "ADC Gain Corr (dB)",
+    "CMRR (dB)",
+    "CMRR Std (dB)",
+    "Output RMS (uVrms)",
+    "Windows",
+]
+
+MAINS_EXCLUDE_HZ = (50.0, 100.0)
+
+
+def sweep_windows_needed(min_hold_s: float, hop_seconds: float, minimum: int = 2) -> int:
+    """Windows that must share one frequency before it counts as a sweep point.
+
+    A stepped sweep holds each frequency for a while before moving on, so two
+    consecutive windows with the same tone are the smallest honest evidence that
+    the generator was standing still rather than mid-transition.
+    """
+
+    if hop_seconds <= 0:
+        return max(int(minimum), 2)
+    needed = int(np.ceil(max(float(min_hold_s), 0.0) / hop_seconds - 1e-9))
+    return max(int(minimum), needed, 2)
+
+
+def _select_stable_sweep_windows(
+    raw: pd.DataFrame,
+    stability_tolerance_hz: float,
+    windows_needed: int,
+) -> tuple[pd.DataFrame, int]:
+    """Drop windows that belong to a frequency the sweep only passed through."""
+
+    stable_mask = np.zeros(len(raw), dtype=bool)
+    rejected = 0
+    run_start = 0
+    while run_start < len(raw):
+        run_end = run_start + 1
+        run_frequencies = [float(raw.iloc[run_start]["Frequency (Hz)"])]
+        while run_end < len(raw):
+            candidate_frequency = float(raw.iloc[run_end]["Frequency (Hz)"])
+            run_center = float(np.median(run_frequencies))
+            if abs(candidate_frequency - run_center) > stability_tolerance_hz:
+                break
+            run_frequencies.append(candidate_frequency)
+            run_end += 1
+        if run_end - run_start >= windows_needed:
+            stable_mask[run_start:run_end] = True
+        else:
+            rejected += run_end - run_start
+        run_start = run_end
+    return raw.loc[stable_mask].copy(), rejected
+
+
+def _aggregate_sweep_windows(
+    raw: pd.DataFrame,
+    *,
+    columns: Sequence[str],
+    mean_columns: Sequence[str],
+    value_column: str,
+    std_column: str,
+    stability_tolerance_hz: float,
+    windows_needed: int,
+    exclude_mains: bool,
+    mains_tolerance_hz: float = 1.0,
+    bucket_hz: Optional[float] = None,
+) -> tuple[pd.DataFrame, int, int]:
+    """Average the stable windows into one row per swept frequency."""
+
+    stable, rejected = _select_stable_sweep_windows(raw, stability_tolerance_hz, windows_needed)
+    if stable.empty:
+        return pd.DataFrame(columns=columns), 0, rejected
+
+    bucket_hz = max(bucket_hz or 0.0, stability_tolerance_hz, 0.05)
+    stable["Frequency Bucket"] = (stable["Frequency (Hz)"] / bucket_hz).round() * bucket_hz
+    aggregation = {column: "mean" for column in mean_columns}
+    aggregation["Time (s)"] = "count"
+    aggregated = stable.groupby("Frequency Bucket", as_index=False).agg(aggregation)
+    aggregated = aggregated.rename(columns={"Time (s)": "Windows"})
+    spread = stable.groupby("Frequency Bucket")[value_column].std(ddof=0).reset_index(name=std_column)
+    aggregated = aggregated.merge(spread, on="Frequency Bucket", how="left")
+    aggregated[std_column] = aggregated[std_column].fillna(0.0)
+    aggregated = aggregated.drop(columns=["Frequency Bucket"])
+
+    if exclude_mains:
+        # 50 and 100 Hz are almost always the generator plus mains pickup, so a
+        # sweep point there measures the mains, not the front end.
+        keep = np.ones(len(aggregated), dtype=bool)
+        for mains_hz in MAINS_EXCLUDE_HZ:
+            keep &= np.abs(aggregated["Frequency (Hz)"].to_numpy() - mains_hz) > mains_tolerance_hz
+        aggregated = aggregated.loc[keep]
+
+    aggregated = aggregated[list(columns)].sort_values("Frequency (Hz)").reset_index(drop=True)
+    return aggregated, int(len(stable.index)), rejected
+
+
 def compute_cmrr_sweep(
     values: np.ndarray,
     sample_rate: float,
@@ -699,7 +948,13 @@ def compute_cmrr_sweep(
     min_output_rms_uv: float = 0.1,
     stability_tolerance_hz: float = 0.2,
     min_stable_run_windows: int = 2,
-    min_local_snr_db: float = 6.0,
+    min_local_snr_db: float = -20.0,
+    min_hold_s: float = 0.0,
+    exclude_mains: bool = False,
+    mains_tolerance_hz: float = 1.0,
+    downward_only: bool = True,
+    lock_tolerance_hz: float = 0.5,
+    lock_release_db: float = 6.0,
 ) -> CMRRSweepResult:
     """Estimate CMRR across frequency for a swept-tone selection.
 
@@ -707,6 +962,19 @@ def compute_cmrr_sweep(
     dominant positive-frequency tone is detected and its exact-frequency RMS is
     estimated with a sine fit. CMRR is then computed against the user-entered
     common-mode amplitude.
+
+    ``min_hold_s`` is how long the generator has to hold a frequency before that
+    step counts: at least two consecutive windows must agree on the tone, which
+    is what rejects the sliding transition between two steps.
+
+    ``downward_only`` follows the usual bench order (high frequency first, then
+    stepping down). With it enabled the fundamental can never move *up*, so the
+    intermodulation products of the tone with the mains - which sit at
+    ``100 +/- f`` and are louder than the tone itself at low frequency - are not
+    mistaken for the applied signal. ``lock_tolerance_hz`` is how far two windows
+    may differ and still count as the same step, and ``lock_release_db`` is how
+    far the previously committed tone has to fall before the tracker accepts that
+    the generator has moved on.
     """
 
     signal_values = np.asarray(values, dtype=np.float64)
@@ -717,10 +985,10 @@ def compute_cmrr_sweep(
 
     window_size = max(int(round(window_duration_s * sample_rate)), 16)
     if signal_values.size < window_size:
-        empty = pd.DataFrame(columns=["Frequency (Hz)", "CMRR Measured (dB)", "ADC Gain Corr (dB)", "CMRR (dB)", "CMRR Std (dB)", "Output RMS (uVrms)", "Windows"])
+        empty = pd.DataFrame(columns=CMRR_SWEEP_COLUMNS)
         return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
     if common_mode_voltage <= 0:
-        empty = pd.DataFrame(columns=["Frequency (Hz)", "CMRR Measured (dB)", "ADC Gain Corr (dB)", "CMRR (dB)", "CMRR Std (dB)", "Output RMS (uVrms)", "Windows"])
+        empty = pd.DataFrame(columns=CMRR_SWEEP_COLUMNS)
         return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
 
     # Sweep mode always uses notch cleanup to suppress fixed mains pickup.
@@ -732,6 +1000,12 @@ def compute_cmrr_sweep(
 
     zero_pad_length = max(int(fft_length), 8 * window_size)
     hop_size = max(int(window_size * hop_fraction), 1)
+    tracker = SweepFundamentalTracker(
+        window_boundary_hz=lock_tolerance_hz,
+        windows_needed=sweep_windows_needed(min_hold_s, hop_size / float(sample_rate), min_stable_run_windows),
+        release_drop_db=lock_release_db,
+        downward_only=downward_only,
+    )
     raw_rows: list[dict[str, float]] = []
     rejected_windows = 0
     for start_index in range(0, signal_values.size - window_size + 1, hop_size):
@@ -745,7 +1019,7 @@ def compute_cmrr_sweep(
             continue
         masked_frequencies = frequencies_hz[positive_mask]
         masked_amplitudes = amplitude_rms[positive_mask]
-        relative_index = detect_fundamental_index(masked_frequencies, masked_amplitudes)
+        relative_index = tracker.choose(masked_frequencies, masked_amplitudes)
         if relative_index is None:
             rejected_windows += 1
             continue
@@ -777,6 +1051,7 @@ def compute_cmrr_sweep(
             )[0]
         )
         cmrr_db = cmrr_measured_db + correction_gain_db
+        tracker.observe(frequency_hz, output_rms)
         center_time_s = (start_index + 0.5 * window_size) / float(sample_rate)
         raw_rows.append(
             {
@@ -792,58 +1067,25 @@ def compute_cmrr_sweep(
 
     raw_dataframe = pd.DataFrame(raw_rows)
     if raw_dataframe.empty:
-        empty = pd.DataFrame(columns=["Frequency (Hz)", "CMRR Measured (dB)", "ADC Gain Corr (dB)", "CMRR (dB)", "CMRR Std (dB)", "Output RMS (uVrms)", "Windows"])
+        empty = pd.DataFrame(columns=CMRR_SWEEP_COLUMNS)
         return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=rejected_windows)
 
-    stable_mask = np.zeros(len(raw_dataframe), dtype=bool)
-    run_start = 0
-    while run_start < len(raw_dataframe):
-        run_end = run_start + 1
-        run_frequencies = [float(raw_dataframe.iloc[run_start]["Frequency (Hz)"])]
-        while run_end < len(raw_dataframe):
-            candidate_frequency = float(raw_dataframe.iloc[run_end]["Frequency (Hz)"])
-            run_center = float(np.median(run_frequencies))
-            if abs(candidate_frequency - run_center) > stability_tolerance_hz:
-                break
-            run_frequencies.append(candidate_frequency)
-            run_end += 1
-        if run_end - run_start >= min_stable_run_windows:
-            stable_mask[run_start:run_end] = True
-        else:
-            rejected_windows += run_end - run_start
-        run_start = run_end
-
-    stable_dataframe = raw_dataframe.loc[stable_mask].copy()
-    if stable_dataframe.empty:
-        empty = pd.DataFrame(columns=["Frequency (Hz)", "CMRR Measured (dB)", "ADC Gain Corr (dB)", "CMRR (dB)", "CMRR Std (dB)", "Output RMS (uVrms)", "Windows"])
-        return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=rejected_windows)
-
-    frequency_bucket_hz = max(stability_tolerance_hz, 0.05)
-    stable_dataframe["Frequency Bucket"] = (stable_dataframe["Frequency (Hz)"] / frequency_bucket_hz).round() * frequency_bucket_hz
-    aggregated = (
-        stable_dataframe.groupby("Frequency Bucket", as_index=False)
-        .agg(
-            {
-                "Frequency (Hz)": "mean",
-                "CMRR Measured (dB)": "mean",
-                "ADC Gain Corr (dB)": "mean",
-                "CMRR (dB)": "mean",
-                "Output RMS (uVrms)": "mean",
-                "Time (s)": "count",
-            }
-        )
-        .rename(columns={"Time (s)": "Windows"})
+    aggregated, accepted, unstable = _aggregate_sweep_windows(
+        raw_dataframe,
+        columns=CMRR_SWEEP_COLUMNS,
+        mean_columns=("Frequency (Hz)", "CMRR Measured (dB)", "ADC Gain Corr (dB)", "CMRR (dB)", "Output RMS (uVrms)"),
+        value_column="CMRR (dB)",
+        std_column="CMRR Std (dB)",
+        stability_tolerance_hz=stability_tolerance_hz,
+        windows_needed=sweep_windows_needed(min_hold_s, hop_size / float(sample_rate), min_stable_run_windows),
+        exclude_mains=exclude_mains,
+        mains_tolerance_hz=mains_tolerance_hz,
+        bucket_hz=lock_tolerance_hz,
     )
-    cmrr_std = stable_dataframe.groupby("Frequency Bucket")["CMRR (dB)"].std(ddof=0).reset_index(name="CMRR Std (dB)")
-    aggregated = aggregated.merge(cmrr_std, on="Frequency Bucket", how="left")
-    aggregated["CMRR Std (dB)"] = aggregated["CMRR Std (dB)"].fillna(0.0)
-    aggregated = aggregated.drop(columns=["Frequency Bucket"])
-    aggregated = aggregated[["Frequency (Hz)", "CMRR Measured (dB)", "ADC Gain Corr (dB)", "CMRR (dB)", "CMRR Std (dB)", "Output RMS (uVrms)", "Windows"]]
-    aggregated = aggregated.sort_values("Frequency (Hz)").reset_index(drop=True)
     return CMRRSweepResult(
         dataframe=aggregated,
-        accepted_windows=int(len(stable_dataframe.index)),
-        rejected_windows=int(rejected_windows),
+        accepted_windows=accepted,
+        rejected_windows=int(rejected_windows + unstable),
     )
 
 
@@ -859,7 +1101,13 @@ def compute_crosstalk_sweep(
     min_source_rms_uv: float = 0.1,
     stability_tolerance_hz: float = 0.2,
     min_stable_run_windows: int = 2,
-    min_local_snr_db: float = 6.0,
+    min_local_snr_db: float = -20.0,
+    min_hold_s: float = 0.0,
+    exclude_mains: bool = False,
+    mains_tolerance_hz: float = 1.0,
+    downward_only: bool = True,
+    lock_tolerance_hz: float = 0.5,
+    lock_release_db: float = 6.0,
 ) -> CrosstalkSweepResult:
     """Estimate crosstalk across frequency for a swept-tone selection.
 
@@ -900,6 +1148,12 @@ def compute_crosstalk_sweep(
 
     zero_pad_length = max(int(fft_length), 8 * window_size)
     hop_size = max(int(window_size * hop_fraction), 1)
+    tracker = SweepFundamentalTracker(
+        window_boundary_hz=lock_tolerance_hz,
+        windows_needed=sweep_windows_needed(min_hold_s, hop_size / float(sample_rate), min_stable_run_windows),
+        release_drop_db=lock_release_db,
+        downward_only=downward_only,
+    )
     raw_rows: list[dict[str, float]] = []
     rejected_windows = 0
     for start_index in range(0, source_signal.size - window_size + 1, hop_size):
@@ -914,7 +1168,7 @@ def compute_crosstalk_sweep(
             continue
         masked_frequencies = frequencies_hz[positive_mask]
         masked_amplitudes = amplitude_rms[positive_mask]
-        relative_index = detect_fundamental_index(masked_frequencies, masked_amplitudes)
+        relative_index = tracker.choose(masked_frequencies, masked_amplitudes)
         if relative_index is None:
             rejected_windows += 1
             continue
@@ -938,6 +1192,7 @@ def compute_crosstalk_sweep(
             rejected_windows += 1
             continue
 
+        tracker.observe(frequency_hz, source_rms)
         target_centered = target_segment - np.mean(target_segment)
         target_rms = _fit_sine_component_rms(target_centered, sample_rate, frequency_hz)
         crosstalk_db = 20.0 * np.log10(target_rms / source_rms) if target_rms > 0 else float("-inf")
@@ -958,54 +1213,22 @@ def compute_crosstalk_sweep(
         empty = pd.DataFrame(columns=columns)
         return CrosstalkSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=rejected_windows)
 
-    stable_mask = np.zeros(len(raw_dataframe), dtype=bool)
-    run_start = 0
-    while run_start < len(raw_dataframe):
-        run_end = run_start + 1
-        run_frequencies = [float(raw_dataframe.iloc[run_start]["Frequency (Hz)"])]
-        while run_end < len(raw_dataframe):
-            candidate_frequency = float(raw_dataframe.iloc[run_end]["Frequency (Hz)"])
-            run_center = float(np.median(run_frequencies))
-            if abs(candidate_frequency - run_center) > stability_tolerance_hz:
-                break
-            run_frequencies.append(candidate_frequency)
-            run_end += 1
-        if run_end - run_start >= min_stable_run_windows:
-            stable_mask[run_start:run_end] = True
-        else:
-            rejected_windows += run_end - run_start
-        run_start = run_end
-
-    stable_dataframe = raw_dataframe.loc[stable_mask].copy()
-    if stable_dataframe.empty:
-        empty = pd.DataFrame(columns=columns)
-        return CrosstalkSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=rejected_windows)
-
-    frequency_bucket_hz = max(stability_tolerance_hz, 0.05)
-    stable_dataframe["Frequency Bucket"] = (stable_dataframe["Frequency (Hz)"] / frequency_bucket_hz).round() * frequency_bucket_hz
-    aggregated = (
-        stable_dataframe.groupby("Frequency Bucket", as_index=False)
-        .agg(
-            {
-                "Frequency (Hz)": "mean",
-                "Crosstalk (dB)": "mean",
-                "Source RMS (uVrms)": "mean",
-                "Target RMS (uVrms)": "mean",
-                "Time (s)": "count",
-            }
-        )
-        .rename(columns={"Time (s)": "Windows"})
+    aggregated, accepted, unstable = _aggregate_sweep_windows(
+        raw_dataframe,
+        columns=columns,
+        mean_columns=("Frequency (Hz)", "Crosstalk (dB)", "Source RMS (uVrms)", "Target RMS (uVrms)"),
+        value_column="Crosstalk (dB)",
+        std_column="Crosstalk Std (dB)",
+        stability_tolerance_hz=stability_tolerance_hz,
+        windows_needed=sweep_windows_needed(min_hold_s, hop_size / float(sample_rate), min_stable_run_windows),
+        exclude_mains=exclude_mains,
+        mains_tolerance_hz=mains_tolerance_hz,
+        bucket_hz=lock_tolerance_hz,
     )
-    crosstalk_std = stable_dataframe.groupby("Frequency Bucket")["Crosstalk (dB)"].std(ddof=0).reset_index(name="Crosstalk Std (dB)")
-    aggregated = aggregated.merge(crosstalk_std, on="Frequency Bucket", how="left")
-    aggregated["Crosstalk Std (dB)"] = aggregated["Crosstalk Std (dB)"].fillna(0.0)
-    aggregated = aggregated.drop(columns=["Frequency Bucket"])
-    aggregated = aggregated[columns]
-    aggregated = aggregated.sort_values("Frequency (Hz)").reset_index(drop=True)
     return CrosstalkSweepResult(
         dataframe=aggregated,
-        accepted_windows=int(len(stable_dataframe.index)),
-        rejected_windows=int(rejected_windows),
+        accepted_windows=accepted,
+        rejected_windows=int(rejected_windows + unstable),
     )
 
 
@@ -1023,7 +1246,13 @@ def compute_gain_sweep(
     min_output_rms_uv: float = 0.1,
     stability_tolerance_hz: float = 0.2,
     min_stable_run_windows: int = 2,
-    min_local_snr_db: float = 6.0,
+    min_local_snr_db: float = -20.0,
+    min_hold_s: float = 0.0,
+    exclude_mains: bool = False,
+    mains_tolerance_hz: float = 1.0,
+    downward_only: bool = True,
+    lock_tolerance_hz: float = 0.5,
+    lock_release_db: float = 6.0,
 ) -> GainSweepResult:
     """Estimate channel gain across frequency for a swept-tone selection.
 
@@ -1040,8 +1269,8 @@ def compute_gain_sweep(
         "Gain (V/V)",
         "Gain (dB)",
         "Gain Std (dB)",
-        "Input Before Attenuator (V)",
-        "Input After Attenuator (uVrms)",
+        "Applied (Vrms)",
+        "At Amplifier Input (uVrms)",
         "Output RMS (uVrms)",
         "Windows",
     ]
@@ -1064,6 +1293,12 @@ def compute_gain_sweep(
         stability_tolerance_hz=stability_tolerance_hz,
         min_stable_run_windows=min_stable_run_windows,
         min_local_snr_db=min_local_snr_db,
+        min_hold_s=min_hold_s,
+        exclude_mains=exclude_mains,
+        mains_tolerance_hz=mains_tolerance_hz,
+        downward_only=downward_only,
+        lock_tolerance_hz=lock_tolerance_hz,
+        lock_release_db=lock_release_db,
     )
     if cmrr_like.dataframe.empty:
         empty = pd.DataFrame(columns=columns)
@@ -1079,8 +1314,8 @@ def compute_gain_sweep(
             "Gain (V/V)": (cmrr_like.dataframe["Output RMS (uVrms)"] * signal_scale_to_volts) / input_after_attenuator_v,
             "Gain (dB)": -cmrr_like.dataframe["CMRR (dB)"],
             "Gain Std (dB)": cmrr_like.dataframe["CMRR Std (dB)"],
-            "Input Before Attenuator (V)": float(input_before_attenuator_v),
-            "Input After Attenuator (uVrms)": input_after_attenuator_v / signal_scale_to_volts,
+            "Applied (Vrms)": float(input_before_attenuator_v),
+            "At Amplifier Input (uVrms)": input_after_attenuator_v / signal_scale_to_volts,
             "Output RMS (uVrms)": cmrr_like.dataframe["Output RMS (uVrms)"],
             "Windows": cmrr_like.dataframe["Windows"],
         }
@@ -1091,3 +1326,545 @@ def compute_gain_sweep(
         accepted_windows=cmrr_like.accepted_windows,
         rejected_windows=cmrr_like.rejected_windows,
     )
+# ---------------------------------------------------------------------------
+# Planned (generator-synchronised) sweeps
+#
+# When the live window drives the function generator itself it knows the exact
+# frequency *and* the exact time each step was applied, so nothing has to be
+# guessed from the spectrum. That removes the whole problem the peak tracker had
+# below ~70 Hz, where the intermodulation products of the tone with the mains are
+# louder than the tone itself: the analyser simply looks at the frequency the
+# generator was told to produce, inside the time window that step occupied.
+# ---------------------------------------------------------------------------
+
+PLANNED_SWEEP_COLUMNS = [
+    "Frequency (Hz)",
+    "Output RMS (uVrms)",
+    "Windows",
+    "Applied Vpp",
+]
+
+_SWEEP_STEP_PATTERN = re.compile(r"^Sweep Step (\d+)$")
+
+
+@dataclass(slots=True)
+class PlannedSweepStep:
+    """One generator step as written into the recording header."""
+
+    frequency_hz: float
+    # Applied sine amplitude in Vrms (recordings older than the RMS change carry
+    # Vpp here; parse_sweep_steps converts those using the metadata key).
+    amplitude_vrms: float
+    start_s: float
+    settle_s: float
+    end_s: float
+
+    @property
+    def usable_start_s(self) -> float:
+        return max(self.settle_s, self.start_s)
+
+
+def parse_sweep_steps(metadata: Mapping[str, str]) -> list[PlannedSweepStep]:
+    """Recover the sweep schedule that the live window wrote into the header.
+
+    The format is ``frequency|amplitude|start|settle|end`` in Hz, Vrms and
+    seconds. Older recordings stored Vpp under ``Sweep Amplitude (Vpp)``; in that
+    case the per-step amplitude is converted so it keeps the same meaning.
+    """
+
+    legacy_vpp = str((metadata or {}).get("Sweep Amplitude (Vpp)", "") or "").strip()
+    convert = bool(legacy_vpp) and not str((metadata or {}).get("Sweep Amplitude (Vrms)", "") or "").strip()
+    steps: list[tuple[int, PlannedSweepStep]] = []
+    for key, value in (metadata or {}).items():
+        match = _SWEEP_STEP_PATTERN.match(str(key).strip())
+        if not match:
+            continue
+        fields = str(value).split("|")
+        if len(fields) < 5:
+            continue
+        try:
+            amplitude = float(fields[1])
+            if convert:
+                amplitude /= 2.0 * np.sqrt(2.0)
+            step = PlannedSweepStep(
+                frequency_hz=float(fields[0]),
+                amplitude_vrms=amplitude,
+                start_s=float(fields[2]),
+                settle_s=float(fields[3]),
+                end_s=float(fields[4]),
+            )
+        except ValueError:
+            continue
+        if step.frequency_hz > 0 and step.end_s > step.usable_start_s:
+            steps.append((int(match.group(1)), step))
+    steps.sort(key=lambda item: item[0])
+    return [step for _index, step in steps]
+
+
+def _segment_indices(step: PlannedSweepStep, sample_rate: float, total: int) -> tuple[int, int]:
+    start = int(round(step.usable_start_s * sample_rate))
+    end = int(round(step.end_s * sample_rate))
+    return max(start, 0), min(end, total)
+
+
+def compute_planned_cmrr_sweep(
+    values: np.ndarray,
+    sample_rate: float,
+    steps: Sequence[PlannedSweepStep],
+    *,
+    common_mode_v_rms: float,
+    signal_scale_to_volts: float = 1e-6,
+    correction_enabled: bool = False,
+    correction_fs_hz: float = 250.0,
+    guard_fraction: float = 0.15,
+    max_windows_per_step: int = 8,
+    min_output_rms_uv: float = 0.02,
+) -> CMRRSweepResult:
+    """CMRR per generator step, using the frequency the generator was set to.
+
+    Each step is cut into as many whole windows as fit between the settled start
+    and the end of the hold, so even a 1 s hold at 5 Hz produces a usable point
+    without any peak picking.
+    """
+
+    signal_values = np.asarray(values, dtype=np.float64)
+    empty = pd.DataFrame(columns=CMRR_SWEEP_COLUMNS)
+    if signal_values.size == 0 or common_mode_v_rms <= 0 or sample_rate <= 0:
+        return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
+
+    filtered = apply_filters(
+        signal_values[:, np.newaxis],
+        sample_rate,
+        FilterSettings(notch_50_hz=True, notch_100_hz=True, quality_factor=30.0),
+    )[:, 0]
+
+    rows: list[dict[str, float]] = []
+    accepted = 0
+    rejected = 0
+    for step in steps:
+        start_index, end_index = _segment_indices(step, sample_rate, signal_values.size)
+        span = end_index - start_index
+        if span < max(int(0.05 * sample_rate), 16):
+            rejected += 1
+            continue
+        guard = int(round(span * max(min(guard_fraction, 0.45), 0.0)))
+        usable = span - guard
+        # At least two cycles per window, so the sine fit is not dominated by the
+        # trend; a 5 Hz step held for one second still gets a usable window.
+        min_window = max(int(round(max(0.15, 2.0 / max(step.frequency_hz, 1e-6)) * sample_rate)), 16)
+        windows = int(min(max_windows_per_step, max(1, usable // min_window)))
+        window_size = max(usable // windows, 16)
+        step_rms: list[float] = []
+        for index in range(windows):
+            window_start = start_index + guard + index * window_size
+            window_end = window_start + window_size
+            if window_end > end_index:
+                break
+            segment = filtered[window_start:window_end]
+            centered = segment - np.mean(segment)
+            rms_uv = _fit_sine_component_rms(centered, sample_rate, step.frequency_hz)
+            if rms_uv <= 0:
+                continue
+            step_rms.append(float(rms_uv))
+        if not step_rms:
+            rejected += 1
+            continue
+        mean_rms_uv = float(np.mean(step_rms))
+        std_rms_uv = float(np.std(step_rms, ddof=0))
+        if mean_rms_uv < min_output_rms_uv:
+            # The tone is below the analyser floor; reporting a CMRR here would be
+            # reporting the noise of the front end.
+            rejected += 1
+            continue
+        output_volts = mean_rms_uv * signal_scale_to_volts
+        cmrr_measured_db = 20.0 * np.log10(common_mode_v_rms / output_volts) if output_volts > 0 else float("inf")
+        correction_gain_db = float(
+            compute_cmrr_correction_gain_db(
+                [step.frequency_hz],
+                correction_enabled=correction_enabled,
+                correction_fs_hz=correction_fs_hz,
+            )[0]
+        )
+        std_db = (
+            20.0 * np.log10(mean_rms_uv / (mean_rms_uv - std_rms_uv))
+            if mean_rms_uv > std_rms_uv > 0
+            else 0.0
+        )
+        accepted += 1
+        rows.append(
+            {
+                "Frequency (Hz)": float(step.frequency_hz),
+                "Output RMS (uVrms)": mean_rms_uv,
+                "CMRR Measured (dB)": cmrr_measured_db,
+                "ADC Gain Corr (dB)": correction_gain_db,
+                "CMRR (dB)": cmrr_measured_db + correction_gain_db,
+                "CMRR Std (dB)": float(std_db),
+                "Windows": float(len(step_rms)),
+            }
+        )
+
+    if not rows:
+        return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=rejected)
+
+    frame = pd.DataFrame(rows)
+    frame = frame[CMRR_SWEEP_COLUMNS].sort_values("Frequency (Hz)").reset_index(drop=True)
+    return CMRRSweepResult(dataframe=frame, accepted_windows=accepted, rejected_windows=rejected)
+
+
+def fit_tone_rms(values: np.ndarray, sample_rate: float, frequency_hz: float) -> float:
+    """Public wrapper: least-squares sine amplitude at an exact frequency.
+
+    Used to read the reference channel's real amplitude at the frequency the
+    generator was set to, which is what a "measured versus applied" figure needs.
+    """
+
+    return _fit_sine_component_rms(np.asarray(values, dtype=np.float64), sample_rate, frequency_hz)
+
+
+def detect_tone_frequency(
+    values: np.ndarray,
+    sample_rate: float,
+    *,
+    fft_length: int = 4096,
+    window_name: str = "Hann",
+    min_frequency_hz: float = 1.0,
+    mains_guard_hz: float = 2.0,
+) -> Optional[float]:
+    """Dominant tone of one segment, used to read the stimulus off a monitor channel.
+
+    A channel wired straight across the common-mode voltage sees the applied sine
+    at close to a volt, so its dominant peak *is* the generator frequency and the
+    intermodulation products that confuse the differential channels are irrelevant.
+    """
+
+    signal_values = np.asarray(values, dtype=np.float64)
+    if signal_values.size < 16 or sample_rate <= 0:
+        return None
+    centered = signal_values - np.mean(signal_values)
+    prepared = _prepare_fft_segment(centered, max(int(fft_length), 4096))
+    frequencies_hz, amplitude_rms = _compute_rms_spectrum_from_segment(prepared, sample_rate, window_name)
+    mask = frequencies_hz >= min_frequency_hz
+    if not np.any(mask):
+        return None
+    masked_frequencies = frequencies_hz[mask]
+    masked_amplitudes = amplitude_rms[mask]
+    if masked_amplitudes.size == 0 or float(np.max(masked_amplitudes)) <= 0:
+        return None
+    best = int(np.argmax(masked_amplitudes))
+    if mains_guard_hz > 0 and any(
+        abs(float(masked_frequencies[best]) - mains) <= mains_guard_hz for mains in MAINS_EXCLUDE_HZ
+    ):
+        # A peak sitting exactly on a mains harmonic is pickup, not the stimulus.
+        order = np.argsort(masked_amplitudes)[::-1]
+        for candidate in order:
+            frequency = float(masked_frequencies[int(candidate)])
+            if all(abs(frequency - mains) > mains_guard_hz for mains in MAINS_EXCLUDE_HZ):
+                best = int(candidate)
+                break
+    original_indices = np.flatnonzero(mask)
+    refined = _refine_peak_frequency(frequencies_hz, amplitude_rms, int(original_indices[best]))
+    return refined if refined > 0 else None
+
+def compute_reference_cmrr_sweep(
+    values: np.ndarray,
+    reference_values: np.ndarray,
+    sample_rate: float,
+    *,
+    common_mode_v_rms: float,
+    window_duration_s: float = 0.75,
+    hop_fraction: float = 0.5,
+    fft_length: int = 4096,
+    window_name: str = "Hann",
+    signal_scale_to_volts: float = 1e-6,
+    correction_enabled: bool = False,
+    correction_fs_hz: float = 250.0,
+    stability_tolerance_hz: float = 0.5,
+    min_stable_run_windows: int = 1,
+    min_output_rms_uv: float = 0.02,
+) -> CMRRSweepResult:
+    """CMRR where the applied frequency is read off a monitor channel.
+
+    The monitor input is wired straight across the common-mode voltage, so it sees
+    the generator at close to a volt. Its dominant peak is therefore the applied
+    frequency, and the differential channels are only ever evaluated at exactly
+    that frequency. This is what makes the low-frequency end of a downward sweep
+    usable: there is no peak to pick on the channel under test, so the
+    intermodulation products that beat the real tone at 60 Hz and below can never
+    be mistaken for it.
+    """
+
+    signal_values = np.asarray(values, dtype=np.float64)
+    monitor_values = np.asarray(reference_values, dtype=np.float64)
+    empty = pd.DataFrame(columns=CMRR_SWEEP_COLUMNS)
+    count = min(signal_values.size, monitor_values.size)
+    if count == 0 or common_mode_v_rms <= 0 or sample_rate <= 0:
+        return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
+    if window_duration_s <= 0:
+        window_duration_s = 0.75
+
+    window_size = max(int(round(window_duration_s * sample_rate)), 16)
+    if count < window_size:
+        return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
+
+    filtered = apply_filters(
+        signal_values[:count, np.newaxis],
+        sample_rate,
+        FilterSettings(notch_50_hz=True, notch_100_hz=True, quality_factor=30.0),
+    )[:, 0]
+    hop_size = max(int(window_size * hop_fraction), 1)
+    raw_rows: list[dict[str, float]] = []
+    rejected = 0
+    for start_index in range(0, count - window_size + 1, hop_size):
+        monitor_segment = monitor_values[start_index : start_index + window_size]
+        frequency_hz = detect_tone_frequency(
+            monitor_segment,
+            sample_rate,
+            fft_length=max(int(fft_length), 8 * window_size),
+            window_name=window_name,
+        )
+        if frequency_hz is None:
+            rejected += 1
+            continue
+        segment = filtered[start_index : start_index + window_size]
+        centered = segment - np.mean(segment)
+        output_rms = _fit_sine_component_rms(centered, sample_rate, frequency_hz)
+        if output_rms <= min_output_rms_uv:
+            rejected += 1
+            continue
+        output_volts = output_rms * signal_scale_to_volts
+        cmrr_measured_db = 20.0 * np.log10(common_mode_v_rms / output_volts) if output_volts > 0 else float("inf")
+        correction_gain_db = float(
+            compute_cmrr_correction_gain_db(
+                [frequency_hz],
+                correction_enabled=correction_enabled,
+                correction_fs_hz=correction_fs_hz,
+            )[0]
+        )
+        raw_rows.append(
+            {
+                "Time (s)": (start_index + 0.5 * window_size) / float(sample_rate),
+                "Frequency (Hz)": float(frequency_hz),
+                "Output RMS (uVrms)": float(output_rms),
+                "CMRR Measured (dB)": cmrr_measured_db,
+                "ADC Gain Corr (dB)": correction_gain_db,
+                "CMRR (dB)": cmrr_measured_db + correction_gain_db,
+            }
+        )
+
+    frame = pd.DataFrame(raw_rows)
+    if frame.empty:
+        return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=rejected)
+    aggregated, accepted, unstable = _aggregate_sweep_windows(
+        frame,
+        columns=CMRR_SWEEP_COLUMNS,
+        mean_columns=["Frequency (Hz)", "Output RMS (uVrms)", "CMRR Measured (dB)", "ADC Gain Corr (dB)", "CMRR (dB)"],
+        value_column="CMRR (dB)",
+        std_column="CMRR Std (dB)",
+        stability_tolerance_hz=stability_tolerance_hz,
+        windows_needed=max(int(min_stable_run_windows), 1),
+        exclude_mains=False,
+    )
+    return CMRRSweepResult(
+        dataframe=aggregated,
+        accepted_windows=accepted,
+        rejected_windows=rejected + unstable,
+    )
+
+CROSSTALK_SWEEP_COLUMNS = [
+    "Frequency (Hz)",
+    "Crosstalk (dB)",
+    "Crosstalk Std (dB)",
+    "Source RMS (uVrms)",
+    "Target RMS (uVrms)",
+    "Windows",
+]
+
+GAIN_SWEEP_COLUMNS = [
+    "Frequency (Hz)",
+    "Gain (V/V)",
+    "Gain (dB)",
+    "Gain Std (dB)",
+    "Applied (Vrms)",
+    "At Amplifier Input (uVrms)",
+    "Output RMS (uVrms)",
+    "Windows",
+]
+
+
+def _step_amplitudes(
+    values: np.ndarray,
+    sample_rate: float,
+    steps: Sequence[PlannedSweepStep],
+    *,
+    guard_fraction: float = 0.15,
+    max_windows_per_step: int = 8,
+) -> dict[float, float]:
+    """Sine-fit RMS at each step frequency, averaged over the windows that fit."""
+
+    results: dict[float, float] = {}
+    for step in steps:
+        start_index, end_index = _segment_indices(step, sample_rate, values.size)
+        span = end_index - start_index
+        if span < max(int(0.05 * sample_rate), 16):
+            continue
+        guard = int(round(span * max(min(guard_fraction, 0.45), 0.0)))
+        usable = span - guard
+        min_window = max(int(round(max(0.15, 2.0 / max(step.frequency_hz, 1e-6)) * sample_rate)), 16)
+        windows = int(min(max_windows_per_step, max(1, usable // min_window)))
+        window_size = max(usable // windows, 16)
+        measured: list[float] = []
+        for index in range(windows):
+            window_start = start_index + guard + index * window_size
+            window_end = window_start + window_size
+            if window_end > end_index:
+                break
+            segment = values[window_start:window_end]
+            rms_uv = _fit_sine_component_rms(segment - np.mean(segment), sample_rate, step.frequency_hz)
+            if rms_uv > 0:
+                measured.append(float(rms_uv))
+        if measured:
+            results[step.frequency_hz] = float(np.mean(measured))
+    return results
+
+
+def compute_planned_crosstalk_sweep(
+    source_values: np.ndarray,
+    target_values: np.ndarray,
+    sample_rate: float,
+    steps: Sequence[PlannedSweepStep],
+    *,
+    min_source_rms_uv: float = 0.05,
+) -> CrosstalkSweepResult:
+    """Crosstalk per generator step, from the schedule the live window recorded."""
+
+    source_signal = np.asarray(source_values, dtype=np.float64)
+    target_signal = np.asarray(target_values, dtype=np.float64)
+    count = min(source_signal.size, target_signal.size)
+    empty = pd.DataFrame(columns=CROSSTALK_SWEEP_COLUMNS)
+    if count == 0 or sample_rate <= 0 or not steps:
+        return CrosstalkSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
+
+    filtered = apply_filters(
+        np.column_stack((source_signal[:count], target_signal[:count])),
+        sample_rate,
+        FilterSettings(notch_50_hz=True, notch_100_hz=True, quality_factor=30.0),
+    )
+    source_map = _step_amplitudes(filtered[:, 0], sample_rate, steps)
+    target_map = _step_amplitudes(filtered[:, 1], sample_rate, steps)
+
+    rows: list[dict[str, float]] = []
+    rejected = 0
+    for step in steps:
+        source_rms = source_map.get(step.frequency_hz)
+        target_rms = target_map.get(step.frequency_hz)
+        if source_rms is None or target_rms is None or source_rms < min_source_rms_uv:
+            rejected += 1
+            continue
+        ratio = target_rms / source_rms
+        rows.append(
+            {
+                "Frequency (Hz)": float(step.frequency_hz),
+                "Crosstalk (dB)": float(20.0 * np.log10(ratio)) if ratio > 0 else float("-inf"),
+                "Crosstalk Std (dB)": 0.0,
+                "Source RMS (uVrms)": source_rms,
+                "Target RMS (uVrms)": target_rms,
+                "Windows": 1.0,
+            }
+        )
+
+    if not rows:
+        return CrosstalkSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=rejected)
+    frame = pd.DataFrame(rows)[CROSSTALK_SWEEP_COLUMNS].sort_values("Frequency (Hz)").reset_index(drop=True)
+    return CrosstalkSweepResult(dataframe=frame, accepted_windows=len(rows), rejected_windows=rejected)
+
+def compute_planned_gain_sweep(
+    values: np.ndarray,
+    sample_rate: float,
+    steps: Sequence[PlannedSweepStep],
+    *,
+    applied_vrms: float,
+    signal_scale_to_volts: float = 1e-6,
+    attenuator_ratio: float = 1.0,
+    guard_fraction: float = 0.15,
+    max_windows_per_step: int = 8,
+    min_output_rms_uv: float = 0.02,
+    notch: bool = False,
+) -> GainSweepResult:
+    """Gain per generator step, from the schedule the live window recorded.
+
+    ``attenuator_ratio`` is the divider between the generator and the amplifier
+    input, so the reference amplitude is what actually reached the electrode.
+    ``notch`` is off by default: a gain step is a ratio of two known amplitudes,
+    and notching 50/100 Hz would shave the tone itself whenever the generator sits
+    near those frequencies.
+    """
+
+    signal_values = np.asarray(values, dtype=np.float64)
+    empty = pd.DataFrame(columns=GAIN_SWEEP_COLUMNS)
+    if signal_values.size == 0 or sample_rate <= 0 or not steps:
+        return GainSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
+
+    input_after_attenuator_v = max(float(applied_vrms), 0.0) * float(attenuator_ratio)
+    if applied_vrms <= 0 or input_after_attenuator_v <= 0:
+        return GainSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
+
+    if notch:
+        filtered = apply_filters(
+            signal_values[:, np.newaxis],
+            sample_rate,
+            FilterSettings(notch_50_hz=True, notch_100_hz=True, quality_factor=30.0),
+        )[:, 0]
+    else:
+        filtered = signal_values - np.mean(signal_values)
+
+    rows: list[dict[str, float]] = []
+    accepted = 0
+    rejected = 0
+    for step in steps:
+        start_index, end_index = _segment_indices(step, sample_rate, signal_values.size)
+        span = end_index - start_index
+        if span < max(int(0.05 * sample_rate), 16):
+            rejected += 1
+            continue
+        guard = int(round(span * max(min(guard_fraction, 0.45), 0.0)))
+        usable = span - guard
+        min_window = max(int(round(max(0.15, 2.0 / max(step.frequency_hz, 1e-6)) * sample_rate)), 16)
+        windows = int(min(max_windows_per_step, max(1, usable // min_window)))
+        window_size = max(usable // windows, 16)
+        measured: list[float] = []
+        for index in range(windows):
+            window_start = start_index + guard + index * window_size
+            window_end = window_start + window_size
+            if window_end > end_index:
+                break
+            segment = filtered[window_start:window_end]
+            rms_uv = _fit_sine_component_rms(segment - np.mean(segment), sample_rate, step.frequency_hz)
+            if rms_uv > 0:
+                measured.append(float(rms_uv))
+        if not measured:
+            rejected += 1
+            continue
+        mean_uv = float(np.mean(measured))
+        if mean_uv < min_output_rms_uv:
+            rejected += 1
+            continue
+        measured_v = mean_uv * signal_scale_to_volts
+        gain = measured_v / input_after_attenuator_v
+        accepted += 1
+        rows.append(
+            {
+                "Frequency (Hz)": float(step.frequency_hz),
+                "Gain (V/V)": gain,
+                "Gain (dB)": float(20.0 * np.log10(gain)) if gain > 0 else float("-inf"),
+                "Gain Std (dB)": 0.0,
+                "Applied (Vrms)": float(applied_vrms),
+                "At Amplifier Input (uVrms)": input_after_attenuator_v / signal_scale_to_volts,
+                "Output RMS (uVrms)": mean_uv,
+                "Windows": float(len(measured)),
+            }
+        )
+
+    if not rows:
+        return GainSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=rejected)
+    frame = pd.DataFrame(rows)[GAIN_SWEEP_COLUMNS].sort_values("Frequency (Hz)").reset_index(drop=True)
+    return GainSweepResult(dataframe=frame, accepted_windows=accepted, rejected_windows=rejected)

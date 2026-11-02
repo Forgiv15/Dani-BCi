@@ -83,23 +83,33 @@ COAX_SUBTYPES = (
 COAX_SUBTYPE_CODES = {value: value for _, value in COAX_SUBTYPES}
 COAX_SUBTYPE_LABELS = {value: label for label, value in COAX_SUBTYPES}
 
-REFERENCE_MODE_CHOICES = (
-    ("True differential", "diff"),
-    ("SRB1", "srb1"),
-    ("SRB2", "srb2"),
-)
+from live_protocol import REFERENCE_MODE_CHOICES as LIVE_REFERENCE_MODE_CHOICES
+from live_protocol import REFERENCE_MODE_SHORT as LIVE_REFERENCE_MODE_SHORT
+from live_protocol import REFERENCE_MODE_SHORT_LABELS as LIVE_REFERENCE_MODE_SHORT_LABELS
+
+# One source of truth for the reference wording. The polarity of these two pins is
+# the thing operators get wrong most often, so the report must never describe SRB2
+# as a negative reference.
+REFERENCE_MODE_CHOICES = LIVE_REFERENCE_MODE_CHOICES
 REFERENCE_MODE_CODES = {value: value for _, value in REFERENCE_MODE_CHOICES}
 REFERENCE_LABELS = {value: label for label, value in REFERENCE_MODE_CHOICES}
 # Compact labels for combo boxes, so a long description cannot widen a narrow
-# side panel. The full text stays available as a tooltip and in reports.
-REFERENCE_MODE_SHORT = (
-    ("True differential", "diff"),
-    ("SRB1", "srb1"),
-    ("SRB2", "srb2"),
-)
+# side panel. The full text stays available as a tooltip and in reports. Defined
+# in live_protocol so the protocol layer, the dock and the reports share one list.
+REFERENCE_MODE_SHORT = LIVE_REFERENCE_MODE_SHORT
+REFERENCE_MODE_SHORT_LABELS = LIVE_REFERENCE_MODE_SHORT_LABELS
 
 # Kinds that are driven by an external stimulus voltage.
 STIMULUS_KINDS = ("cmrr", "crosstalk", "gain")
+
+# Kinds where the bias network loading the input changes the result, so the
+# recording name records whether bias was on.
+BIAS_KINDS = ("cmrr", "crosstalk", "gain")
+
+BIAS_CHOICES = (
+    ("Bias off", False),
+    ("Bias on", True),
+)
 
 
 def _slug(text: str) -> str:
@@ -116,6 +126,7 @@ class MeasurementInfo:
     stimulus_v: float = 0.0
     stimulus_note: str = ""
     reference_mode: str = "srb2"
+    bias_enabled: bool = False
     note: str = ""
     operator_note: str = ""
 
@@ -134,6 +145,7 @@ class MeasurementInfo:
             stimulus_v=stimulus,
             stimulus_note=self.stimulus_note,
             reference_mode=reference,
+            bias_enabled=bool(self.bias_enabled) if kind in BIAS_KINDS else False,
             note=self.note,
             operator_note=self.operator_note,
         )
@@ -159,6 +171,13 @@ class MeasurementInfo:
         return REFERENCE_LABELS.get(self.normalised().reference_mode, "SRB2")
 
     @property
+    def bias_label(self) -> str:
+        info = self.normalised()
+        if info.kind not in BIAS_KINDS:
+            return "-"
+        return "On" if info.bias_enabled else "Off"
+
+    @property
     def stimulus_label(self) -> str:
         info = self.normalised()
         if info.kind not in STIMULUS_KINDS:
@@ -177,6 +196,8 @@ class MeasurementInfo:
         if info.kind in STIMULUS_KINDS:
             parts.append(_slug(format_voltage(info.stimulus_v).replace(" ", "")))
         parts.append(f"ref-{info.reference_mode}")
+        if info.kind in BIAS_KINDS:
+            parts.append("bias-on" if info.bias_enabled else "bias-off")
         return "_".join(_slug(part) for part in parts if part)
 
     def describe_lines(self) -> list[str]:
@@ -189,7 +210,7 @@ class MeasurementInfo:
             f"Reference mode: {info.reference_label}",
         ]
         if info.kind in STIMULUS_KINDS:
-            lines.append(f"Applied stimulus: {format_voltage(info.stimulus_v)}")
+            lines.append(f"Applied stimulus: {format_voltage(info.stimulus_v)}   Bias: {info.bias_label}")
         if info.stimulus_note:
             lines.append(f"Stimulus detail: {info.stimulus_note}")
         if info.note:
@@ -215,7 +236,8 @@ class MeasurementInfo:
             payload["Connection Type"] = info.connection
         if info.kind in STIMULUS_KINDS:
             payload["Applied Stimulus"] = format_voltage(info.stimulus_v)
-            payload["Applied Stimulus (V)"] = f"{info.stimulus_v:.9g}"
+            payload["Applied Stimulus (Vrms)"] = f"{info.stimulus_v:.9g}"
+            payload["Bias"] = info.bias_label
         if info.stimulus_note:
             payload["Stimulus Source"] = info.stimulus_note
         if info.note:
@@ -231,6 +253,7 @@ class MeasurementInfo:
             "stimulus_v": info.stimulus_v,
             "stimulus_note": info.stimulus_note,
             "reference_mode": info.reference_mode,
+            "bias_enabled": info.bias_enabled,
             "note": info.note,
             "operator_note": info.operator_note,
         }
@@ -256,6 +279,7 @@ class MeasurementInfo:
             stimulus_v=stimulus,
             stimulus_note=text("stimulus_note"),
             reference_mode=text("reference_mode"),
+            bias_enabled=bool(payload.get("bias_enabled", False)),
             note=text("note"),
             operator_note=text("operator_note"),
         ).normalised()
@@ -291,7 +315,7 @@ class MeasurementInfo:
             if label_text.lower() == reference or code == reference:
                 info.reference_mode = code
                 break
-        for key in ("Applied Stimulus (V)", "Applied Stimulus"):
+        for key in ("Applied Stimulus (Vrms)", "Applied Stimulus (V)", "Applied Stimulus"):
             value = (metadata.get(key) or "").strip()
             if value:
                 parsed = parse_voltage(value)
@@ -299,6 +323,9 @@ class MeasurementInfo:
                     info.stimulus_v = parsed
                     break
         info.stimulus_note = (metadata.get("Stimulus Source") or "").strip()
+        bias_raw = (metadata.get("Bias") or "").strip().lower()
+        if bias_raw in ("on", "1", "true", "yes"):
+            info.bias_enabled = True
         info.note = (metadata.get("Measurement Note") or "").strip()
         return info.normalised()
 
@@ -322,19 +349,19 @@ def parse_voltage(text: str) -> Optional[float]:
 
 
 def format_voltage(volts: float) -> str:
-    """Pick a readable unit for a stimulus voltage."""
+    """Readable RMS voltage. Every voltage in this app is an RMS value."""
 
     value = float(volts or 0.0)
     magnitude = abs(value)
     if magnitude == 0.0:
-        return "0 V"
+        return "0 Vrms"
     if magnitude >= 1.0:
-        return f"{value:g} V"
+        return f"{value:g} Vrms"
     if magnitude >= 1e-3:
-        return f"{value * 1e3:g} mV"
+        return f"{value * 1e3:g} mVrms"
     if magnitude >= 1e-6:
-        return f"{value * 1e6:g} uV"
-    return f"{value * 1e9:g} nV"
+        return f"{value * 1e6:g} uVrms"
+    return f"{value * 1e9:g} nVrms"
 
 
 def full_export_stem(stem: str, info: MeasurementInfo) -> str:
@@ -358,6 +385,10 @@ EXPORT_SECTIONS = (
     ("crosstalk_sweep", "Crosstalk sweep", "Crosstalk versus frequency"),
     ("gain_sweep", "Gain sweep", "Response versus applied stimulus level"),
     ("cmrr_sweep", "CMRR sweep", "CMRR versus frequency"),
+    ("cmrr_fits", "Fitted curves", "Polynomial fits of the sweep, one curve per channel"),
+    ("cmrr_fit_mean", "Mean of the fits", "Average fitted response with the channel spread"),
+    ("cmrr_50hz", "50 Hz table", "CMRR at 50 Hz taken from each channel's fitted curve"),
+    ("reference", "Reference channel", "What the reference input actually measured, in Vrms"),
 )
 EXPORT_SECTION_KEYS = tuple(key for key, _label, _desc in EXPORT_SECTIONS)
 DEFAULT_EXPORT_SECTIONS = ("info", "waveform", "fft", "metrics")
@@ -895,10 +926,10 @@ class MeasurementNameDialog(QDialog):
         self.stimulus_spin.setDecimals(6)
         self.stimulus_spin.setRange(0.0, 1000.0)
         self.stimulus_spin.setValue(max(self._info.stimulus_v, 0.0))
-        self.stimulus_spin.setSuffix(" V")
+        self.stimulus_spin.setSuffix(" Vrms")
         self.stimulus_spin.setSingleStep(0.1)
-        self.stimulus_spin.setToolTip("Voltage you feed in externally (CMRR / crosstalk / gain)")
-        self.stimulus_label = QLabel("Applied voltage")
+        self.stimulus_spin.setToolTip("RMS voltage you feed in externally (CMRR / crosstalk / gain)")
+        self.stimulus_label = QLabel("Applied voltage (Vrms)")
         form.addRow(self.stimulus_label, self.stimulus_spin)
 
         self.stimulus_note_edit = QLineEdit(self._info.stimulus_note)
@@ -911,6 +942,16 @@ class MeasurementNameDialog(QDialog):
             self.reference_combo.addItem(label, value)
         self.reference_combo.setCurrentIndex(max(self.reference_combo.findData(self._info.reference_mode), 0))
         form.addRow("Reference", self.reference_combo)
+
+        self.bias_combo = QComboBox()
+        for label, value in BIAS_CHOICES:
+            self.bias_combo.addItem(label, value)
+        self.bias_combo.setCurrentIndex(max(self.bias_combo.findData(bool(self._info.bias_enabled)), 0))
+        self.bias_combo.setToolTip(
+            "Whether the board bias network was connected to the inputs during the measurement"
+        )
+        self.bias_label = QLabel("Bias")
+        form.addRow(self.bias_label, self.bias_combo)
 
         self.note_edit = QLineEdit(self._info.note)
         self.note_edit.setPlaceholderText("optional free text")
@@ -936,6 +977,7 @@ class MeasurementNameDialog(QDialog):
         self.subtype_combo.currentIndexChanged.connect(self._refresh)
         self.stimulus_spin.valueChanged.connect(self._refresh)
         self.reference_combo.currentIndexChanged.connect(self._refresh)
+        self.bias_combo.currentIndexChanged.connect(self._refresh)
         self._refresh()
 
     def _refresh(self) -> None:
@@ -946,6 +988,9 @@ class MeasurementNameDialog(QDialog):
         stimulus = kind in STIMULUS_KINDS
         for widget in (self.stimulus_spin, self.stimulus_label, self.stimulus_note_edit, self.stimulus_note_label):
             widget.setVisible(stimulus)
+        bias = kind in BIAS_KINDS
+        self.bias_combo.setVisible(bias)
+        self.bias_label.setVisible(bias)
         info = self.measurement()
         self.preview_label.setText(f"{self.name_stem()}\n\n" + "\n".join(info.describe_lines()))
 
@@ -957,6 +1002,7 @@ class MeasurementNameDialog(QDialog):
             stimulus_v=float(self.stimulus_spin.value()),
             stimulus_note=self.stimulus_note_edit.text().strip(),
             reference_mode=str(self.reference_combo.currentData() or "srb2"),
+            bias_enabled=bool(self.bias_combo.currentData()),
             note=self.note_edit.text().strip(),
             operator_note=self._info.operator_note,
         ).normalised()
@@ -1090,20 +1136,43 @@ class WheelGuard(QObject):
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._value_types = (QComboBox, QAbstractSpinBox)
+        # Re-entrancy guard: forwarding the wheel to the scroll area can deliver
+        # it back to this filter (the area's viewport is often the widget's own
+        # parent), and a loop here would blow the C++ stack.
+        self._forwarding = False
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
-        if event.type() != QEvent.Type.Wheel or not isinstance(obj, self._value_types):
+        # An exception escaping a Qt virtual method is fatal: PyQt aborts the whole
+        # process with a bare traceback (which is how a stray Ctrl+C or a widget
+        # destroyed mid-event used to kill the window). This filter is on *every*
+        # widget, so it must never raise - it either handles the event or waves it
+        # through.
+        try:
+            if self._forwarding or event.type() != QEvent.Type.Wheel:
+                return False
+            if not isinstance(obj, self._value_types):
+                return False
+            if obj.hasFocus():
+                return False
+            area = obj.parentWidget()
+            while area is not None and not isinstance(area, QAbstractScrollArea):
+                area = area.parentWidget()
+            if area is None:
+                return False
+            viewport = area.viewport()
+            if viewport is None or viewport is obj:
+                return False
+            self._forwarding = True
+            try:
+                # Forward to the viewport so the panel scrolls exactly as if the
+                # pointer had been over empty space.
+                QApplication.sendEvent(viewport, event)
+            finally:
+                self._forwarding = False
+            return True
+        except BaseException:  # noqa: BLE001 - never let Qt call qFatal on us
+            self._forwarding = False
             return False
-        if obj.hasFocus():
-            return False
-        area = obj.parentWidget()
-        while area is not None and not isinstance(area, QAbstractScrollArea):
-            area = area.parentWidget()
-        if area is not None:
-            # Forward to the viewport so the panel scrolls exactly as if the
-            # pointer had been over empty space.
-            QApplication.sendEvent(area.viewport(), event)
-        return True
 
 
 def install_wheel_guard(application: QApplication) -> WheelGuard:

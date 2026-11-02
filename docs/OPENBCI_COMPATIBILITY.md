@@ -48,17 +48,39 @@ Implemented in firmware command parser:
 - `d` apply default ADS settings
 - `c` 8-channel mode (`daisy removed$$$` when daisy is active)
 - `C` 16-channel mode (`16$$$` / `daisy attached16$$$` / `no daisy to attach!8$$$`)
-- `~0..~6` data-rate selection (ADS1299 DR bits)
+- `~0..~6` data-rate selection (ADS1299 DR bits). The rate check is made on the
+  *decimated output* rate for the serial link and on the raw rate for SCLK
 - `x...X` per-channel ADS settings command (channels `1-8` = board, `Q I` = daisy)
 - `?` dump every ADS1299 register as plain text
 - `N<0|1|2>` board-wide reference routing (0 = true differential, 1 = SRB1,
   2 = SRB2). Applied to every converter at once; `x...X` no longer touches
   `MISC1`, because SRB1 is a single switch per chip and a per-channel request
   could silently move every other channel's negative input.
-- `P` configuration readback for the GUI: one `[CFG] DEV=ADS1 LINK=1 REGS=<48 hex chars>`
-  line per converter (registers `0x00..0x17`) plus a
-  `[CFG] CODE=.. SPS=.. SPICLK=.. SPILIMIT=.. SERIALLIMIT=.. DONE=1` line.
-  Streaming is paused for the readback and restarted afterwards.
+- `n<converter><0|1|2>` reference routing for **one** ADS1299 (`n10` = ADS1 true
+  differential, `n21` = ADS2 SRB1). SRB1 is chip-wide, so this is what lets one
+  converter run SRB1 while the other stays true differential and measures the
+  common-mode voltage directly. In SRB2 mode the per-channel `CHnSET` bit 3 is
+  honoured, so a single input can remain differential while the rest of that
+  converter is referred to SRB2. The two converters and the per-channel bit are
+  fully independent: changing one never rewrites the others, and an input's
+  own-INN choice survives a trip through differential or SRB1 mode because the
+  host keeps it as intent and the firmware gates it on the chip mode.
+- `m<n>m` output decimation (`1..32`): the converters are sampled at the `~`
+  data rate and `n` conversions are block-averaged into one published packet.  This moves the sinc3 -3 dB corner (`0.262 x f_MOD`, e.g. 1048 Hz at 4000 SPS)
+  above the measurement band without raising the packet rate.
+- `o<kHz>o` runtime SCLK change (`1000..8000`). Streaming is paused while the
+  clock changes because both converters share SCLK.
+- `>` repair and verify: re-programs every register of both converters from the
+  cached state, then reads all 24 registers back and prints
+  `[CHK] DEV=ADS1 ID=3D NCH=6 REGOK=12 CHECKED=12` plus one
+  `[CHK] BAD DEV=.. REG=.. GOT=.. WANT=..` line per register that still differs and
+  `[CHK] CODE=.. PROBLEMS=.. REASON=host DONE=1`. The same re-programming runs at
+  every stream start, so a half-applied configuration is never streamed.
+- `P` configuration readback for the GUI: one
+  `[CFG] DEV=ADS1 LINK=1 REF=srb2 REGS=<48 hex chars>` line per converter
+  (registers `0x00..0x17`) plus a
+  `[CFG] CODE=.. SPS=.. DECIM=.. OUT=.. SPICLK=.. SPILIMIT=.. SERIALLIMIT=.. REF=.. DONE=1`
+  line. Streaming is paused for the readback and restarted afterwards.
 - `z...Z` impedance-mode style command (basic support)
 - legacy channel toggles: `1..8` off, `!@#$%^&*` on, daisy `q..i` off / `Q..I` on
 
@@ -227,16 +249,26 @@ SPI clock: 2000 kHz, frame 216 us x 2 devices, SPI link limit: 4166 SPS
 
 ## Reference / SRB routing
 
-`MISC1` bit 5 (SRB1) closes one switch inside each ADS1299 that connects the
-negative input of **all** channels of that chip to the SRB1 pin, so it is a
-chip-wide setting. `CHnSET` bit 3 (SRB2) is the per-channel equivalent for the
-SRB2 pin. The firmware keeps one board-wide mode and derives both:
+The two reference pins go to **different** inputs of the channel - this is the one
+thing that is almost always assumed wrongly:
+
+| Pin | Register | Connects to |
+|-----|----------|-------------|
+| SRB1 | `MISC1` bit 5, one switch for the whole chip | the **inverting** input (INxN) of *all* channels |
+| SRB2 | `CHnSET` bit 3, per channel | that channel's **non-inverting** input (INxP) |
+
+So SRB1 is the reference-electrode pin for a referential montage (datasheet
+"Referential montage": reference on SRB1, active electrodes on INxP), while SRB2
+*drives* INP and is not a negative reference. A channel with `CHnSET` bit 3 closed
+measures *(SRB2 pin) - (INN)*, so INN still has to be wired.
+
+The firmware keeps one mode per converter and derives both registers:
 
 | Mode | `MISC1` | `CHnSET` bit 3 | Montage |
 |------|---------|----------------|---------|
-| 0 (differential) | `0x00` | 0 | each channel uses its own INP and INN |
-| 1 (SRB1) | `0x20` | 0 | all INN tied to the SRB1 pin |
-| 2 (SRB2, default) | `0x00` | 1 | all INN switched to the SRB2 pin |
+| 0 (differential) | `0x00` | per channel (0 for own INN) | each channel uses its own INP and INN; SRB2 rows drive INP from the SRB2 pin |
+| 1 (SRB1) | `0x20` | 0 | every INN tied to the SRB1 pin |
+| 2 (SRB2) | `0x00` | 1 on the selected channels | INP driven from the SRB2 pin |
 
 `configureChannel()` only tracks the SRB1 flag; the routing itself is written by
 `setSrb1Routing()` / `setSrb2ForAllChannels()`, and `applyCytonDefaults()` leaves
@@ -244,9 +276,106 @@ SRB2 pin. The firmware keeps one board-wide mode and derives both:
 running SRB1 configuration. The mode is re-applied after `d`/`v` and when a
 converter is recovered at stream start.
 
-If a channel reports full-scale input, the mode does not match the wiring: an
-SRB2 mode with the reference electrode on SRB1 (or vice versa) leaves every INN
-floating, and the bias amplifier then drives the inputs into the rail.
+The firmware default is **mode 0 with every SRB2 bit clear**. It used to default
+to mode 2 with all SRB2 bits set, which shorted every INxP to the SRB2 pin - on a
+board where SRB2 is not wired that leaves the positive input floating, and every
+channel reads as saturation or as pure float noise.
+
+`verifyDeviceRegisters()` prints two warnings that no register comparison can
+catch, because the registers are *correct*:
+
+* `[CHK] NOTE ... SRB2_SWITCH=CLOSED ... EFFECT=INxP_DRIVEN_BY_SRB2_NOT_A_NEGATIVE_REFERENCE`
+* `[CHK] WARN ... REASON=NO_DC_RETURN BIAS_SENSP=0 BIAS_SENSN=0 EFFECT=inputs_float_and_rail`
+
+If a channel reports full-scale input, check those two first. A referenced input
+without a bias/DRL return path is a floating input, whatever the register map says.
+
+### What the configuration check actually compares
+
+The ADS1299 does not read back every bit you write: reserved bits of `CONFIG1` and
+`CONFIG2` come back as 0, and so do `DAISY_EN` (`CONFIG1` b6) and `INT_CAL`
+(`CONFIG2` b4), while `CONFIG3`, `MISC1`, `BIAS_SENSP/N` and every `CHnSET` read
+back exactly. Comparing whole bytes therefore reported "CONFIG1 0x04, expected
+0xD4" on a converter that was configured correctly and streaming - a false alarm.
+
+The check now masks to the bits that decide behaviour and that the readback
+reflects:
+
+| Register | Compared bits |
+|----------|---------------|
+| `CONFIG1` | `CLK_EN` + `DR[2:0]` (`0x27`) - a wrong data rate is still caught |
+| `CONFIG2` | `INT_CAL` only while the test signal is off; `INT_CAL`/`CAL_AMP`/`CAL_FREQ` when it is on |
+| `CONFIG3`, `MISC1`, `BIAS_SENSP/N`, `CHnSET` | whole byte |
+
+`DAISY_EN` is confirmed by the write acknowledgement and by both converters
+actually delivering samples; its raw value stays visible in the *Board reports*
+line. A converter that is missing from the report now says whether it answered
+with `LINK=0` (an SPI problem) or sent no line at all (a lost report), instead of
+the bare "did not report registers".
+
+## SD card commands (`:` prefix)
+
+The prefix exists because every letter and digit is already a Cyton channel
+selector or an existing command.
+
+| Command | Meaning |
+|---------|---------|
+| `:s` | Status line: `[SD] EVENT PRESENT RECORDING FILE NAME CHANNELS RATE TOTAL_MB FREE_MB FREE_BYTES EST_SEC SAMPLES DROPPED BYTES DONE=1` |
+| `:b` | Start recording to the card. Starts the data stream if it is not already running |
+| `:e` | Stop and close the file |
+| `:p` | Toggle (what the GPIO35 button does) |
+| `:w` | Write the current board configuration to `/SZD_CFG.TXT` |
+| `:r` | Read that file and apply it (rate, decimation, SPI clock, converter reference modes, per-channel settings) |
+| `:n<name>;` | Set the session name, terminated by `;` |
+
+`EVENT` is `status` for an explicit Refresh and `start` / `stop` / `timeout` /
+`fail` / `busy` / `saved` for a state change, so a host can confirm an action
+without waiting for the next poll. There is no periodic poll: `:s` re-reads the
+card's free space, and the FAT walk behind it is slow enough to disturb a running
+measurement. Only `status` and `saved` measure it (`sdCapacityCached()`); the
+automatic action replies reuse the cached value.
+
+`QUEUED` / `QPEAK` / `QBUF` / `BUFKB` expose the RAM write buffering, and
+`WRITE_MS` / `RATE_KB` / `SPIKHZ` the card's own performance: a `QPEAK` close to
+512 together with a non-zero `DROPPED` means the card cannot keep up with the
+sample rate.
+
+`#BT ... peak= rate= need=` reports the radio side: `need` is what the live link
+must carry at the current data rate (33 bytes per packet), `rate` what it is
+actually sending, and `peak` the high-water mark of the transmit ring. Bluetooth
+SPP has **no baud rate** - `btSerial.begin()` takes only the device name - so these
+figures, not a serial speed, are what decide whether the link keeps up.
+
+The OpenBCI marker command (`` ` ``) writes `Marker=1` into the next card row, so a
+card recording and a live recording can be aligned on one shared instant rather
+than by correlation, which is ambiguous for any periodic trace.
+
+**Card recordings are fed by the conversion stream**, so `:b` starts the stream when
+it is not running; a recording requested while stopped used to write a header and
+no rows. Any host byte also counts as presence: while a card recording is active the
+board restarts a stopped stream if the last host byte arrived within 50 ms, so a
+dropped stream heals itself during a recording. `s` and `v` arm
+`suppressAutoStream`, so a deliberate stop is never undone by the 5 s `:s` poll; a
+`b` or a new recording clears it. A board with no host never self-starts.
+
+Recordings are OpenBCI-compatible CSV at `/SZD_NNNN_<name>.CSV`, containing only
+the channels that are switched on. The stored configuration is a plain text file:
+
+```
+SZDCFG 1
+name=<session>
+rate=<DR bits>
+decim=<n>
+spi=<Hz>
+ref1=<0|1|2>
+ref2=<0|1|2>
+ch<0..11>=<active>,<gain>,<input>,<bias>,<srb2>
+```
+
+`:w` should be sent *after* the normal `x...X` / `N` / `n` / `~` / `m` / `o`
+writes, so the card stores the configuration the converters are actually running.
+The GPIO37 button reads that file and applies it before recording, which is what
+makes a standalone recording reproduce the settings last reviewed in the GUI.
 
 ## ADS1299 register defaults applied (Cyton-like)
 
@@ -255,8 +384,9 @@ On startup, `d` command, and after the self test:
 - `CONFIG1`: `DAISY_EN = 1` (multiple readback, since both devices share
   SCLK/DIN/DOUT with independent CS), `CLK_EN` per device role, `250 SPS`
 - `CONFIG2`: internal test signal off
-- `CONFIG3`: `PD_REFBUF = 1`, `BIASREF_INT = 1`, `PD_BIAS = 1`
-- `CHnSET`: gain = `x24`, input type = `NORMAL`, SRB2 = ON, bias include = ON
+- `CONFIG3`: `PD_REFBUF = 1` (internal reference buffer on), `BIASREF_INT = 1`
+  (bias reference from `(AVDD + AVSS)/2`), `PD_BIAS = 1` (bias amplifier on)
+- `CHnSET`: gain = `x24`, input type = `NORMAL`, **SRB2 = OFF**, bias include = ON
 
 ## Channel mapping
 

@@ -63,33 +63,97 @@ BOARD_CHANNEL_CHOICES = (("Cyton + Daisy (16 channels)", 16), ("Cyton (8 channel
 # ADS1299 SPI bus. This has to match ADS_SPI_CLOCK_HZ in the firmware; the app
 # only uses it to sanity-check the budget the board reports.
 ADS_SPI_CLOCK_HZ = 2_000_000
+ADS_SPI_CLOCK_MIN_HZ = 1_000_000
+ADS_SPI_CLOCK_MAX_HZ = 8_000_000
+SPI_CLOCK_CHOICES = (
+    (1_000_000, "1 MHz"),
+    (2_000_000, "2 MHz (default)"),
+    (4_000_000, "4 MHz"),
+    (6_000_000, "6 MHz"),
+    (8_000_000, "8 MHz (max)"),
+)
 ADS_SPI_FRAME_BITS = 3 * 8 + 8 * 8 * 3  # 3 status bytes + 8 x 24-bit samples = 216
+
+# Output decimation. The converter runs at the selected output data rate and the
+# firmware block-averages N conversions before it publishes a packet, so the
+# packet rate stays where the serial/BLE link is comfortable while the ADS1299
+# third-order sinc corner (-3 dB at 0.262 x ODR) moves out of the measurement
+# band: 500 SPS -> 131 Hz, 2000 SPS -> 524 Hz, 4000 SPS -> 1048 Hz.
+DECIMATION_CHOICES = (1, 2, 4, 5, 8, 10, 16, 20, 25, 32)
+DECIMATION_MIN = 1
+DECIMATION_MAX = 32
+
+# Sinc3 -3 dB corner as a fraction of the output data rate.
+SINC3_CORNER_FRACTION = 0.262
+
+
+def sinc3_corner_hz(data_rate_hz: float) -> float:
+    """-3 dB corner of the ADS1299 digital filter at the given data rate."""
+
+    return SINC3_CORNER_FRACTION * float(data_rate_hz)
+
+
+def clamp_spi_clock(value: object, default: int = ADS_SPI_CLOCK_HZ) -> int:
+    try:
+        clock = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return max(ADS_SPI_CLOCK_MIN_HZ, min(ADS_SPI_CLOCK_MAX_HZ, clock))
+
+
+def clamp_decimation(value: object) -> int:
+    try:
+        factor = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 1
+    return max(DECIMATION_MIN, min(DECIMATION_MAX, factor))
 
 # Default display band. Matches what the offline analyzer is usually driven
 # with, so the live traces and the analysis look at the same signal.
 DEFAULT_HIGH_PASS_HZ = 0.1
 DEFAULT_LOW_PASS_HZ = 150.0
 # Bumped whenever a stored settings file needs to adopt a new default.
-SETTINGS_VERSION = 4
+SETTINGS_VERSION = 5
 
-# Reference ("SRB") routing. SRB1 is a single switch inside each ADS1299
-# (MISC1 bit 5) that ties the negative input of every channel to the SRB1 pin,
-# so it can never be a per-channel choice; SRB2 is the per-channel CHnSET bit 3
-# but is exposed as one board-wide mode as well. Exactly one of the three states
-# is always programmed, which is what keeps the input from floating.
+# Reference ("SRB") routing, as the silicon actually implements it.
+#
+# * SRB1 - MISC1 bit 5 closes one switch inside the converter that ties the
+#   **inverting** input (INxN) of every channel to the SRB1 pin. The datasheet's
+#   referential-montage section (SBAS499C, "Referential montage") describes exactly
+#   this: reference electrode to SRB1, every active electrode to INxP. This is the
+#   pin that provides a shared *negative* reference.
+# * SRB2 - CHnSET bit 3 closes a switch between the SRB2 pin and that channel's
+#   **non-inverting** input (INxP). It is per channel and chip-mode independent,
+#   but it does NOT refer the channel to a negative reference: closing it drives
+#   INP from the SRB2 pin and leaves INN to whatever is wired there.
+# * Differential - neither switch closed, each channel uses its own INP and INN.
+#
+# Keeping these two distinct matters: wiring a reference electrode to SRB2 and
+# expecting a referential montage leaves INN floating, which is why an SRB2 setup
+# that "should" work reads as saturation or as pure floating-input noise.
 REFERENCE_MODE_DIFFERENTIAL = "diff"
 REFERENCE_MODE_SRB1 = "srb1"
 REFERENCE_MODE_SRB2 = "srb2"
 REFERENCE_MODE_CHOICES = (
-    ("True differential (INP/INN from electrodes)", REFERENCE_MODE_DIFFERENTIAL),
-    ("SRB1 (all INN to SRB1, one reference)", REFERENCE_MODE_SRB1),
-    ("SRB2 (all INN to SRB2, one reference)", REFERENCE_MODE_SRB2),
+    ("True differential (each channel uses its own INP and INN)", REFERENCE_MODE_DIFFERENTIAL),
+    ("SRB1 - reference electrode to every INxN (referential montage)", REFERENCE_MODE_SRB1),
+    ("SRB2 - SRB2 pin drives INxP (non-inverting), per channel", REFERENCE_MODE_SRB2),
 )
 REFERENCE_MODE_CODES = {
     REFERENCE_MODE_DIFFERENTIAL: 0,
     REFERENCE_MODE_SRB1: 1,
     REFERENCE_MODE_SRB2: 2,
 }
+# Compact labels for combo boxes and one-line status text. `report_export`
+# re-exports this tuple so the UI and the reports can never disagree.
+REFERENCE_MODE_SHORT = (
+    ("Differential", REFERENCE_MODE_DIFFERENTIAL),
+    ("SRB1->INN", REFERENCE_MODE_SRB1),
+    ("SRB2->INP", REFERENCE_MODE_SRB2),
+)
+# value -> label. ``dict(REFERENCE_MODE_SHORT)`` is the opposite direction (what a
+# combo box needs), so looking a mode up in it silently fell back to the raw code.
+REFERENCE_MODE_SHORT_LABELS = {value: label for label, value in REFERENCE_MODE_SHORT}
 
 # Cyton selectors for the second half of a 16-channel board.
 DAISY_SELECTORS = ("Q", "W", "E", "R", "T", "Y", "U", "I")
@@ -151,11 +215,48 @@ def supported_packet_rates(baud: int) -> list[tuple[int, int]]:
     return [(rate, code) for rate, code in SAMPLE_RATES if rate <= limit]
 
 
-def sample_rate_for(code: int, board_channels: int) -> float:
-    """Per-channel sample rate; daisy mode halves the packet rate."""
+def sample_rate_for(code: int, board_channels: int, decimation: int = 1) -> float:
+    """Per-channel sample rate after the firmware's block averaging.
 
-    rate = float(SAMPLE_RATE_BY_CODE.get(int(code), 250))
+    The converters produce ``SAMPLE_RATE`` samples/s; the firmware averages
+    ``decimation`` of them into one packet, and in Cyton+Daisy mode one packet
+    carries one of the two chips, so the rate a single channel ends up with is
+    ``rate / (decimation * 2)``.
+    """
+
+    rate = float(SAMPLE_RATE_BY_CODE.get(int(code), 250)) / max(int(decimation), 1)
     return rate / 2.0 if int(board_channels) > 8 else rate
+
+
+def output_packet_rate(code: int, decimation: int = 1) -> float:
+    """Packets per second the firmware publishes for one data-rate code."""
+
+    return float(SAMPLE_RATE_BY_CODE.get(int(code), 250)) / max(int(decimation), 1)
+
+
+def rate_fits_link(
+    data_rate_hz: float,
+    packet_rate_hz: float,
+    baud: int,
+    spi_clock_hz: int = ADS_SPI_CLOCK_HZ,
+    device_count: int = 2,
+) -> tuple[bool, str]:
+    """Check a (data rate, decimated packet rate) pair against both budgets."""
+
+    serial_limit = max_sustained_packet_rate(baud)
+    spi_limit = max_sample_rate_from_spi(spi_clock_hz, device_count)
+    if float(packet_rate_hz) > serial_limit:
+        return False, (
+            f"{packet_rate_hz:g} packets/s needs "
+            f"{packet_rate_hz * PACKET_LENGTH * 10 / 1000:.0f} kbit/s, "
+            f"the {baud / 1000:.0f} kbit/s link carries {serial_limit:g}"
+        )
+    if float(data_rate_hz) > spi_limit:
+        return False, (
+            f"{data_rate_hz:g} SPS needs {spi_frame_microseconds(spi_clock_hz, device_count):.0f} us "
+            f"per sample, SCLK at {spi_clock_hz / 1e6:g} MHz serves {spi_limit:g} SPS"
+        )
+    return True, ""
 
 
 def physical_channel_map(board_channels: int) -> list[Optional[int]]:
@@ -198,7 +299,10 @@ class ChannelSetting:
     gain_ordinal: int = 6
     input_ordinal: int = 0
     bias: bool = True
-    srb2: bool = True
+    # CHnSET bit 3: closes the switch that ties this channel's **INxP**
+    # (non-inverting input) to the SRB2 pin. It is *not* a negative reference.
+    srb2: bool = False
+    # Derived from the converter's mode; MISC1 bit 5 owns it for the whole chip.
     srb1: bool = False
 
     @property
@@ -243,6 +347,69 @@ def build_reference_command(mode: str) -> bytes:
 
     code = REFERENCE_MODE_CODES.get(str(mode), REFERENCE_MODE_CODES[REFERENCE_MODE_SRB2])
     return f"N{code}".encode("ascii")
+
+
+def build_chip_reference_command(device_index: int, mode: str) -> bytes:
+    """``n<chip><0|1|2>``: reference routing for one ADS1299 only.
+
+    SRB1 is one switch per converter, so a board that measures the common-mode
+    voltage on a true-differential input *and* tests SRB1 needs the two halves to
+    run different reference modes.
+    """
+
+    code = REFERENCE_MODE_CODES.get(str(mode), REFERENCE_MODE_CODES[REFERENCE_MODE_SRB2])
+    return f"n{int(device_index) + 1}{code}".encode("ascii")
+
+
+def build_spi_clock_command(spi_clock_hz: int) -> bytes:
+    """``o<kHz>o``: runtime SCLK change."""
+
+    kilohertz = max(int(round(float(spi_clock_hz) / 1000.0)), 1)
+    return f"o{kilohertz}o".encode("ascii")
+
+
+def build_decimation_command(decimation: int) -> bytes:
+    """``m<n>m``: block-average factor applied before a packet is published."""
+
+    factor = min(max(int(decimation), DECIMATION_MIN), DECIMATION_MAX)
+    return f"m{factor}m".encode("ascii")
+
+
+def build_repair_command() -> bytes:
+    """``>``: re-program every register from the firmware's cached state and
+    report the readback check. Named with a symbol because every letter is
+    already a Cyton channel selector."""
+
+    return b">"
+
+
+def boxcar_corner_hz(data_rate_hz: float, decimation: int) -> float:
+    """-3 dB point of the MCU's block average, for the operator to see.
+
+    A block average of N samples at f_s has its first null at f_s/N and its
+    -3 dB point at roughly 0.443 * f_s/N. This is why averaging cannot lower
+    noise *inside* the measurement band: it only removes what is above this
+    corner, and it is the ADS1299 sample rate that sets the noise bandwidth.
+    """
+
+    factor = max(int(decimation), 1)
+    return 0.443 * float(data_rate_hz) / factor
+
+
+def boxcar_null_hz(data_rate_hz: float, decimation: int) -> float:
+    factor = max(int(decimation), 1)
+    return float(data_rate_hz) / factor
+
+
+def noise_bandwidth_hz(data_rate_hz: float) -> float:
+    """Effective noise bandwidth of the ADS1299 sinc3 filter.
+
+    The datasheet's noise table uses ENBW = 1.22 x the -3 dB corner for the
+    third-order sinc, so this is the number that explains why a higher data rate
+    is noisier for the same signal band.
+    """
+
+    return 1.22 * sinc3_corner_hz(data_rate_hz)
 
 
 @dataclass(slots=True)
@@ -651,6 +818,14 @@ class HardwareSettings:
     # rate that still fits the serial link comfortably at 921600 baud.
     sample_rate_code: int = 5
     reference_mode: str = REFERENCE_MODE_SRB2
+    # One reference mode per ADS1299. SRB1 is a single switch inside each chip,
+    # so the two converters can run different references even though the
+    # recording name can only describe one - this is what lets one converter stay
+    # true differential (measuring the common-mode voltage directly) while the
+    # other is in SRB1 or SRB2.
+    chip_reference_modes: list[str] = field(default_factory=list)
+    spi_clock_hz: int = ADS_SPI_CLOCK_HZ
+    decimation: int = 1
     channels: list[ChannelSetting] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -672,24 +847,278 @@ class HardwareSettings:
         mode = str(self.reference_mode or REFERENCE_MODE_SRB2)
         return mode if mode in REFERENCE_MODE_CODES else REFERENCE_MODE_SRB2
 
-    def sync_reference(self) -> None:
-        """Make every channel agree with the single board-wide reference mode.
+    def normalised_chip_modes(self) -> list[str]:
+        """Exactly one reference mode per converter."""
 
-        SRB1 is one switch per chip and SRB2 is meant to be uniform across the
-        inputs, so the per-channel flags are derived rather than chosen. This is
-        what stops one channel from silently moving every other channel's
-        negative input onto a different node.
+        modes: list[str] = []
+        for value in list(self.chip_reference_modes)[:2]:
+            modes.append(value if value in REFERENCE_MODE_CODES else self.normalised_reference_mode())
+        while len(modes) < 2:
+            modes.append(self.normalised_reference_mode())
+        return modes
+
+    @property
+    def device_count(self) -> int:
+        """How many ADS1299 converters this board profile actually has."""
+
+        return 2 if int(self.board_channels) > 8 else 1
+
+    @property
+    def chip_modes_differ(self) -> bool:
+        modes = self.normalised_chip_modes()[: self.device_count]
+        return len(set(modes)) > 1
+
+    def chip_mode_for_real(self, real_channel: int) -> str:
+        per_device = channels_per_device(self.board_channels)
+        device = min(int(real_channel) // max(per_device, 1), 1)
+        return self.normalised_chip_modes()[device]
+
+    def chip_indices(self, device: int) -> list[int]:
+        """GUI channel indices that belong to one converter and are powered up."""
+
+        per_device = channels_per_device(self.board_channels)
+        device = int(device)
+        result: list[int] = []
+        for gui_index, real in enumerate(physical_channel_map(self.board_channels)):
+            if real is None or gui_index >= len(self.channels):
+                continue
+            if (int(real) // max(per_device, 1)) != device:
+                continue
+            if self.channels[gui_index].active:
+                result.append(gui_index)
+        return result
+
+    def resolve_chip_modes(self) -> list[str]:
+        """Derive each converter's mode from its channel rows.
+
+        The rows are the master: this is exactly what the firmware will be told,
+        and it is the only place the two converters' states come from.
+
+        ``SRB1`` is a single switch per chip (``MISC1`` bit 5), so a converter can
+        only be in SRB1 when **every** powered-up input of that converter asks for
+        it. Anything else is a plain per-input choice: ``SRB2`` when at least one
+        input still uses the SRB2 pin (the firmware must then be in SRB2 mode for
+        those inputs to get ``CHnSET`` bit 3), otherwise every input is on its own
+        INN.
         """
 
-        mode = self.normalised_reference_mode()
-        self.reference_mode = mode
-        for channel in self.channels:
-            channel.srb1 = mode == REFERENCE_MODE_SRB1
-            channel.srb2 = mode == REFERENCE_MODE_SRB2
+        modes: list[str] = []
+        for device in range(2):
+            inputs = self.chip_indices(device)
+            on_srb1 = [index for index in inputs if self.channels[index].srb1]
+            if inputs and len(on_srb1) == len(inputs):
+                modes.append(REFERENCE_MODE_SRB1)
+            elif any(self.channels[index].srb2 for index in inputs) or not inputs:
+                modes.append(REFERENCE_MODE_SRB2)
+            else:
+                modes.append(REFERENCE_MODE_DIFFERENTIAL)
+        return modes
+
+    def reference_conflicts(self) -> list[str]:
+        """Per-input choices that the silicon cannot honour, if any.
+
+        Only SRB1 can conflict: it is chip-wide, so mixing it with the SRB2 pin or
+        with own-INN inputs on the same converter is not programmable.
+        """
+
+        problems: list[str] = []
+        for device in range(2):
+            inputs = self.chip_indices(device)
+            on_srb1 = [index for index in inputs if self.channels[index].srb1]
+            if on_srb1 and len(on_srb1) != len(inputs):
+                problems.append(
+                    f"ADS{device + 1}: SRB1 is one switch for the whole converter, so it cannot be "
+                    f"mixed with other references (CH "
+                    + ", ".join(str(index + 1) for index in on_srb1)
+                    + ")"
+                )
+        return problems
+
+    def sync_reference(self) -> None:
+        """Make the per-input choices self-consistent and derive the chip modes.
+
+        SRB1 is chip-wide, so if any powered-up input of a converter asks for it,
+        the whole converter is SRB1 - that is the only state the hardware can be
+        in, and resolving it here means a file saved by an older version (which
+        stored the mode separately) still lands on a real configuration.
+
+        Everything else is left alone: ``srb2`` is the per-input ``CHnSET`` bit 3
+        and stays the operator's choice even while the converter is in SRB1 or
+        differential mode, so returning to SRB2 restores the mix instead of
+        turning every input into "SRB2 pin".
+        """
+
+        self.spi_clock_hz = clamp_spi_clock(self.spi_clock_hz)
+        self.decimation = clamp_decimation(self.decimation)
+        for device in range(2):
+            inputs = self.chip_indices(device)
+            if any(self.channels[index].srb1 for index in inputs):
+                for index in inputs:
+                    self.channels[index].srb1 = True
+        for gui_index, real in enumerate(physical_channel_map(self.board_channels)):
+            if real is None and gui_index < len(self.channels):
+                self.channels[gui_index].srb1 = False
+        modes = self.resolve_chip_modes()
+        self.chip_reference_modes = modes
+        self.reference_mode = modes[0] if modes else self.normalised_reference_mode()
+
+    def set_channel_reference(self, gui_index: int, mode: str) -> None:
+        """Set one row's reference, honouring the chip-wide SRB1 switch.
+
+        Choosing SRB1 therefore moves the whole converter to SRB1 (that is the
+        only thing it can do), and choosing anything else clears SRB1 for the
+        converter while leaving the other inputs' SRB2-pin / own-INN choices
+        untouched.
+        """
+
+        if not (0 <= int(gui_index) < len(self.channels)):
+            return
+        value = mode if mode in REFERENCE_MODE_CODES else REFERENCE_MODE_SRB2
+        device = self._device_of_gui(int(gui_index))
+        inputs = self.chip_indices(device)
+        if value == REFERENCE_MODE_SRB1:
+            for index in inputs:
+                self.channels[index].srb1 = True
+        else:
+            for index in inputs:
+                self.channels[index].srb1 = False
+            self.channels[int(gui_index)].srb2 = value == REFERENCE_MODE_SRB2
+        self.sync_reference()
+
+    def _device_of_gui(self, gui_index: int) -> int:
+        per_device = channels_per_device(self.board_channels)
+        real = physical_channel_map(self.board_channels)[int(gui_index)]
+        if real is None:
+            return 0
+        return min(int(real) // max(per_device, 1), 1)
 
     def set_reference_mode(self, mode: str) -> None:
-        self.reference_mode = mode if mode in REFERENCE_MODE_CODES else REFERENCE_MODE_SRB2
+        """Bulk-set both converters: every powered-up input follows the mode."""
+
+        value = mode if mode in REFERENCE_MODE_CODES else REFERENCE_MODE_SRB2
+        for device in range(2):
+            self._apply_mode_to_chip(device, value)
         self.sync_reference()
+
+    def set_chip_reference_mode(self, device_index: int, mode: str) -> None:
+        """Bulk-set one converter (the one-click control above the table)."""
+
+        value = mode if mode in REFERENCE_MODE_CODES else REFERENCE_MODE_SRB2
+        self._apply_mode_to_chip(int(device_index), value)
+        self.sync_reference()
+
+    def _apply_mode_to_chip(self, device: int, mode: str) -> None:
+        for index in self.chip_indices(device):
+            channel = self.channels[index]
+            channel.srb1 = mode == REFERENCE_MODE_SRB1
+            if mode == REFERENCE_MODE_SRB2:
+                channel.srb2 = True
+            elif mode == REFERENCE_MODE_DIFFERENTIAL:
+                channel.srb2 = False
+            # SRB1 mode keeps the srb2 intent, which is unused while the chip is
+            # in SRB1 and comes back if the converter returns to SRB2.
+
+    def channel_connects_srb2(self, gui_index: int) -> bool:
+        """True when this input's INxP is tied to the SRB2 pin right now.
+
+        This is the non-inverting input, so a channel with this closed is *not*
+        referred to a negative reference: its INN still has to be wired.
+        """
+
+        if not (0 <= int(gui_index) < len(self.channels)):
+            return False
+        channel = self.channels[gui_index]
+        real = physical_channel_map(self.board_channels)[int(gui_index)]
+        if real is None or not channel.active:
+            return False
+        return bool(channel.srb2)
+
+    def channel_reference_short(self, gui_index: int) -> str:
+        """One-word description of how an input's two sides are connected."""
+
+        real = physical_channel_map(self.board_channels)[int(gui_index)]
+        if real is None:
+            return "n/a"
+        mode = self.chip_mode_for_real(real)
+        if mode == REFERENCE_MODE_SRB1:
+            return "SRB1"
+        if self.channel_connects_srb2(gui_index):
+            return "SRB2>INP"
+        return "own INN"
+
+    def reference_summary(self) -> str:
+        """Human readable reference state for the dock, including per-input mix."""
+
+        short = REFERENCE_MODE_SHORT_LABELS
+        modes = self.normalised_chip_modes()[: self.device_count]
+        parts: list[str] = []
+        for device, mode in enumerate(modes):
+            per_device = channels_per_device(self.board_channels)
+            inputs = [
+                gui_index
+                for gui_index, real in enumerate(physical_channel_map(self.board_channels))
+                if real is not None and (int(real) // max(per_device, 1)) == device
+                and self.channels[gui_index].active
+            ]
+            label = short.get(mode, mode)
+            if mode == REFERENCE_MODE_SRB2 and inputs:
+                driven = [index for index in inputs if self.channels[index].srb2]
+                if driven:
+                    shown = ", ".join(str(index + 1) for index in driven[:6])
+                    if len(driven) > 6:
+                        shown += "..."
+                    label = f"{label}, {len(driven)} INP driven by SRB2 ({shown})"
+            parts.append(f"ADS{device + 1}: {label}")
+        return "  |  ".join(parts)
+
+    def bias_channels(self) -> list[int]:
+        """Powered-up inputs currently feeding the bias/DRL amplifier."""
+
+        result: list[int] = []
+        for device in range(self.device_count):
+            for index in self.chip_indices(device):
+                if self.channels[index].bias:
+                    result.append(index)
+        return result
+
+    def reference_risks(self) -> list[str]:
+        """Reasons the current routing will read as floating or as saturation.
+
+        This is the check that was missing when an SRB2 setup "should" have worked:
+        SRB2 drives the non-inverting input, so a channel whose INN has no path is
+        an open input no matter how the register looks.
+        """
+
+        risks: list[str] = []
+        modes = self.resolve_chip_modes()
+        for device in range(self.device_count):
+            mode = modes[device]
+            inputs = self.chip_indices(device)
+            if mode == REFERENCE_MODE_SRB2:
+                driven = [index for index in inputs if self.channels[index].srb2]
+                if driven:
+                    risks.append(
+                        f"ADS{device + 1}: the SRB2 switch is closed on "
+                        + ", ".join(str(index + 1) for index in driven[:6])
+                        + ("..." if len(driven) > 6 else "")
+                        + ". That ties INxP to the SRB2 pin - it does not refer the channel to a "
+                        "negative reference. Those inputs measure SRB2 against their own INN, so INN "
+                        "must still be wired; for a reference electrode on the inverting input use SRB1."
+                    )
+        if not self.bias_channels():
+            active_reference = any(mode != REFERENCE_MODE_DIFFERENTIAL for mode in modes) or any(
+                self.channels[index].srb2
+                for device in range(self.device_count)
+                for index in self.chip_indices(device)
+            )
+            if active_reference:
+                risks.append(
+                    "No input feeds the bias/DRL amplifier, so the inputs have no DC return path. "
+                    "A referenced or SRB2-driven input without bias drifts to a rail and looks exactly "
+                    "like a floating electrode. Enable bias on at least one input and connect the BIAS "
+                    "electrode."
+                )
+        return risks
 
     @property
     def reference_mode_code(self) -> int:
@@ -697,6 +1126,12 @@ class HardwareSettings:
 
     @property
     def reference_mode_label(self) -> str:
+        modes = self.normalised_chip_modes()[: self.device_count]
+        short = REFERENCE_MODE_SHORT_LABELS
+        if len(set(modes)) > 1:
+            return " / ".join(
+                f"ADS{device + 1} {short.get(mode, mode)}" for device, mode in enumerate(modes)
+            )
         mode = self.normalised_reference_mode()
         for label, value in REFERENCE_MODE_CHOICES:
             if value == mode:
@@ -704,12 +1139,26 @@ class HardwareSettings:
         return mode
 
     @property
+    def data_rate_hz(self) -> float:
+        """ADS1299 output data rate (before the firmware's block averaging)."""
+
+        return float(SAMPLE_RATE_BY_CODE.get(int(self.sample_rate_code), 250))
+
+    @property
     def sample_rate_hz(self) -> float:
-        return sample_rate_for(self.sample_rate_code, self.board_channels)
+        return sample_rate_for(self.sample_rate_code, self.board_channels, self.decimation)
 
     @property
     def packet_rate_hz(self) -> float:
         return float(SAMPLE_RATE_BY_CODE.get(int(self.sample_rate_code), 250))
+
+    @property
+    def output_packet_rate_hz(self) -> float:
+        return output_packet_rate(self.sample_rate_code, self.decimation)
+
+    @property
+    def sinc_corner_hz(self) -> float:
+        return sinc3_corner_hz(self.data_rate_hz)
 
     def physical_gains(self) -> list[float]:
         """PGA scalar per physical ADS channel, in decoder order."""
@@ -747,10 +1196,39 @@ class HardwareSettings:
                 mode = REFERENCE_MODE_DIFFERENTIAL
             else:
                 mode = REFERENCE_MODE_SRB2
+        chip_modes = payload.get("chip_reference_modes")
+        if not isinstance(chip_modes, list) or not chip_modes:
+            chip_modes = [mode, mode]
+        chip_modes = [str(value) for value in chip_modes][:2]
+        # Migrate a saved per-converter mode into the channel rows, which are now
+        # the master. Older versions kept the mode separately and could leave the
+        # rows without the matching SRB1 flag, which would silently demote an SRB1
+        # converter to per-input routing.
+        per_device = channels_per_device(int(payload.get("board_channels", 16)))
+        mapping = physical_channel_map(int(payload.get("board_channels", 16)))
+        for device, chip_mode in enumerate(chip_modes):
+            if chip_mode != REFERENCE_MODE_SRB1:
+                continue
+            for gui_index, real in enumerate(mapping):
+                if real is None or gui_index >= len(channels):
+                    continue
+                if (int(real) // max(per_device, 1)) == device:
+                    channels[gui_index].srb1 = True
+        try:
+            spi_clock_hz = int(payload.get("spi_clock_hz", ADS_SPI_CLOCK_HZ) or ADS_SPI_CLOCK_HZ)
+        except (TypeError, ValueError):
+            spi_clock_hz = ADS_SPI_CLOCK_HZ
+        try:
+            decimation = int(payload.get("decimation", 1) or 1)
+        except (TypeError, ValueError):
+            decimation = 1
         return cls(
             board_channels=int(payload.get("board_channels", 16)),
             sample_rate_code=int(payload.get("sample_rate_code", 6)),
             reference_mode=mode,
+            chip_reference_modes=[str(value) for value in chip_modes][:2],
+            spi_clock_hz=spi_clock_hz,
+            decimation=decimation,
             channels=channels,
         )
 
@@ -759,6 +1237,9 @@ class HardwareSettings:
             "board_channels": int(self.board_channels),
             "sample_rate_code": int(self.sample_rate_code),
             "reference_mode": self.normalised_reference_mode(),
+            "chip_reference_modes": self.normalised_chip_modes(),
+            "spi_clock_hz": int(self.spi_clock_hz),
+            "decimation": int(self.decimation),
             "channels": [
                 {
                     "active": channel.active,
@@ -793,10 +1274,34 @@ class DeviceExpectation:
         return f"gain x{GAIN_SCALARS[min(gain_ordinal, 6)]}"
 
 
+def channel_register_value(setting: "ChannelSetting", chip_mode: str) -> int:
+    """The CHnSET byte the firmware should hold for one channel.
+
+    Mirrors ``ADS1299::configureChannel()``: powered-down channels carry 0x80 and
+    MUX = 001 (input shorted), the gain sits in bits 6:4, SRB2 is bit 3 and the
+    input type is bits 2:0.
+
+    Bit 3 closes the switch between the SRB2 pin and this channel's **INxP**
+    (non-inverting input). It is suppressed only while the converter is in SRB1
+    mode, where the whole chip is already referred to the SRB1 pin and closing
+    both would measure one reference pin against the other.
+    """
+
+    gain = min(max(int(setting.gain_ordinal), 0), 6)
+    if not setting.active:
+        return 0x80 | (gain << 4) | 0x01
+    srb2 = 0x08 if (chip_mode == REFERENCE_MODE_SRB2 and setting.srb2) else 0x00
+    return (gain << 4) | srb2 | (int(setting.input_ordinal) & 0x07)
+
+
 def channels_per_device(board_channels: int) -> int:
     """Real ADS channels behind each of the two converters."""
 
     return 6 if int(board_channels) > 8 else 4
+
+
+# ID register value per channel count (datasheet: NU_CH bits 7..3).
+DEVICE_ID_BY_CHANNELS = {4: 0x3C, 6: 0x3D, 8: 0x3E}
 
 
 def expected_device_registers(hardware: "HardwareSettings") -> list[DeviceExpectation]:
@@ -819,7 +1324,7 @@ def expected_device_registers(hardware: "HardwareSettings") -> list[DeviceExpect
         channel_regs: list[int] = []
         bias_sensp = 0
         bias_sensn = 0
-        srb1_any = False
+        chip_mode = hardware.chip_mode_for_real(device * per_device)
         for local in range(per_device):
             real = device * per_device + local
             gui_index = next((index for index, value in enumerate(mapping) if value == real), None)
@@ -833,13 +1338,13 @@ def expected_device_registers(hardware: "HardwareSettings") -> list[DeviceExpect
             if not setting.active:
                 channel_regs.append(0x80 | (gain << 4) | 0x01)
                 continue
-            value = (gain << 4) | (0x08 if setting.srb2 else 0x00) | (int(setting.input_ordinal) & 0x07)
-            channel_regs.append(value)
+            # SRB2 is only in the CHnSET byte while the converter is in SRB2
+            # mode, which is what keeps a true-differential monitor input
+            # differential on an otherwise SRB2-referred chip.
+            channel_regs.append(channel_register_value(setting, chip_mode))
             if setting.bias:
                 bias_sensp |= 1 << local
                 bias_sensn |= 1 << local
-            if setting.srb1:
-                srb1_any = True
         expectations.append(
             DeviceExpectation(
                 name=f"ADS{device + 1}",
@@ -849,7 +1354,7 @@ def expected_device_registers(hardware: "HardwareSettings") -> list[DeviceExpect
                 channel_regs=channel_regs,
                 bias_sensp=bias_sensp,
                 bias_sensn=bias_sensn,
-                misc1=0x20 if srb1_any else 0x00,
+                misc1=0x20 if chip_mode == REFERENCE_MODE_SRB1 else 0x00,
             )
         )
     return expectations
@@ -863,13 +1368,33 @@ class RegisterCheck:
     label: str
     actual: int
     expected: int
+    mask: int = 0xFF
 
     @property
     def matches(self) -> bool:
-        return self.actual == self.expected
+        return (self.actual & self.mask) == (self.expected & self.mask)
 
     def describe(self) -> str:
         return f"{self.device} {self.label} 0x{self.actual:02X}, expected 0x{self.expected:02X}"
+
+
+# Reserved bits of CONFIG1 and CONFIG2 read back as 0 on this part - so does
+# DAISY_EN (CONFIG1 b6) and INT_CAL (CONFIG2 b4) - while CONFIG3, MISC1 and the
+# CHnSET bytes read back exactly. Comparing whole bytes therefore reported a
+# mismatch on a converter that is configured correctly and is streaming happily,
+# which is worse than useless. Only the bits that decide behaviour and that the
+# readback actually reflects are compared:
+#
+#   CONFIG1: CLK_EN (b5) | DR[2:0]                          -> 0x27
+#   CONFIG2: INT_CAL (b4) | CAL_AMP (b2) | CAL_FREQ[1:0]    -> 0x17
+#
+# DAISY_EN is verified through the ACK of the write and the fact that both
+# converters deliver samples; it is shown raw in the board-report line instead.
+COMPARE_MASKS = {0x01: 0x27, 0x02: 0x17}
+
+# The test-signal settings only mean anything while INT_CAL is on, so a stale
+# CAL_FREQ left over from a test-signal run must not look like a fault.
+CONFIG2_CAL_MASK = 0x07
 
 
 def compare_configuration(
@@ -885,13 +1410,19 @@ def compare_configuration(
 
     checks: list[RegisterCheck] = []
     notes: list[str] = []
+    expected_id = DEVICE_ID_BY_CHANNELS.get(channels_per_device(hardware.board_channels), 0x3E)
     for expectation in expected_device_registers(hardware):
         regs = report.get(expectation.name)
         if not regs or len(regs) < 0x18:
             notes.append(f"{expectation.name} did not report registers")
             continue
-        if regs[0] not in (0x3E, 0x3F):
-            notes.append(f"{expectation.name} reports device ID 0x{regs[0]:02X}")
+        if regs[0] != expected_id:
+            # 0x3C/0x3D/0x3E are the ADS1299-4/-6/-8 IDs. Anything else means the
+            # chip did not answer, so say so instead of blaming a channel.
+            notes.append(
+                f"{expectation.name} reports device ID 0x{regs[0]:02X}, expected 0x{expected_id:02X} "
+                f"for {channels_per_device(hardware.board_channels)} channels"
+            )
         for address, expected in (
             (0x01, expectation.config1),
             (0x02, expectation.config2),
@@ -901,8 +1432,17 @@ def compare_configuration(
             (0x15, expectation.misc1),
         ):
             actual = regs[address]
-            if actual != expected:
-                checks.append(RegisterCheck(expectation.name, REGISTER_LABELS[address], actual, expected))
+            mask = COMPARE_MASKS.get(address, 0xFF)
+            if address == 0x02 and not (actual & 0x10) and not (expected & 0x10):
+                # Test signal off on both sides: CAL_AMP/CAL_FREQ are don't-care,
+                # so a leftover CAL_FREQ from an earlier test-signal run must not
+                # read as a configuration fault.
+                mask = 0x10
+            check = RegisterCheck(
+                expectation.name, REGISTER_LABELS[address], actual, expected, mask
+            )
+            if not check.matches:
+                checks.append(check)
         for local, expected in enumerate(expectation.channel_regs):
             actual = regs[0x05 + local]
             if actual != expected:
@@ -911,8 +1451,7 @@ def compare_configuration(
 
 
 REGISTER_LABELS = {
-    0x00: "ID",
-    0x01: "CONFIG1",
+    0x00: "ID",    0x01: "CONFIG1",
     0x02: "CONFIG2",
     0x03: "CONFIG3",
     0x04: "LOFF",
@@ -936,6 +1475,75 @@ REGISTER_LABELS = {
     0x16: "MISC2",
     0x17: "CONFIG4",
 }
+
+
+@dataclass(slots=True)
+class RepairReport:
+    """Result of the firmware's own repair-and-verify pass (``>`` command)."""
+
+    devices: list[dict[str, object]] = field(default_factory=list)
+    bad_registers: list[str] = field(default_factory=list)
+    problems: int = 0
+    summary: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return self.problems == 0 and bool(self.devices)
+
+    def describe(self) -> str:
+        if not self.devices:
+            return "The board did not answer the repair command."
+        parts = [
+            f"{device.get('DEV', '?')} ID 0x{int(device.get('ID', '0'), 16):02X}, "
+            f"{device.get('REGOK', '?')}/{device.get('CHECKED', '?')} registers match"
+            if str(device.get("ID", "")).strip()
+            else f"{device.get('DEV', '?')} not linked"
+            for device in self.devices
+        ]
+        verdict = "configuration repaired and verified" if self.ok else f"{self.problems} register(s) still wrong"
+        return f"{verdict}: " + "; ".join(parts)
+
+
+def parse_repair_report(lines: Sequence[str]) -> RepairReport:
+    """Collect the ``[CHK]`` lines the firmware prints for a repair pass."""
+
+    report = RepairReport()
+    for line in lines:
+        text = str(line).strip()
+        if not text.startswith("[CHK]"):
+            continue
+        fields = dict(token.split("=", 1) for token in text[len("[CHK]"):].split() if "=" in token)
+        if "REASON" in fields:
+            report.summary = fields
+            try:
+                report.problems = int(fields.get("PROBLEMS", "0"))
+            except ValueError:
+                report.problems = 0
+        elif " BAD " in f" {text} ":
+            report.bad_registers.append(
+                f"{fields.get('DEV', '?')} {fields.get('REG', '?')} "
+                f"0x{fields.get('GOT', '??')}, expected 0x{fields.get('WANT', '??')}"
+            )
+        elif "DEV" in fields:
+            report.devices.append(fields)
+    return report
+
+
+def parse_configuration_links(lines: Sequence[str]) -> dict[str, bool]:
+    """Which converters said they were on the SPI bus, from the ``[CFG]`` lines."""
+
+    links: dict[str, bool] = {}
+    for line in lines:
+        text = line.strip()
+        if not text.startswith("[CFG]"):
+            continue
+        fields = dict(
+            token.split("=", 1) for token in text[len("[CFG]"):].split() if "=" in token
+        )
+        name = fields.get("DEV")
+        if name:
+            links[name] = fields.get("LINK", "1") != "0"
+    return links
 
 
 def parse_configuration_report(lines: Sequence[str]) -> dict[str, list[int]]:
@@ -983,6 +1591,10 @@ class ViewSettings:
     accel_motion_threshold_g: float = 0.08
     accel_baseline_seconds: float = 2.0
     accel_counts_per_g: float = ACCEL_COUNTS_PER_G
+    # Channel wired across the applied stimulus. It gets its own plot/FFT with its
+    # own scale, is excluded from the main views and forced to PGA x1.
+    reference_channel: str = ""
+    reference_fft_scale_uv: float = 1000.0
     notch_50: bool = False
     notch_100: bool = False
     notch_q: float = 30.0
@@ -1033,6 +1645,9 @@ class AppSettings:
     output_dir: str = "recordings"
     auto_connect: bool = True
     measurement: dict[str, object] = field(default_factory=dict)
+    # Everything the automated function-generator sweep remembers (resource,
+    # amplitude, drive mode, frequency list, dwell rules, monitor channel).
+    sweep: dict[str, object] = field(default_factory=dict)
     version: int = SETTINGS_VERSION
 
     def as_dict(self) -> dict[str, object]:
@@ -1050,6 +1665,7 @@ class AppSettings:
                 "output_dir": self.output_dir,
                 "measurement": dict(self.measurement),
             },
+            "sweep": dict(self.sweep),
         }
 
     @classmethod
@@ -1071,6 +1687,7 @@ class AppSettings:
             output_dir=str(recording.get("output_dir", "recordings")),
             auto_connect=bool(connection.get("auto_connect", True)),
             measurement=dict(recording.get("measurement") or {}) if isinstance(recording.get("measurement"), dict) else {},
+            sweep=dict(payload.get("sweep") or {}) if isinstance(payload.get("sweep"), dict) else {},
             version=version,
         )
         settings.migrate()
@@ -1096,6 +1713,16 @@ class AppSettings:
                 channel.active = True
                 channel.gain_ordinal = 6
                 channel.input_ordinal = 0
+        if self.version < 5:
+            # Version 5 added per-converter reference modes, a selectable SPI
+            # clock and MCU-side block averaging. Existing files keep working at
+            # 2 MHz / no averaging / the same reference on both chips.
+            self.hardware.chip_reference_modes = [
+                self.hardware.normalised_reference_mode(),
+                self.hardware.normalised_reference_mode(),
+            ]
+            self.hardware.spi_clock_hz = ADS_SPI_CLOCK_HZ
+            self.hardware.decimation = 1
         self.hardware.sync_reference()
         self.version = SETTINGS_VERSION
 
@@ -1166,6 +1793,22 @@ class OpenBCIRecording:
         self._thread: Optional[threading.Thread] = None
         self._rows_written = 0
         self._error: Optional[str] = None
+        # Rows still to stamp with Marker=1. Set by mark(), consumed by the writer
+        # thread, so a marker is the same instant in this file and on the card.
+        self._mark_rows = 0
+        self._mark_lock = threading.Lock()
+
+    def mark(self, rows: int = 1) -> None:
+        """Stamp the next ``rows`` data rows with Marker=1.
+
+        The window sends the board's marker command at the same moment, so the two
+        files end up holding one shared instant. Without it the comparison tool can
+        only guess the offset by correlating the traces, which is ambiguous for any
+        periodic signal.
+        """
+
+        with self._mark_lock:
+            self._mark_rows = max(int(rows), 0)
 
     @property
     def rows_written(self) -> int:
@@ -1237,7 +1880,13 @@ class OpenBCIRecording:
                     self._rows_written += 1
                     values = ",".join(f"{value:.4f}" for value in data[row])
                     accel_values = ",".join(f"{value:.5f}" for value in accel[row])
-                    buffer.append(f"{self._rows_written},{values},{accel_values},0,{times[row]:.6f}\n")
+                    with self._mark_lock:
+                        marker = 1 if self._mark_rows > 0 else 0
+                        if self._mark_rows > 0:
+                            self._mark_rows -= 1
+                    buffer.append(
+                        f"{self._rows_written},{values},{accel_values},{marker},{times[row]:.6f}\n"
+                    )
                 if len(buffer) >= 512:
                     self._handle.writelines(buffer)
                     self._handle.flush()
@@ -1313,6 +1962,16 @@ class DemoBoardPort:
         self._start_time = time.monotonic()
         self._stream_start = self._start_time
         self._stream_base = 0
+        self.bt_buffer_bytes = 24576
+        self.bluetooth_mode = "bt"
+        self.bluetooth_client = True
+        self.bluetooth_tx_dbm = 4
+        self.bluetooth_sent = 0
+        self.bluetooth_dropped = 0
+        self.bluetooth_opens = 1
+        self.bluetooth_closes = 0
+        self.bluetooth_rejected = 0
+        self.bluetooth_write_failures = 0
 
     @property
     def is_open(self) -> bool:
@@ -1400,6 +2059,22 @@ class DemoBoardPort:
                 self._emit_text("Failure: sample rate out of bounds")
             elif char == "?":
                 self._emit_text("Board ADS Registers\nCH1SET=0x61 CH2SET=0x61\n$$$", terminator="")
+            elif char == "Q":
+                end = data.find(b"Q", index + 1)
+                if end < 0:
+                    break
+                digits = data[index + 1 : end].decode("ascii", errors="replace")
+                if digits.isdigit() and 2 <= int(digits) <= 64:
+                    self.bt_buffer_bytes = int(digits) * 1024
+                    self._emit_text(f"Success: bluetooth buffer set to {int(digits)} kB")
+                else:
+                    self._emit_text("Failure: buffer size out of range (2..64 kB)")
+                index = end + 1
+                continue
+            elif char == "T":
+                self._emit_text(self.bluetooth_report_text())
+            elif char == "B":
+                self._emit_text(self.bluetooth_log_text(), terminator="")
             elif char == "P":
                 self._emit_configuration_report()
             elif char == "N":
@@ -1420,6 +2095,42 @@ class DemoBoardPort:
                         continue
                 self._emit_text("Failure: invalid reference mode (0=diff, 1=SRB1, 2=SRB2)")
             index += 1
+
+    def bluetooth_health_text(self) -> str:
+        """The ``#BT`` line the firmware emits every 500 ms."""
+
+        used = min(self.bt_buffer_bytes // 8, self.bt_buffer_bytes)
+        return (
+            f"#BT mode={self.bluetooth_mode} client={1 if self.bluetooth_client else 0} "
+            f"boots=1 up=42s opens={self.bluetooth_opens} closes={self.bluetooth_closes} "
+            f"remote=0 rej={self.bluetooth_rejected} fail={self.bluetooth_write_failures} "
+            f"heap=210000 name=SZD_EEG txdbm={self.bluetooth_tx_dbm} buf={used} "
+            f"bufsize={self.bt_buffer_bytes} sent={self.bluetooth_sent} "
+            f"dropped={self.bluetooth_dropped} crc=0x1A2B crc_n=32\n"
+        )
+
+    def bluetooth_report_text(self) -> str:
+        return (
+            "Success: BT name=SZD_EEG client=1 link=bt boots=1 uptime=42s "
+            f"opens=1 closes=0 remote=0 rejected=0 writefail=0 heap=210000 "
+            f"buffer=0/{self.bt_buffer_bytes} sent={self.bluetooth_sent} "
+            f"dropped={self.bluetooth_dropped} crc=0x1A2B"
+        )
+
+    def acquisition_health_text(self) -> str:
+        """The ``#DX`` line the firmware emits once a second while streaming."""
+
+        rate = self._packet_rate_hz()
+        return (
+            f"#DX ch_rate={rate / 2.0:.1f} pkt_rate={rate:.1f} drdy_s={rate * 2:.1f} "
+            f"pkts={self._counter} miss=0 late=0 gap_max_us=2000 corrupt=0 spi_us=110 spi_max_us=118 "
+            f"usb_free=3900 bt_buf=0 core=1 prio=22\n"
+        )
+
+    def bluetooth_log_text(self) -> str:
+        events = ["boot=1 reset=1(power-on)", "ready txdbm=4 power=ok heap=210000", "spp server started"]
+        events.append("open handle=1 status=0")
+        return "\n".join(f"#BTLOG {event}" for event in events) + "\n"
 
     def _emit_configuration_report(self) -> None:
         """Answer the firmware's ``P`` command with the same ``[CFG]`` lines."""
@@ -1509,6 +2220,8 @@ class DemoBoardPort:
 
     def _run(self) -> None:
         period = 1.0 / self._packet_rate_hz()
+        self._last_health = time.monotonic()
+        self._last_dx = time.monotonic()
         if self.notify_boot:
             boot = (
                 "=== OpenBCI ESP32 power-on self test ===\n"
@@ -1531,8 +2244,15 @@ class DemoBoardPort:
                     packets.extend(self._build_packet(now - self._stream_start))
                     emitted += 1
                 if packets:
+                    self.bluetooth_sent += emitted
                     with self._lock:
                         self._rx.extend(packets)
+                if now - self._last_health >= 0.5:
+                    self._last_health = now
+                    self._emit_text(self.bluetooth_health_text(), terminator="")
+                if now - self._last_dx >= 1.0:
+                    self._last_dx = now
+                    self._emit_text(self.acquisition_health_text(), terminator="")
             time.sleep(0.007)
 
     def _build_packet(self, elapsed: float) -> bytes:

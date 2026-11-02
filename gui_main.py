@@ -29,11 +29,14 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -57,6 +60,7 @@ from report_export import (
     ReportWriter,
     full_export_stem,
     install_wheel_guard,
+    parse_voltage,
 )
 from data_loader import (
     CsvPreview,
@@ -77,8 +81,243 @@ from fft_analysis import (
     compute_cmrr_sweep,
     compute_crosstalk_sweep,
     compute_gain_sweep,
+    compute_planned_cmrr_sweep,
+    compute_planned_crosstalk_sweep,
+    compute_planned_gain_sweep,
+    compute_reference_cmrr_sweep,
+    detect_tone_frequency,
+    fit_tone_rms,
+    parse_sweep_steps,
 )
 from signal_processing import FilterSettings, apply_filters, extract_time_region, hard_remove_ranges, keep_only_range, merge_ranges
+from recording_compare import compare_recordings
+
+
+# Sweep curves were thin enough to lose behind the grid on a 2560-wide screen.
+SWEEP_TRACE_WIDTH = 2.4
+SWEEP_FIT_WIDTH = 2.0
+SWEEP_FIT_COLOR = (70, 82, 100)
+# Entry in the CMRR monitor combo that means "work the frequency out from the
+# channel under test".
+NO_MONITOR_CHANNEL = "(none)"
+
+
+def resolve_channel_name(reference: str, channel_names: Sequence[str]) -> str:
+    """Match a recorded channel label to one of the dataset's column names.
+
+    The recorder names a reference as ``CH 1`` (its own label), while the CSV
+    columns are ``EXG Channel 0`` and so on. Comparing the two literally never
+    matches, which is why a recorded reference used to be ignored instead of
+    excluded from the plots. This accepts either form, plus a bare number.
+    """
+
+    text = str(reference or "").strip()
+    if not text:
+        return ""
+    names = [str(name) for name in channel_names]
+    if text in names:
+        return text
+    lowered = {name.lower(): name for name in names}
+    if text.lower() in lowered:
+        return lowered[text.lower()]
+
+    # "CH 3" -> third channel; "EXG Channel 2" -> third channel as well, since the
+    # two conventions differ by one. Prefer the CH form because that is what the
+    # recorder writes.
+    digits = "".join(character for character in text if character.isdigit())
+    if not digits:
+        return ""
+    number = int(digits)
+    upper = text.upper()
+    looks_one_based = upper.startswith("CH ") or upper.startswith("CHANNEL") or upper == f"CH{digits}"
+    if looks_one_based:
+        zero_based = number - 1
+        if 0 <= zero_based < len(names):
+            return names[zero_based]
+        return ""
+    # Already a column name with an index, e.g. "EXG Channel 2".
+    for name in names:
+        if name.lower().endswith(str(number)):
+            return name
+    return ""
+
+# Sweep figures are drawn over the measurement band only. A fixed 0..125 Hz axis
+# replaces the auto range, which used to leave half the plot empty (-50..250 Hz).
+SWEEP_X_MAX_HZ = 125.0
+# Height/width for the FFT figure in the report: a wide strip instead of a
+# narrow column that came out of the tab layout.
+FFT_FIGURE_ASPECT = 0.42
+
+
+def _metadata_float(metadata: dict[str, str], key: str) -> float:
+    try:
+        return float(str(metadata.get(key, "") or "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _sweep_amplitude_vrms(metadata: dict[str, str]) -> float:
+    """Applied sine amplitude in Vrms, whichever key the recording carries.
+
+    Everything is Vrms now. Recordings made before that change stored Vpp, so the
+    old key is converted rather than silently mistreated as an RMS value.
+    """
+
+    vrms = _metadata_float(metadata, "Sweep Amplitude (Vrms)")
+    if vrms > 0:
+        return vrms
+    vpp = _metadata_float(metadata, "Sweep Amplitude (Vpp)")
+    return vpp / (2.0 * np.sqrt(2.0)) if vpp > 0 else 0.0
+SWEEP_FIT_ORDERS = (
+    ("No fit", 0),
+    ("Order 2", 2),
+    ("Order 3", 3),
+    ("Order 4", 4),
+)
+SWEEP_FIT_REFERENCE_HZ = 50.0
+# Reported sweep figures are re-laid out wider than the on-screen widget so the
+# legend and the swept points stay readable at page width.
+SWEEP_FIGURE_ASPECT = 0.42
+SWEEP_FIGURE_MAX_HEIGHT = 0.55
+# Height of one sweep figure inside the scrollable area. Tall enough to read, short
+# enough that four of them are reachable with one scroll gesture.
+SWEEP_PLOT_HEIGHT = 260
+
+
+class RecordingComparisonDialog(QDialog):
+    """Compare a live recording with the board's own SD-card recording.
+
+    Deliberately not part of the main layout: it answers a bench question ("did
+    the card lose anything, and did the two recordings start together?"), not an
+    analysis question, so it opens from the menu and closes again.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Compare two recordings")
+        self.resize(940, 720)
+        self.setWindowFlag(Qt.WindowType.Window, True)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        intro = QLabel(
+            "Pick the live recording and the copy the board wrote to its SD card. The comparison "
+            "reports how far apart the two timelines are, whether either is missing samples, and "
+            "whether the traces actually correlate - which is what tells you if the card kept up."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QGridLayout()
+        self.file_a_edit = QLineEdit()
+        self.file_b_edit = QLineEdit()
+        for row, (label, edit) in enumerate(
+            (("Recording A (live)", self.file_a_edit), ("Recording B (SD card)", self.file_b_edit))
+        ):
+            form.addWidget(QLabel(label), row, 0)
+            form.addWidget(edit, row, 1)
+            browse = QPushButton("Browse...")
+            browse.clicked.connect(lambda _checked=False, target=edit: self._browse(target))
+            form.addWidget(browse, row, 2)
+        layout.addLayout(form)
+
+        button_row = QHBoxLayout()
+        self.compare_button = QPushButton("Compare")
+        self.compare_button.clicked.connect(self._compare)
+        button_row.addWidget(self.compare_button)
+        self.swap_button = QPushButton("Swap")
+        self.swap_button.setToolTip("Compare the other way round (start offset is signed)")
+        self.swap_button.clicked.connect(self._swap)
+        button_row.addWidget(self.swap_button)
+        button_row.addStretch(1)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        self.result_view = QPlainTextEdit()
+        self.result_view.setReadOnly(True)
+        self.result_view.setStyleSheet("font-family: Consolas; font-size: 12px;")
+        self.result_view.setPlaceholderText("The comparison appears here.")
+        layout.addWidget(self.result_view, 1)
+
+    def set_first_file(self, path) -> None:
+        self.file_a_edit.setText(str(path))
+
+    def _browse(self, target: QLineEdit) -> None:
+        start = target.text().strip() or str(Path.cwd())
+        chosen, _filter = QFileDialog.getOpenFileName(
+            self, "Choose a recording", start, "Recordings (*.csv *.CSV);;All files (*)"
+        )
+        if chosen:
+            target.setText(chosen)
+
+    def _swap(self) -> None:
+        a, b = self.file_a_edit.text(), self.file_b_edit.text()
+        self.file_a_edit.setText(b)
+        self.file_b_edit.setText(a)
+
+    def _compare(self) -> None:
+        path_a = self.file_a_edit.text().strip()
+        path_b = self.file_b_edit.text().strip()
+        if not path_a or not path_b:
+            QMessageBox.information(self, "Compare", "Choose both recordings first.")
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result = compare_recordings(path_a, path_b)
+        except (OSError, ValueError) as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "Compare", f"Could not compare the files.\\n\\n{exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.result_view.setPlainText(result.report())
+
+
+class PlotScrollArea(QScrollArea):
+    """Vertical scroll area whose plots zoom on the mouse wheel.
+
+    Four stacked sweep figures do not fit on any monitor, so the area scrolls.
+    The wheel zooms the plot under the cursor (which is what "zoomable" means
+    here) and Shift+wheel scrolls the page, so both actions stay reachable
+    without a modifier-free ambiguity.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        scrolling = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        plot = None if scrolling else self._plot_under(event)
+        if plot is None:
+            super().wheelEvent(event)
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        factor = 0.82 if delta > 0 else 1.0 / 0.82
+        view_box = plot.getPlotItem().getViewBox()
+        view_box.scaleBy((factor, factor))
+        # Auto-range would undo the zoom on the next redraw.
+        view_box.disableAutoRange()
+        event.accept()
+
+    def _plot_under(self, event) -> Optional[pg.PlotWidget]:
+        widget = self.widget()
+        if widget is None:
+            return None
+        position = event.position().toPoint()
+        child = widget.childAt(widget.mapFrom(self.viewport(), position))
+        while child is not None:
+            if isinstance(child, pg.PlotWidget):
+                return child
+            child = child.parentWidget()
+        return None
 
 
 @dataclass(slots=True)
@@ -295,6 +534,13 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.crosstalk_sweep_df = pd.DataFrame()
         self.gain_sweep_df = pd.DataFrame()
         self.cmrr_sweep_df = pd.DataFrame()
+        self.crosstalk_sweep_fit_df = pd.DataFrame()
+        self.gain_sweep_fit_df = pd.DataFrame()
+        self.cmrr_sweep_fit_df = pd.DataFrame()
+        self.cmrr_reference_df = pd.DataFrame()
+        self.cmrr_mean_fit_df = pd.DataFrame()
+        self.cmrr_mean_fit_hz = float("nan")
+        self.cmrr_reference_fit_hz = float("nan")
         self.spectra: list[SpectrumResult] = []
         self.channel_checks: dict[str, QCheckBox] = {}
         self.channel_fft_checks: dict[str, QCheckBox] = {}
@@ -372,6 +618,26 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         live_action = QAction("Live recorder", self)
         live_action.triggered.connect(self.open_live_recorder)
         window_menu.addAction(live_action)
+
+        # Comparing a live recording with the SD-card copy is a diagnostic tool,
+        # not part of the normal analysis flow, so it lives here rather than in
+        # the layout: it opens on demand and closes again.
+        tools_menu = self.menuBar().addMenu("Tools")
+        compare_action = QAction("Compare two recordings...", self)
+        compare_action.setToolTip(
+            "Check a live recording against the board's SD-card copy: start/end offset, "
+            "missing samples and timeline damage."
+        )
+        compare_action.triggered.connect(self.open_recording_comparison)
+        tools_menu.addAction(compare_action)
+
+    def open_recording_comparison(self) -> None:
+        """Open the live-versus-SD comparison window (own top-level dialog)."""
+
+        dialog = RecordingComparisonDialog(self)
+        if self.dataset is not None:
+            dialog.set_first_file(self.dataset.file_path)
+        dialog.exec()
 
     def open_live_recorder(self) -> None:
         """Open the acquisition window, reusing this analyzer for its results."""
@@ -471,8 +737,10 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         bottom_splitter.addWidget(result_tabs)
 
         splitter.setSizes([360, self._default_window_size().width() - 380])
-        right_splitter.setSizes([600, 340])
-        bottom_splitter.setSizes([740, 540])
+        # The sweep tabs stack several figures plus their controls, so the lower
+        # half needs real height and width or every figure is a 70 px slit.
+        right_splitter.setSizes([520, 430])
+        bottom_splitter.setSizes([660, 620])
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Load an OpenBCI CSV recording to begin.")
@@ -596,6 +864,515 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self._on_fundamental_mode_changed()
         return page
 
+    # -- sweep options, fitting and legends -------------------------------
+
+    def _scroll_row(self, row: QHBoxLayout) -> QScrollArea:
+        """Let a wide control row scroll sideways instead of demanding a wide panel.
+
+        These rows hold a dozen controls, so their combined minimum width used to
+        force the whole results tab - and with it the right-hand column - to about
+        2400 px, which does not fit any monitor. Scrolling the row keeps every
+        control reachable at any panel width.
+        """
+
+        holder = QWidget()
+        holder.setLayout(row)
+        row.setContentsMargins(0, 0, 0, 0)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        area.setWidget(holder)
+        area.setFixedHeight(holder.sizeHint().height() + 18)
+        return area
+
+    def _add_sweep_options(self, prefix: str, layout, plot: pg.PlotWidget) -> None:
+        """Hold time, mains exclusion and curve fitting, shared by all sweeps."""
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Min hold"))
+        hold_spin = QDoubleSpinBox()
+        hold_spin.setRange(0.0, 30.0)
+        hold_spin.setDecimals(2)
+        hold_spin.setSingleStep(0.1)
+        hold_spin.setValue(1.0)
+        hold_spin.setSuffix(" s")
+        hold_spin.setToolTip(
+            "How long the generator holds one frequency. A step only counts once at least two "
+            "consecutive windows agree on the tone, so the transition between steps is ignored."
+        )
+        row.addWidget(hold_spin)
+
+        mains_button = QPushButton("Exclude 50/100 Hz")
+        mains_button.setCheckable(True)
+        mains_button.setToolTip("Leave the mains points out of the sweep, curve fit and 50 Hz value")
+        row.addWidget(mains_button)
+
+        downward_check = QCheckBox("Downward sweep")
+        downward_check.setChecked(True)
+        downward_check.setToolTip(
+            "Start high and step down. The fundamental can then never move up, so the intermodulation "
+            "products of the tone with the mains (100 +/- f, which are louder than the tone itself at low "
+            "frequency) are not mistaken for the applied signal."
+        )
+        row.addWidget(downward_check)
+
+        row.addWidget(QLabel("Lock"))
+        lock_spin = QDoubleSpinBox()
+        lock_spin.setRange(0.01, 20.0)
+        lock_spin.setDecimals(2)
+        lock_spin.setSingleStep(0.1)
+        lock_spin.setValue(0.5)
+        lock_spin.setSuffix(" Hz")
+        lock_spin.setToolTip(
+            "How far two windows may differ and still count as the same step. The generator must hold a "
+            "frequency within this band for the whole minimum hold before the step is locked in."
+        )
+        row.addWidget(lock_spin)
+
+        row.addWidget(QLabel("Min SNR"))
+        snr_spin = QDoubleSpinBox()
+        snr_spin.setRange(-40.0, 30.0)
+        snr_spin.setDecimals(1)
+        snr_spin.setSingleStep(1.0)
+        snr_spin.setValue(-20.0)
+        snr_spin.setSuffix(" dB")
+        snr_spin.setToolTip(
+            "Reject a window whose tracked tone is weaker than this against everything else in the window. "
+            "The default (-20 dB) effectively disables it, because a high-CMRR point at low frequency is "
+            "exactly a small tone among louder interferers."
+        )
+        row.addWidget(snr_spin)
+
+        row.addWidget(QLabel("Curve fit"))
+        fit_combo = QComboBox()
+        for label, order in SWEEP_FIT_ORDERS:
+            fit_combo.addItem(label, order)
+        # A third-order fit in log10(f) is the useful default: it follows the
+        # rolled-off response without chasing single noisy points.
+        fit_combo.setCurrentIndex(max(fit_combo.findData(3), 0))
+        fit_combo.setToolTip("Polynomial in log10(frequency), fitted through the swept points")
+        row.addWidget(fit_combo)
+
+        fit_check = QCheckBox("Show fit")
+        fit_check.setChecked(True)
+        row.addWidget(fit_check)
+
+        fit_label = QLabel("")
+        # Wrapping keeps a long "mean (min .. max)" summary from widening the
+        # window; the label only has to be readable, not on one line.
+        fit_label.setWordWrap(True)
+        fit_label.setMinimumWidth(160)
+        row.addWidget(fit_label, 1)
+        layout.addWidget(self._scroll_row(row))
+
+        setattr(self, f"{prefix}_sweep_hold_spin", hold_spin)
+        setattr(self, f"{prefix}_sweep_mains_button", mains_button)
+        setattr(self, f"{prefix}_sweep_downward_check", downward_check)
+        setattr(self, f"{prefix}_sweep_lock_spin", lock_spin)
+        setattr(self, f"{prefix}_sweep_snr_spin", snr_spin)
+        setattr(self, f"{prefix}_sweep_fit_combo", fit_combo)
+        setattr(self, f"{prefix}_sweep_fit_check", fit_check)
+        setattr(self, f"{prefix}_sweep_fit_label", fit_label)
+        setattr(self, f"{prefix}_sweep_fit_curves", [])
+
+        for widget in (hold_spin, lock_spin, snr_spin):
+            widget.valueChanged.connect(lambda *_: self._mark_sweep_stale_for(prefix))
+        downward_check.toggled.connect(lambda *_: self._mark_sweep_stale_for(prefix))
+        mains_button.toggled.connect(lambda *_: self._mark_sweep_stale_for(prefix))
+        fit_combo.currentIndexChanged.connect(self._on_sweep_fit_changed)
+        fit_check.toggled.connect(self._on_sweep_fit_changed)
+
+        legend = plot.addLegend(offset=(-10, 10), labelTextSize="11pt", brush=(255, 255, 255, 210))
+        legend.setColumnCount(2)
+        setattr(self, f"{prefix}_sweep_legend", legend)
+
+    def _sweep_info_text(self, prefix: str, head: str, accepted: int, rejected: int) -> str:
+        """One-line status under the sweep controls."""
+
+        parts = [head, f"{accepted} ok", f"{rejected} rej"]
+        if self._sweep_exclude_mains(prefix):
+            parts.append("50/100 Hz excluded")
+        if getattr(self, f"{prefix}_sweep_downward_check").isChecked():
+            parts.append("downward lock")
+        parts.append("notch on")
+        return " | ".join(parts)
+
+    def _sweep_hold_seconds(self, prefix: str) -> float:
+        spin = getattr(self, f"{prefix}_sweep_hold_spin", None)
+        return float(spin.value()) if spin is not None else 0.0
+
+    def _sweep_tracking_options(self, prefix: str) -> dict[str, object]:
+        """Fundamental-tracking settings shared by the three sweeps."""
+
+        return {
+            "downward_only": bool(getattr(self, f"{prefix}_sweep_downward_check").isChecked()),
+            "lock_tolerance_hz": float(getattr(self, f"{prefix}_sweep_lock_spin").value()),
+            "min_local_snr_db": float(getattr(self, f"{prefix}_sweep_snr_spin").value()),
+        }
+
+    def _sweep_exclude_mains(self, prefix: str) -> bool:
+        button = getattr(self, f"{prefix}_sweep_mains_button", None)
+        return bool(button.isChecked()) if button is not None else False
+
+    def _sweep_fit_order(self, prefix: str) -> int:
+        combo = getattr(self, f"{prefix}_sweep_fit_combo", None)
+        return int(combo.currentData() or 0) if combo is not None else 0
+
+    def _mark_sweep_stale_for(self, prefix: str) -> None:
+        """Throw away one sweep's results after its options changed."""
+
+        setattr(self, f"{prefix}_sweep_df", pd.DataFrame())
+        setattr(self, f"{prefix}_sweep_fit_df", pd.DataFrame())
+        getattr(self, f"_clear_{prefix}_sweep_plot")()
+        getattr(self, f"{prefix}_sweep_info_label").setText("Sweep stale - recompute")
+
+    def _on_sweep_fit_changed(self, *_args) -> None:
+        for prefix, builder in (
+            ("cmrr", self._redraw_cmrr_sweep_fit),
+            ("crosstalk", self._redraw_crosstalk_sweep_fit),
+            ("gain", self._redraw_gain_sweep_fit),
+        ):
+            builder(prefix)
+
+    @staticmethod
+    def _fit_sweep_curve(
+        frequencies: np.ndarray,
+        values: np.ndarray,
+        order: int,
+        reference_hz: float = SWEEP_FIT_REFERENCE_HZ,
+    ) -> Optional[dict[str, object]]:
+        """Fit a polynomial in log10(frequency) and evaluate it at the reference."""
+
+        if order <= 0:
+            return None
+        frequencies = np.asarray(frequencies, dtype=np.float64)
+        values = np.asarray(values, dtype=np.float64)
+        finite = np.isfinite(frequencies) & np.isfinite(values) & (frequencies > 0)
+        frequencies = frequencies[finite]
+        values = values[finite]
+        if frequencies.size < order + 1 or np.unique(frequencies).size < order + 1:
+            return None
+        log_frequency = np.log10(frequencies)
+        coefficients = np.polyfit(log_frequency, values, order)
+        grid = np.linspace(log_frequency.min(), log_frequency.max(), 200)
+        fitted = np.polyval(coefficients, grid)
+        residuals = values - np.polyval(coefficients, log_frequency)
+        total = values - values.mean()
+        total_sum = float(np.sum(total**2))
+        r_squared = 1.0 - float(np.sum(residuals**2)) / total_sum if total_sum > 0 else 1.0
+        return {
+            "order": int(order),
+            "frequencies": np.power(10.0, grid),
+            "values": fitted,
+            "at_reference": float(np.polyval(coefficients, np.log10(reference_hz))),
+            "r_squared": float(r_squared),
+            "points": int(frequencies.size),
+        }
+
+    def _draw_sweep_fit(
+        self,
+        prefix: str,
+        plot: Optional[pg.PlotWidget],
+        frequency_column: str,
+        value_column: str,
+        channel_labels: Sequence[str],
+        channel_column: str = "Channel",
+    ) -> tuple[pd.DataFrame, list[dict[str, object]]]:
+        """Fit one curve per channel; return the summary and the fits.
+
+        ``plot=None`` computes and returns the fits without drawing them on the
+        measurement figure - the CMRR tab shows the measured points and the fits in
+        separate figures so neither obscures the other.
+
+        ``channel_column`` names the column that holds the channel of each point:
+        the crosstalk table calls it ``Target``. Matching the wrong name silently
+        fitted every point of every channel into one curve.
+        """
+
+        if plot is not None:
+            for curve in getattr(self, f"{prefix}_sweep_fit_curves", []):
+                plot.removeItem(curve)
+        setattr(self, f"{prefix}_sweep_fit_curves", [])
+
+        frame = getattr(self, f"{prefix}_sweep_df", pd.DataFrame())
+        label = getattr(self, f"{prefix}_sweep_fit_label", None)
+        order = self._sweep_fit_order(prefix)
+        show = getattr(self, f"{prefix}_sweep_fit_check", None)
+        visible = show is None or show.isChecked()
+        rows: list[dict[str, object]] = []
+        fits: list[dict[str, object]] = []
+        empty = pd.DataFrame(columns=["Channel", "Fit Order", "Fit @ 50 Hz", "R2", "Points"])
+        if frame.empty or order <= 0:
+            if label is not None:
+                label.setText("" if order <= 0 or frame.empty else "fit hidden")
+            return empty, fits
+
+        value_name = f"Fit @ {SWEEP_FIT_REFERENCE_HZ:g} Hz"
+        curves = getattr(self, f"{prefix}_sweep_fit_curves", [])
+        for index, channel in enumerate(channel_labels):
+            if channel_column in frame:
+                subset = frame.loc[frame[channel_column] == channel]
+            else:
+                subset = frame
+            if subset.empty:
+                continue
+            fit = self._fit_sweep_curve(
+                subset[frequency_column].to_numpy(), subset[value_column].to_numpy(), order
+            )
+            if fit is None:
+                continue
+            color = pg.intColor(index, hues=max(8, len(channel_labels)), values=1.0)
+            if plot is not None and visible:
+                # No ``name``: the fit must not double every legend entry.
+                curves.append(
+                    plot.plot(
+                        np.asarray(fit["frequencies"]),
+                        np.asarray(fit["values"]),
+                        pen=pg.mkPen(color, width=SWEEP_FIT_WIDTH, style=Qt.PenStyle.DashLine),
+                    )
+                )
+            fits.append({"channel": channel, "color": color, "fit": fit})
+            rows.append(
+                {
+                    "Channel": channel,
+                    "Fit Order": int(order),
+                    value_name: float(fit["at_reference"]),
+                    "R2": float(fit["r_squared"]),
+                    "Points": int(fit["points"]),
+                }
+            )
+        setattr(self, f"{prefix}_sweep_fit_curves", curves)
+
+        summary = pd.DataFrame(rows)
+        if label is not None:
+            if summary.empty:
+                label.setText(f"order {order}: not enough swept points")
+            else:
+                values = summary[value_name]
+                if len(values) == 1:
+                    label.setText(f"{value_name}: {values.iloc[0]:.2f} dB")
+                else:
+                    label.setText(
+                        f"{value_name}: mean {values.mean():.2f} dB "
+                        f"({values.min():.2f} .. {values.max():.2f})"
+                    )
+        return summary, fits
+
+    def _refresh_cmrr_reference_figure(self, monitor_name: str, common_mode_vrms: float) -> None:
+        """Plot what the reference input really measured, in Vrms.
+
+        Comparing this with the amplitude the generator was set to is the whole
+        point of the monitor channel: the difference is what the bias network and
+        the sinc filter did to the common-mode voltage.
+        """
+
+        self.cmrr_reference_plot.clear()
+        self.cmrr_reference_df = pd.DataFrame()
+        if not monitor_name or monitor_name == NO_MONITOR_CHANNEL:
+            return
+        if monitor_name not in self._last_enabled_names or self._last_selection_matrix is None:
+            return
+
+        sample_rate = self.dataset.sample_rate if self.dataset else 1.0
+        column = self._last_selection_matrix[:, self._last_enabled_names.index(monitor_name)]
+        steps = parse_sweep_steps(self.source_metadata)
+        rows: list[dict[str, float]] = []
+        if steps:
+            for step in steps:
+                start = int(round(step.usable_start_s * sample_rate))
+                end = int(round(step.end_s * sample_rate))
+                if end <= start:
+                    continue
+                segment = np.asarray(column[start:end], dtype=np.float64)
+                if segment.size < 8:
+                    continue
+                rms_uv = fit_tone_rms(segment, sample_rate, step.frequency_hz)
+                rows.append(
+                    {
+                        "Frequency (Hz)": float(step.frequency_hz),
+                        "Reference (Vrms)": rms_uv * 1e-6,
+                        "Applied (Vrms)": float(step.amplitude_vrms),
+                    }
+                )
+        else:
+            # No recorded schedule: fall back to the dominant tone of the window.
+            frame = self._last_selection_matrix
+            window = max(int(round(sample_rate * 0.5)), 16)
+            for start in range(0, max(frame.shape[0] - window, 1), window):
+                segment = np.asarray(column[start : start + window], dtype=np.float64)
+                frequency = detect_tone_frequency(segment, sample_rate)
+                if frequency is None:
+                    continue
+                rms_uv = fit_tone_rms(segment, sample_rate, frequency)
+                rows.append(
+                    {
+                        "Frequency (Hz)": float(frequency),
+                        "Reference (Vrms)": rms_uv * 1e-6,
+                        "Applied (Vrms)": float(common_mode_vrms),
+                    }
+                )
+        if not rows:
+            return
+
+        self.cmrr_reference_df = pd.DataFrame(rows).sort_values("Frequency (Hz)").reset_index(drop=True)
+        self.cmrr_reference_fit_hz = float("nan")
+        order = self._sweep_fit_order("cmrr")
+        fit = self._fit_sweep_curve(
+            self.cmrr_reference_df["Frequency (Hz)"].to_numpy(),
+            self.cmrr_reference_df["Reference (Vrms)"].to_numpy(),
+            max(order, 2),
+        )
+        self.cmrr_reference_plot.plot(
+            self.cmrr_reference_df["Frequency (Hz)"],
+            self.cmrr_reference_df["Reference (Vrms)"],
+            pen=pg.mkPen((16, 120, 90), width=SWEEP_TRACE_WIDTH),
+            symbol="o",
+            symbolSize=5,
+            name=f"{monitor_name} measured",
+        )
+        self.cmrr_reference_plot.plot(
+            self.cmrr_reference_df["Frequency (Hz)"],
+            self.cmrr_reference_df["Applied (Vrms)"],
+            pen=pg.mkPen((190, 90, 60), width=1.4, style=Qt.PenStyle.DashLine),
+            name="generator set",
+        )
+        if fit is not None:
+            # The fit is what makes the loss curve readable: the measured points
+            # scatter, the trend is the response of the bias network plus sinc
+            # filter. Its value at 50 Hz is also reported in the info line.
+            self.cmrr_reference_fit_hz = float(fit["at_reference"])
+            self.cmrr_reference_plot.plot(
+                np.asarray(fit["frequencies"]),
+                np.asarray(fit["values"]),
+                pen=pg.mkPen((16, 120, 90), width=SWEEP_FIT_WIDTH, style=Qt.PenStyle.DashLine),
+                name=f"fit (R^2 {float(fit['r_squared']):.3f})",
+            )
+            self.cmrr_reference_df["Reference fit (Vrms)"] = np.interp(
+                self.cmrr_reference_df["Frequency (Hz)"].to_numpy(),
+                np.asarray(fit["frequencies"]),
+                np.asarray(fit["values"]),
+            )
+        self.cmrr_reference_plot.setXRange(0.0, SWEEP_X_MAX_HZ, padding=0.0)
+        legend = self.cmrr_reference_plot.addLegend(offset=(-10, 10))
+        legend.setBrush(pg.mkBrush(255, 255, 255, 190))
+
+    def _redraw_cmrr_sweep_fit(self, prefix: str = "cmrr") -> None:
+        # Fits go to their own figure, never on top of the measured points.
+        summary, fits = self._draw_sweep_fit(
+            "cmrr", None, "Frequency (Hz)", "CMRR (dB)", self._last_enabled_names
+        )
+        self.cmrr_sweep_fit_df = summary
+        self._refresh_cmrr_fit_figures(fits)
+
+    def _refresh_cmrr_fit_figures(self, fits: Sequence[dict[str, object]]) -> None:
+        """Draw the fit-only figure, the mean-of-fits figure and the 50 Hz table.
+
+        These are what the report shows: the fitted response on its own (without
+        the measurement clutter), the average fitted response with the channel
+        spread, and the numeric 50 Hz value per channel.
+        """
+
+        self.cmrr_fit_plot.clear()
+        self.cmrr_fit_mean_plot.clear()
+        self.cmrr_50hz_table.clear()
+        show = getattr(self, "cmrr_sweep_fit_check", None)
+        drawing = show is None or show.isChecked()
+        if not fits or not drawing:
+            return
+
+        for entry in fits:
+            fit = entry["fit"]
+            color = entry["color"]
+            curve = self.cmrr_fit_plot.plot(
+                np.asarray(fit["frequencies"]),
+                np.asarray(fit["values"]),
+                pen=pg.mkPen(color, width=SWEEP_TRACE_WIDTH + 0.4),
+                name=str(entry["channel"]),
+            )
+            curve.setToolTip(str(entry["channel"]))
+        self.cmrr_fit_plot.setXRange(0.0, SWEEP_X_MAX_HZ, padding=0.0)
+        legend = self.cmrr_fit_plot.addLegend(offset=(-10, 10))
+        legend.setBrush(pg.mkBrush(255, 255, 255, 190))
+
+        # Mean of the fits on a common grid. Each fit is only defined over its own
+        # frequency range, so the mean is taken where at least one fit exists and
+        # the spread is the min/max envelope of the fits that cover that point.
+        greatest = max(np.asarray(entry["fit"]["frequencies"]).size for entry in fits)
+        low = min(float(np.min(entry["fit"]["frequencies"])) for entry in fits)
+        high = max(float(np.max(entry["fit"]["frequencies"])) for entry in fits)
+        grid = np.logspace(np.log10(max(low, 1e-3)), np.log10(max(high, low * 1.01)), max(greatest, 64))
+        stacked = np.full((len(fits), grid.size), np.nan)
+        for row, entry in enumerate(fits):
+            fitted = entry["fit"]
+            stacked[row, :] = np.interp(
+                grid,
+                np.asarray(fitted["frequencies"]),
+                np.asarray(fitted["values"]),
+                left=np.nan,
+                right=np.nan,
+            )
+        with np.errstate(invalid="ignore"):
+            mean_curve = np.nanmean(stacked, axis=0)
+            low_curve = np.nanmin(stacked, axis=0)
+            high_curve = np.nanmax(stacked, axis=0)
+        self.cmrr_fit_mean_plot.plot(
+            grid, low_curve, pen=pg.mkPen((120, 130, 150), width=1.2, style=Qt.PenStyle.DotLine),
+            name="min" if len(fits) > 1 else "",
+        )
+        self.cmrr_fit_mean_plot.plot(
+            grid, high_curve, pen=pg.mkPen((120, 130, 150), width=1.2, style=Qt.PenStyle.DotLine)
+        )
+        self.cmrr_fit_mean_plot.plot(
+            grid, mean_curve, pen=pg.mkPen((30, 90, 160), width=SWEEP_TRACE_WIDTH + 0.8), name="mean of fits"
+        )
+        self.cmrr_fit_mean_plot.setXRange(0.0, SWEEP_X_MAX_HZ, padding=0.0)
+        mean_legend = self.cmrr_fit_mean_plot.addLegend(offset=(-10, 10))
+        mean_legend.setBrush(pg.mkBrush(255, 255, 255, 190))
+
+        self.cmrr_mean_fit_hz = float(
+            np.interp(SWEEP_FIT_REFERENCE_HZ, grid, mean_curve)
+            if np.isfinite(mean_curve).any()
+            else float("nan")
+        )
+        self.cmrr_mean_fit_df = pd.DataFrame(
+            {
+                "Frequency (Hz)": grid,
+                "Mean CMRR (dB)": mean_curve,
+                "Min CMRR (dB)": low_curve,
+                "Max CMRR (dB)": high_curve,
+            }
+        )
+
+        value_name = f"Fit @ {SWEEP_FIT_REFERENCE_HZ:g} Hz"
+        frame = self.cmrr_sweep_fit_df
+        if frame.empty:
+            return
+        table = frame[["Channel", value_name, "R2", "Points"]].copy()
+        mean_value = float(table[value_name].mean())
+        table.loc[len(table)] = ["Mean of fits", mean_value, float(table["R2"].mean()), int(table["Points"].sum())]
+        self._populate_table(self.cmrr_50hz_table, table)
+
+    def _redraw_crosstalk_sweep_fit(self, prefix: str = "crosstalk") -> None:
+        # _draw_sweep_fit returns (summary_frame, fits); assigning the tuple here
+        # left this attribute unusable as a DataFrame.
+        summary, _fits = self._draw_sweep_fit(
+            "crosstalk",
+            self.crosstalk_sweep_plot,
+            "Frequency (Hz)",
+            "Crosstalk (dB)",
+            self._last_enabled_names,
+            channel_column="Target",
+        )
+        self.crosstalk_sweep_fit_df = summary
+
+    def _redraw_gain_sweep_fit(self, prefix: str = "gain") -> None:
+        summary, _fits = self._draw_sweep_fit(
+            "gain", self.gain_sweep_plot, "Frequency (Hz)", "Gain (dB)", self._last_enabled_names
+        )
+        self.gain_sweep_fit_df = summary
+
     def _build_cmrr_sweep_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -622,21 +1399,118 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.cmrr_sweep_tolerance_spin.setValue(0.20)
         self.cmrr_sweep_tolerance_spin.setSuffix(" Hz")
         control_row.addWidget(self.cmrr_sweep_tolerance_spin)
-        self.cmrr_sweep_info_label = QLabel("Select region and set Vcm")
+        control_row.addWidget(QLabel("CM monitor"))
+        self.cmrr_monitor_combo = QComboBox()
+        self.cmrr_monitor_combo.setMinimumWidth(110)
+        self.cmrr_monitor_combo.addItem(NO_MONITOR_CHANNEL)
+        self.cmrr_monitor_combo.setToolTip(
+            "Channel wired straight across the common-mode voltage. Its dominant peak is the applied "
+            "generator frequency, so every other channel is evaluated at exactly that frequency. "
+            "Without it the sweep has to guess the frequency from the channel under test, which fails "
+            "below about 70 Hz where the mixing products are louder than the tone."
+        )
+        control_row.addWidget(self.cmrr_monitor_combo)
+        self.cmrr_sweep_info_label = QLabel("Select region and set Vcm (Vrms)")
         self.cmrr_sweep_info_label.setWordWrap(False)
         control_row.addWidget(self.cmrr_sweep_info_label)
         control_row.addStretch(1)
-        layout.addLayout(control_row)
+        self.cmrr_reset_zoom_button = QPushButton("Reset zoom")
+        self.cmrr_reset_zoom_button.setToolTip(
+            "Undo any wheel zoom on the four CMRR figures below."
+        )
+        self.cmrr_reset_zoom_button.clicked.connect(self._reset_cmrr_zoom)
+        control_row.addWidget(self.cmrr_reset_zoom_button)
+        layout.addWidget(self._scroll_row(control_row))
 
-        self.cmrr_sweep_plot = pg.PlotWidget()
-        self.cmrr_sweep_plot.setLabel("bottom", "Frequency", units="Hz")
-        self.cmrr_sweep_plot.setLabel("left", "CMRR", units="dB")
-        self.cmrr_sweep_plot.showGrid(x=True, y=True, alpha=0.28)
-        layout.addWidget(self.cmrr_sweep_plot)
+        # The four figures are stacked in a scroll area: four plots do not fit on a
+        # screen at a readable size, and a scroll area keeps their height honest
+        # instead of squeezing them into slivers.
+        self.cmrr_figures = QWidget()
+        figures = QVBoxLayout(self.cmrr_figures)
+        figures.setContentsMargins(0, 0, 0, 0)
+        figures.setSpacing(6)
 
-        self.cmrr_sweep_table = QTableWidget()
-        layout.addWidget(self.cmrr_sweep_table)
+        self.cmrr_sweep_plot = self._make_sweep_figure(
+            figures,
+            "Measured CMRR per channel",
+            "Frequency",
+            "Hz",
+            "CMRR",
+            "dB",
+        )
+        self.cmrr_fit_plot = self._make_sweep_figure(
+            figures,
+            "Fitted curves (one per channel)",
+            "Frequency",
+            "Hz",
+            "CMRR fit",
+            "dB",
+        )
+        self.cmrr_fit_mean_plot = self._make_sweep_figure(
+            figures,
+            "Mean of the fitted curves with the channel spread",
+            "Frequency",
+            "Hz",
+            "Mean of fits",
+            "dB",
+        )
+        self.cmrr_reference_plot = self._make_sweep_figure(
+            figures,
+            "Reference input actually measured, and its fit",
+            "Frequency",
+            "Hz",
+            "Reference input",
+            "Vrms",
+        )
+        figures.addStretch(1)
+
+        self.cmrr_figure_scroll = PlotScrollArea()
+        self.cmrr_figure_scroll.setWidget(self.cmrr_figures)
+        self.cmrr_figure_scroll.setToolTip(
+            "Mouse wheel zooms the figure under the cursor, Shift+wheel scrolls."
+        )
+        self._add_sweep_options("cmrr", layout, self.cmrr_sweep_plot)
+        layout.addWidget(self.cmrr_figure_scroll, 1)
+
+        layout.addWidget(QLabel(f"CMRR at {SWEEP_FIT_REFERENCE_HZ:g} Hz from each channel's fitted curve"))
+        self.cmrr_50hz_table = QTableWidget()
+        self.cmrr_50hz_table.setMaximumHeight(100)
+        layout.addWidget(self.cmrr_50hz_table, 0)
         return page
+
+    def _make_sweep_figure(
+        self,
+        layout: QVBoxLayout,
+        title: str,
+        bottom_label: str,
+        bottom_units: str,
+        left_label: str,
+        left_units: str,
+    ) -> pg.PlotWidget:
+        """One titled, zoomable figure inside the scrollable sweep area."""
+
+        heading = QLabel(title)
+        heading.setStyleSheet("font-weight: 600; color: #1e293b;")
+        layout.addWidget(heading)
+        plot = pg.PlotWidget()
+        plot.setMinimumHeight(SWEEP_PLOT_HEIGHT)
+        plot.setLabel("bottom", bottom_label, units=bottom_units)
+        plot.setLabel("left", left_label, units=left_units)
+        plot.showGrid(x=True, y=True, alpha=0.28)
+        plot.setXRange(0.0, SWEEP_X_MAX_HZ, padding=0.0)
+        # Left-drag pans, right-drag scales; the wheel is handled by the scroll
+        # area so it zooms instead of scrolling.
+        plot.setMouseEnabled(x=True, y=True)
+        layout.addWidget(plot)
+        return plot
+
+    def _reset_cmrr_zoom(self) -> None:
+        for name in ("cmrr_sweep_plot", "cmrr_fit_plot", "cmrr_fit_mean_plot", "cmrr_reference_plot"):
+            plot = getattr(self, name, None)
+            if plot is None:
+                continue
+            plot.getPlotItem().getViewBox().enableAutoRange()
+            plot.setXRange(0.0, SWEEP_X_MAX_HZ, padding=0.0)
 
     def _build_gain_sweep_page(self) -> QWidget:
         page = QWidget()
@@ -654,12 +1528,12 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.gain_sweep_channel_combo.currentIndexChanged.connect(self._mark_gain_sweep_stale)
         control_row.addWidget(self.gain_sweep_channel_combo)
 
-        control_row.addWidget(QLabel("Input before attenuator"))
+        control_row.addWidget(QLabel("Applied (Vrms, before attenuator)"))
         self.gain_sweep_input_spin = QDoubleSpinBox()
         self.gain_sweep_input_spin.setRange(0.0, 1_000_000_000.0)
         self.gain_sweep_input_spin.setDecimals(9)
         self.gain_sweep_input_spin.setValue(0.0)
-        self.gain_sweep_input_spin.setSuffix(" V")
+        self.gain_sweep_input_spin.setSuffix(" Vrms")
         self.gain_sweep_input_spin.valueChanged.connect(self._mark_gain_sweep_stale)
         control_row.addWidget(self.gain_sweep_input_spin)
 
@@ -683,25 +1557,38 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.gain_sweep_tolerance_spin.valueChanged.connect(self._mark_gain_sweep_stale)
         control_row.addWidget(self.gain_sweep_tolerance_spin)
 
-        attenuator_label = QLabel("Atten 100/1000100")
-        attenuator_label.setToolTip("Input at ADC = input before attenuator * 100 / 1000100")
-        control_row.addWidget(attenuator_label)
+        self.gain_attenuator_label = QLabel("")
+        self.gain_attenuator_label.setToolTip("")
+        control_row.addWidget(self.gain_attenuator_label)
+        self._refresh_attenuator_label()
 
         self.gain_sweep_info_label = QLabel("Select region, input, channel")
         self.gain_sweep_info_label.setWordWrap(False)
         control_row.addWidget(self.gain_sweep_info_label)
         control_row.addStretch(1)
-        layout.addLayout(control_row)
+        layout.addWidget(self._scroll_row(control_row))
 
         self.gain_sweep_plot = pg.PlotWidget()
         self.gain_sweep_plot.setLabel("bottom", "Frequency", units="Hz")
         self.gain_sweep_plot.setLabel("left", "Gain", units="dB")
         self.gain_sweep_plot.showGrid(x=True, y=True, alpha=0.28)
-        layout.addWidget(self.gain_sweep_plot)
+        self._add_sweep_options("gain", layout, self.gain_sweep_plot)
+        layout.addWidget(self._scrollable_figure(self.gain_sweep_plot), 3)
 
-        self.gain_sweep_table = QTableWidget()
-        layout.addWidget(self.gain_sweep_table)
         return page
+
+    def _scrollable_figure(self, plot: pg.PlotWidget, minimum_height: int = SWEEP_PLOT_HEIGHT):
+        """Put one sweep figure in the same zoomable, scrolling frame as the CMRR tab."""
+
+        plot.setMinimumHeight(minimum_height)
+        holder = QWidget()
+        holder_layout = QVBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder_layout.addWidget(plot)
+        area = PlotScrollArea()
+        area.setWidget(holder)
+        area.setToolTip("Mouse wheel zooms the figure, Shift+wheel scrolls.")
+        return area
 
     def _build_crosstalk_sweep_page(self) -> QWidget:
         page = QWidget()
@@ -729,20 +1616,33 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.crosstalk_sweep_tolerance_spin.setValue(0.20)
         self.crosstalk_sweep_tolerance_spin.setSuffix(" Hz")
         control_row.addWidget(self.crosstalk_sweep_tolerance_spin)
+        control_row.addWidget(QLabel("Reference"))
+        self.crosstalk_reference_combo = QComboBox()
+        self.crosstalk_reference_combo.setMinimumWidth(110)
+        self.crosstalk_reference_combo.addItem(NO_MONITOR_CHANNEL)
+        self.crosstalk_reference_combo.setToolTip(
+            "Channel that measures the applied stimulus. It is left out of the crosstalk curves, "
+            "because its level is the stimulus itself and a crosstalk figure for it would be "
+            "meaningless.\n"
+            "Default: the channel the recorder marked as its reference."
+        )
+        self.crosstalk_reference_combo.currentIndexChanged.connect(
+            lambda *_: self._mark_sweep_stale_for("crosstalk")
+        )
+        control_row.addWidget(self.crosstalk_reference_combo)
         self.crosstalk_sweep_info_label = QLabel("Select region and source")
         self.crosstalk_sweep_info_label.setWordWrap(False)
         control_row.addWidget(self.crosstalk_sweep_info_label)
         control_row.addStretch(1)
-        layout.addLayout(control_row)
+        layout.addWidget(self._scroll_row(control_row))
 
         self.crosstalk_sweep_plot = pg.PlotWidget()
         self.crosstalk_sweep_plot.setLabel("bottom", "Frequency", units="Hz")
         self.crosstalk_sweep_plot.setLabel("left", "Crosstalk", units="dB")
         self.crosstalk_sweep_plot.showGrid(x=True, y=True, alpha=0.28)
-        layout.addWidget(self.crosstalk_sweep_plot)
+        self._add_sweep_options("crosstalk", layout, self.crosstalk_sweep_plot)
+        layout.addWidget(self._scrollable_figure(self.crosstalk_sweep_plot), 3)
 
-        self.crosstalk_sweep_table = QTableWidget()
-        layout.addWidget(self.crosstalk_sweep_table)
         return page
 
     def _build_controls_panel(self) -> QWidget:
@@ -852,7 +1752,7 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.common_mode_spin.setRange(0.0, 1_000_000_000.0)
         self.common_mode_spin.setDecimals(9)
         self.common_mode_spin.setValue(0.0)
-        self.common_mode_spin.setSuffix(" V")
+        self.common_mode_spin.setSuffix(" Vrms")
         self.common_mode_spin.valueChanged.connect(self._refresh_analysis)
         metrics_layout.addRow("Common-mode input", self.common_mode_spin)
         # The applied signal makes SNR/THD/ENOB meaningful: without it the app can
@@ -917,6 +1817,29 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             return
         self.open_csv_path(file_name)
 
+    def _apply_header_stimulus(self, metadata: dict[str, str]) -> None:
+        """Carry the applied voltage from the recording name into the metrics.
+
+        The stimulus is typed once, in the recorder's naming dialog. Reading it
+        back here is what lets gain error, input-referred SNR and ENOB at full
+        scale fill in without retyping it.
+        """
+
+        spin = getattr(self, "input_amplitude_spin", None)
+        if spin is None:
+            return
+        applied = float(self.measurement.stimulus_v or 0.0)
+        if applied <= 0.0:
+            for key in ("Applied Stimulus (V)", "Applied Stimulus"):
+                parsed = parse_voltage(str(metadata.get(key, "") or ""))
+                if parsed is not None and parsed > 0.0:
+                    applied = parsed
+                    break
+        spin.blockSignals(True)
+        spin.setValue(max(applied, 0.0))
+        spin.blockSignals(False)
+        self.measurement.stimulus_v = max(applied, 0.0)
+
     def open_csv_path(self, file_name: str | Path, selection: Optional[tuple[float, float]] = None) -> None:
         """Load a CSV by path, using the sample rate stored in the file header.
 
@@ -939,6 +1862,8 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.source_metadata = dict(metadata)
         self.recording_name = str(metadata.get("Session", "") or "").strip()
         self.measurement = MeasurementInfo.from_metadata(metadata)
+        self._apply_header_stimulus(metadata)
+        self._refresh_attenuator_label()
         if self.recording_name:
             self.export_options.last_stem = full_export_stem(self.recording_name, self.measurement)
         if str(file_path.parent) and not self.export_options.output_dir:
@@ -980,6 +1905,24 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.file_label.setToolTip(str(file_path))
         self._update_session_label()
         self._rebuild_channel_controls()
+        # After the channel list exists: the combos are filled from the enabled
+        # channels, which only exist once the checkboxes do.
+        self._refresh_channel_combos()
+        recorded_reference = str(metadata.get("Reference Channel", "") or "").strip()
+        if recorded_reference:
+            # Preselect the monitor the live window used, so the CMRR tab is ready
+            # without hunting for the channel name. The recorder writes "CH 1"
+            # while the columns are "EXG Channel 0", so the label is resolved
+            # rather than matched literally.
+            resolved = resolve_channel_name(recorded_reference, self._enabled_channel_names())
+            for combo in (self.cmrr_monitor_combo, self.crosstalk_reference_combo):
+                if not resolved:
+                    continue
+                position = combo.findText(resolved)
+                if position >= 0:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(position)
+                    combo.blockSignals(False)
         self._rebuild_waveform_items()
         self._initialize_selection()
 
@@ -1121,20 +2064,46 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         enabled_names = self._enabled_channel_names()
         current_source = self.crosstalk_source_combo.currentText()
         current_gain_channel = self.gain_sweep_channel_combo.currentText()
+        current_monitor = self.cmrr_monitor_combo.currentText()
+        current_reference = self.crosstalk_reference_combo.currentText()
 
         self.crosstalk_source_combo.blockSignals(True)
         self.gain_sweep_channel_combo.blockSignals(True)
+        self.cmrr_monitor_combo.blockSignals(True)
+        self.crosstalk_reference_combo.blockSignals(True)
         self.crosstalk_source_combo.clear()
         self.gain_sweep_channel_combo.clear()
+        self.cmrr_monitor_combo.clear()
+        self.crosstalk_reference_combo.clear()
+        self.cmrr_monitor_combo.addItem(NO_MONITOR_CHANNEL)
+        self.crosstalk_reference_combo.addItem(NO_MONITOR_CHANNEL)
         self.crosstalk_source_combo.addItems(enabled_names)
         self.gain_sweep_channel_combo.addItems(enabled_names)
+        self.cmrr_monitor_combo.addItems(enabled_names)
+        self.crosstalk_reference_combo.addItems(enabled_names)
 
         if current_source in enabled_names:
             self.crosstalk_source_combo.setCurrentText(current_source)
         if current_gain_channel in enabled_names:
             self.gain_sweep_channel_combo.setCurrentText(current_gain_channel)
+        if current_monitor:
+            self.cmrr_monitor_combo.setCurrentText(current_monitor)
+        # The recorded reference is what the tab should default to; only override
+        # it when the operator has chosen something that no longer exists. "(none)"
+        # is a real choice and must survive a channel toggle, not be replaced by
+        # the recorded channel again.
+        if current_reference in enabled_names or current_reference == NO_MONITOR_CHANNEL:
+            if current_reference:
+                self.crosstalk_reference_combo.setCurrentText(current_reference)
+        else:
+            recorded = self.reference_channel_name(resolve=False)
+            resolved = resolve_channel_name(recorded, enabled_names)
+            if resolved:
+                self.crosstalk_reference_combo.setCurrentText(resolved)
         self.crosstalk_source_combo.blockSignals(False)
         self.gain_sweep_channel_combo.blockSignals(False)
+        self.cmrr_monitor_combo.blockSignals(False)
+        self.crosstalk_reference_combo.blockSignals(False)
 
     def _enabled_channel_names(self) -> list[str]:
         if not self.dataset:
@@ -1260,6 +2229,37 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             return None
         return float(self.crosstalk_frequency_spin.value())
 
+    def reference_channel_name(self, resolve: bool = True) -> str:
+        """Channel the live window recorded as the applied-stimulus monitor.
+
+        The recorder writes its own label (``CH 1``) while the CSV columns are
+        ``EXG Channel 0``; ``resolve_channel_name()`` bridges the two so the
+        reference really is matched instead of silently ignored.
+        """
+
+        combo = getattr(self, "cmrr_monitor_combo", None)
+        manual = str(combo.currentText()).strip() if combo is not None else ""
+        recorded = str(self.source_metadata.get("Reference Channel", "") or "").strip()
+        chosen = manual if manual and manual != NO_MONITOR_CHANNEL else recorded
+        if not chosen or not resolve:
+            return chosen
+        names = self.dataset.channel_names if self.dataset else []
+        return resolve_channel_name(chosen, names) or chosen
+
+    def crosstalk_reference_name(self) -> str:
+        """Reference channel chosen on the Crosstalk Sweep tab itself.
+
+        It is chosen there rather than taken from the recording so a single file
+        can be re-examined with a different reference without editing anything
+        else, and it defaults to the recorded reference.
+        """
+
+        combo = getattr(self, "crosstalk_reference_combo", None)
+        if combo is None:
+            return ""
+        text = str(combo.currentText()).strip()
+        return "" if text == NO_MONITOR_CHANNEL else text
+
     def _redraw_waveform(self) -> None:
         if not self.dataset:
             return
@@ -1273,6 +2273,25 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         if not enabled_indices:
             for curve in self.channel_curves.values():
                 curve.hide()
+            self.waveform_plot.getAxis("left").setTicks([[]])
+            return
+
+        # The reference channel is volts while the rest are microvolts, so it would
+        # flatten every other trace. It gets its own figure (Reference channel in
+        # the export), and is left out of the stacked view - unless it is the only
+        # channel enabled, in which case showing nothing would be worse.
+        reference_name = self.reference_channel_name()
+        reference_index = (
+            self.dataset.channel_names.index(reference_name)
+            if reference_name and reference_name in self.dataset.channel_names
+            else None
+        )
+        if reference_index is not None and len(enabled_indices) > 1:
+            enabled_indices = [index for index in enabled_indices if index != reference_index]
+        for index, curve in self.channel_curves.items():
+            if index not in enabled_indices:
+                curve.hide()
+        if not enabled_indices:
             self.waveform_plot.getAxis("left").setTicks([[]])
             return
 
@@ -1544,20 +2563,17 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
     def _mark_sweep_results_stale(self) -> None:
         self.crosstalk_sweep_df = pd.DataFrame()
         self._clear_crosstalk_sweep_plot()
-        self.crosstalk_sweep_table.clear()
         self.crosstalk_sweep_info_label.setText("Sweep stale")
 
         self._mark_gain_sweep_stale()
 
         self.cmrr_sweep_df = pd.DataFrame()
         self._clear_cmrr_sweep_plot()
-        self.cmrr_sweep_table.clear()
         self.cmrr_sweep_info_label.setText("Sweep stale")
 
     def _mark_gain_sweep_stale(self, *args) -> None:
         self.gain_sweep_df = pd.DataFrame()
         self._clear_gain_sweep_plot()
-        self.gain_sweep_table.clear()
         self.gain_sweep_info_label.setText("Sweep stale")
 
     def compute_crosstalk_sweep_view(self) -> None:
@@ -1572,6 +2588,12 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
 
         source_index = self._last_enabled_names.index(source_name)
         source_values = self._last_selection_matrix[:, source_index]
+        steps = parse_sweep_steps(self.source_metadata)
+        # The reference measures the stimulus, so a crosstalk figure for it would
+        # be the drive itself. It is skipped here rather than hidden afterwards, so
+        # it contributes nothing to the fit or the 50 Hz summary either.
+        reference_name = self.crosstalk_reference_name()
+        skipped_reference = bool(reference_name) and reference_name in self._last_enabled_names
         self._clear_crosstalk_sweep_plot()
         combined_frames: list[pd.DataFrame] = []
         accepted_windows = 0
@@ -1579,15 +2601,28 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         plotted_channels = 0
 
         for target_index, target_name in enumerate(self._last_enabled_names):
-            result = compute_crosstalk_sweep(
-                source_values=source_values,
-                target_values=self._last_selection_matrix[:, target_index],
-                sample_rate=self.dataset.sample_rate if self.dataset else 1.0,
-                fft_length=int(self.fft_length_spin.value()),
-                window_name=self.window_combo.currentText(),
-                window_duration_s=float(self.crosstalk_sweep_window_spin.value()),
-                stability_tolerance_hz=float(self.crosstalk_sweep_tolerance_spin.value()),
-            )
+            if skipped_reference and target_name == reference_name:
+                continue
+            if steps:
+                result = compute_planned_crosstalk_sweep(
+                    source_values=source_values,
+                    target_values=self._last_selection_matrix[:, target_index],
+                    sample_rate=self.dataset.sample_rate if self.dataset else 1.0,
+                    steps=steps,
+                )
+            else:
+                result = compute_crosstalk_sweep(
+                    source_values=source_values,
+                    target_values=self._last_selection_matrix[:, target_index],
+                    sample_rate=self.dataset.sample_rate if self.dataset else 1.0,
+                    fft_length=int(self.fft_length_spin.value()),
+                    window_name=self.window_combo.currentText(),
+                    window_duration_s=float(self.crosstalk_sweep_window_spin.value()),
+                    stability_tolerance_hz=float(self.crosstalk_sweep_tolerance_spin.value()),
+                    min_hold_s=self._sweep_hold_seconds("crosstalk"),
+                    exclude_mains=self._sweep_exclude_mains("crosstalk"),
+                    **self._sweep_tracking_options("crosstalk"),
+                )
             accepted_windows = result.accepted_windows
             rejected_windows = result.rejected_windows
             if result.dataframe.empty:
@@ -1603,24 +2638,61 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             curve = self.crosstalk_sweep_plot.plot(
                 channel_frame["Frequency (Hz)"],
                 channel_frame["Crosstalk (dB)"],
-                pen=pg.mkPen(color, width=1.8),
+                pen=pg.mkPen(color, width=SWEEP_TRACE_WIDTH),
                 symbol="o",
                 symbolSize=4,
                 name=target_name,
             )
             self.crosstalk_sweep_curves.append(curve)
 
+        reference_note = f" | ref {reference_name} skipped" if skipped_reference else ""
         if not combined_frames:
             self.crosstalk_sweep_df = pd.DataFrame()
-            self.crosstalk_sweep_table.clear()
-            self.crosstalk_sweep_info_label.setText(f"Src {source_name} | 0 ch | {accepted_windows} ok | {rejected_windows} rej")
+            self.crosstalk_sweep_info_label.setText(
+                f"Src {source_name} | 0 ch | {accepted_windows} ok | {rejected_windows} rej{reference_note}"
+            )
             return
 
         self.crosstalk_sweep_df = pd.concat(combined_frames, ignore_index=True)
-        self._populate_table(self.crosstalk_sweep_table, self.crosstalk_sweep_df)
         self.crosstalk_sweep_info_label.setText(
-            f"Src {source_name} | {plotted_channels} ch | {accepted_windows} ok | {rejected_windows} rej | notch on"
+            self._sweep_info_text(
+                "crosstalk",
+                f"Src {source_name} | {plotted_channels} ch{reference_note}",
+                accepted_windows,
+                rejected_windows,
+            )
         )
+        self._redraw_crosstalk_sweep_fit()
+
+    def _recorded_attenuator_ratio(self) -> float:
+        """The input divider the live window wrote into this recording.
+
+        Falls back to this module's default so older recordings, and manual files
+        that never saw the app, still produce a number.
+        """
+
+        ratio = _metadata_float(self.source_metadata, "Input Attenuator Ratio")
+        return ratio if 0.0 < ratio <= 1.0 else DEFAULT_INPUT_ATTENUATOR_RATIO
+
+    def _refresh_attenuator_label(self) -> None:
+        label = getattr(self, "gain_attenuator_label", None)
+        if label is None:
+            return
+        ratio = self._recorded_attenuator_ratio()
+        series = _metadata_float(self.source_metadata, "Input Attenuator Series (ohm)")
+        shunt = _metadata_float(self.source_metadata, "Input Attenuator Shunt (ohm)")
+        if series > 0 and shunt > 0:
+            label.setText(f"Divider {shunt:g}/({series:g}+{shunt:g}) = {ratio:.4g}")
+            label.setToolTip(
+                f"Input at the amplifier = applied before the divider * {ratio:.6g}.\n"
+                f"Recorded with {series:g} ohm in series and {shunt:g} ohm to ground."
+            )
+        else:
+            label.setText(f"Divider {ratio:.4g} (default)")
+            label.setToolTip(
+                f"Input at the amplifier = applied before the divider * {ratio:.6g}.\n"
+                "This recording carries no divider, so the default is used."
+            )
 
     def compute_gain_sweep_view(self) -> None:
         if self._last_selection_matrix is None or not self._last_enabled_names:
@@ -1633,58 +2705,112 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             return
 
         input_before_v = float(self.gain_sweep_input_spin.value())
-        if input_before_v <= 0:
-            QMessageBox.information(self, "Gain Sweep", "Enter a positive input voltage before the attenuator first.")
+        channel_index = self._last_enabled_names.index(channel_name)
+        steps = parse_sweep_steps(self.source_metadata)
+        metadata_vrms = _sweep_amplitude_vrms(self.source_metadata)
+        # The recording carries the divider that was actually in front of the
+        # amplifier, so a run with a different attenuator is converted correctly
+        # instead of with this module's default.
+        attenuator = self._recorded_attenuator_ratio()
+        planned = bool(steps) and metadata_vrms > 0
+        if not planned and input_before_v <= 0:
+            # Only the manual path needs this: an automated run reads the applied
+            # amplitude out of the recording, so asking for it again would be
+            # both redundant and wrong.
+            QMessageBox.information(
+                self, "Gain Sweep", "Enter a positive input voltage before the attenuator first."
+            )
             return
 
-        channel_index = self._last_enabled_names.index(channel_name)
-        result = compute_gain_sweep(
-            values=self._last_selection_matrix[:, channel_index],
-            sample_rate=self.dataset.sample_rate if self.dataset else 1.0,
-            input_before_attenuator_v=input_before_v,
-            fft_length=int(self.fft_length_spin.value()),
-            window_name=self.window_combo.currentText(),
-            attenuator_ratio=DEFAULT_INPUT_ATTENUATOR_RATIO,
-            signal_scale_to_volts=1e-6,
-            window_duration_s=float(self.gain_sweep_window_spin.value()),
-            stability_tolerance_hz=float(self.gain_sweep_tolerance_spin.value()),
-        )
+        if planned:
+            # The live window drove the generator itself, so the applied amplitude
+            # is known exactly and the gain comes straight out of the schedule.
+            result = compute_planned_gain_sweep(
+                values=self._last_selection_matrix[:, channel_index],
+                sample_rate=self.dataset.sample_rate if self.dataset else 1.0,
+                steps=steps,
+                applied_vrms=metadata_vrms,
+                signal_scale_to_volts=1e-6,
+                attenuator_ratio=attenuator,
+            )
+        else:
+            result = compute_gain_sweep(
+                values=self._last_selection_matrix[:, channel_index],
+                sample_rate=self.dataset.sample_rate if self.dataset else 1.0,
+                input_before_attenuator_v=input_before_v,
+                fft_length=int(self.fft_length_spin.value()),
+                window_name=self.window_combo.currentText(),
+                attenuator_ratio=attenuator,
+                signal_scale_to_volts=1e-6,
+                window_duration_s=float(self.gain_sweep_window_spin.value()),
+                stability_tolerance_hz=float(self.gain_sweep_tolerance_spin.value()),
+                min_hold_s=self._sweep_hold_seconds("gain"),
+                exclude_mains=self._sweep_exclude_mains("gain"),
+                **self._sweep_tracking_options("gain"),
+            )
 
         self._clear_gain_sweep_plot()
         if result.dataframe.empty:
             self.gain_sweep_df = pd.DataFrame()
-            self.gain_sweep_table.clear()
             self.gain_sweep_info_label.setText(
-                f"Ch {channel_name} | 0 ok | {result.rejected_windows} rej"
+                f"Ch {channel_name} | 0 ok | {result.rejected_windows} rej | div {attenuator:.4g}"
             )
             return
 
         self.gain_sweep_df = result.dataframe.copy()
         self.gain_sweep_df.insert(0, "Channel", channel_name)
-        self._populate_table(self.gain_sweep_table, self.gain_sweep_df)
 
         curve = self.gain_sweep_plot.plot(
             self.gain_sweep_df["Frequency (Hz)"],
             self.gain_sweep_df["Gain (dB)"],
-            pen=pg.mkPen(pg.intColor(channel_index, hues=max(8, len(self._last_enabled_names)), values=1.0), width=1.8),
+            pen=pg.mkPen(
+                pg.intColor(channel_index, hues=max(8, len(self._last_enabled_names)), values=1.0),
+                width=SWEEP_TRACE_WIDTH,
+            ),
             symbol="o",
             symbolSize=4,
             name=channel_name,
         )
         self.gain_sweep_curves.append(curve)
 
-        input_after_uvrms = input_before_v * DEFAULT_INPUT_ATTENUATOR_RATIO / 1e-6
+        if planned:
+            input_after_uvrms = metadata_vrms * attenuator / 1e-6
+            source_tag = f"generator plan ({len(steps)} steps)"
+        else:
+            input_after_uvrms = input_before_v * attenuator / 1e-6
+            source_tag = "manual"
         self.gain_sweep_info_label.setText(
-            f"Ch {channel_name} | in {input_after_uvrms:.6g} uVrms | {result.accepted_windows} ok | {result.rejected_windows} rej | notch on"
+            self._sweep_info_text(
+                "gain",
+                f"Ch {channel_name} | in {input_after_uvrms:.6g} uVrms | div {attenuator:.4g} | {source_tag}",
+                result.accepted_windows,
+                result.rejected_windows,
+            )
         )
+        self._redraw_gain_sweep_fit()
 
     def compute_cmrr_sweep_view(self) -> None:
         if self._last_selection_matrix is None or not self._last_enabled_names:
             QMessageBox.information(self, "CMRR Sweep", "Select a valid time region first.")
             return
+
+        # A recording made by the automated generator sweep carries the exact
+        # schedule, so nothing has to be guessed: every step is evaluated at the
+        # frequency the generator was told to produce, inside the time it held it.
+        steps = parse_sweep_steps(self.source_metadata)
+        metadata_vrms = _sweep_amplitude_vrms(self.source_metadata)
+        monitor_name = self.cmrr_monitor_combo.currentText()
+        monitor_values = None
+        if monitor_name and monitor_name != NO_MONITOR_CHANNEL and monitor_name in self._last_enabled_names:
+            monitor_values = self._last_selection_matrix[:, self._last_enabled_names.index(monitor_name)]
+
+        # Everything is Vrms: the spin box, the recording metadata and the CMRR
+        # definition all use the same unit, so nothing is converted by hand.
         common_mode_voltage = float(self.common_mode_spin.value())
+        if steps and metadata_vrms > 0:
+            common_mode_voltage = metadata_vrms
         if common_mode_voltage <= 0:
-            QMessageBox.information(self, "CMRR Sweep", "Enter a positive common-mode input voltage first.")
+            QMessageBox.information(self, "CMRR Sweep", "Enter a positive common-mode voltage in Vrms first.")
             return
 
         self._clear_cmrr_sweep_plot()
@@ -1694,19 +2820,50 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         plotted_channels = 0
 
         for channel_index, channel_name in enumerate(self._last_enabled_names):
+            if monitor_values is not None and channel_name == monitor_name:                # The monitor channel measures the stimulus itself, so a CMRR
+                # number for it would be meaningless.
+                continue
             signal_values = self._last_selection_matrix[:, channel_index]
-            result = compute_cmrr_sweep(
-                values=signal_values,
-                sample_rate=self.dataset.sample_rate if self.dataset else 1.0,
-                common_mode_voltage=common_mode_voltage,
-                fft_length=int(self.fft_length_spin.value()),
-                window_name=self.window_combo.currentText(),
-                signal_scale_to_volts=1e-6,
-                correction_enabled=self.cmrr_correction_check.isChecked(),
-                correction_fs_hz=float(self.cmrr_correction_fs_spin.value()),
-                window_duration_s=float(self.cmrr_sweep_window_spin.value()),
-                stability_tolerance_hz=float(self.cmrr_sweep_tolerance_spin.value()),
-            )
+            if steps:
+                result = compute_planned_cmrr_sweep(
+                    values=signal_values,
+                    sample_rate=self.dataset.sample_rate if self.dataset else 1.0,
+                    steps=steps,
+                    common_mode_v_rms=common_mode_voltage,
+                    signal_scale_to_volts=1e-6,
+                    correction_enabled=self.cmrr_correction_check.isChecked(),
+                    correction_fs_hz=float(self.cmrr_correction_fs_spin.value()),
+                )
+            elif monitor_values is not None:
+                result = compute_reference_cmrr_sweep(
+                    values=signal_values,
+                    reference_values=monitor_values,
+                    sample_rate=self.dataset.sample_rate if self.dataset else 1.0,
+                    common_mode_v_rms=common_mode_voltage,
+                    window_duration_s=float(self.cmrr_sweep_window_spin.value()),
+                    fft_length=int(self.fft_length_spin.value()),
+                    window_name=self.window_combo.currentText(),
+                    signal_scale_to_volts=1e-6,
+                    correction_enabled=self.cmrr_correction_check.isChecked(),
+                    correction_fs_hz=float(self.cmrr_correction_fs_spin.value()),
+                    stability_tolerance_hz=max(float(self.cmrr_sweep_tolerance_spin.value()), 0.1),
+                )
+            else:
+                result = compute_cmrr_sweep(
+                    values=signal_values,
+                    sample_rate=self.dataset.sample_rate if self.dataset else 1.0,
+                    common_mode_voltage=common_mode_voltage,
+                    fft_length=int(self.fft_length_spin.value()),
+                    window_name=self.window_combo.currentText(),
+                    signal_scale_to_volts=1e-6,
+                    correction_enabled=self.cmrr_correction_check.isChecked(),
+                    correction_fs_hz=float(self.cmrr_correction_fs_spin.value()),
+                    window_duration_s=float(self.cmrr_sweep_window_spin.value()),
+                    stability_tolerance_hz=float(self.cmrr_sweep_tolerance_spin.value()),
+                    min_hold_s=self._sweep_hold_seconds("cmrr"),
+                    exclude_mains=self._sweep_exclude_mains("cmrr"),
+                    **self._sweep_tracking_options("cmrr"),
+                )
             accepted_total += result.accepted_windows
             rejected_total += result.rejected_windows
             if result.dataframe.empty:
@@ -1721,7 +2878,7 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             curve = self.cmrr_sweep_plot.plot(
                 channel_frame["Frequency (Hz)"],
                 channel_frame["CMRR (dB)"],
-                pen=pg.mkPen(color, width=1.8),
+                pen=pg.mkPen(color, width=SWEEP_TRACE_WIDTH),
                 symbol="o",
                 symbolSize=4,
                 name=channel_name,
@@ -1730,29 +2887,52 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
 
         if not combined_frames:
             self.cmrr_sweep_df = pd.DataFrame()
-            self.cmrr_sweep_table.clear()
             self.cmrr_sweep_info_label.setText(f"0 ch | 0 ok | {rejected_total} rej")
+            self.cmrr_sweep_fit_df = pd.DataFrame()
             return
 
         self.cmrr_sweep_df = pd.concat(combined_frames, ignore_index=True)
-        self._populate_table(self.cmrr_sweep_table, self.cmrr_sweep_df)
         correction_tag = "corr on" if self.cmrr_correction_check.isChecked() else "corr off"
-        self.cmrr_sweep_info_label.setText(f"{plotted_channels} ch | {accepted_total} ok | {rejected_total} rej | {correction_tag} | notch on")
+        if steps:
+            source_tag = f"generator plan ({len(steps)} steps)"
+        elif monitor_values is not None:
+            source_tag = f"from {monitor_name}"
+        else:
+            source_tag = "auto"
+        self.cmrr_sweep_info_label.setText(
+            self._sweep_info_text(
+                "cmrr",
+                f"{plotted_channels} ch | {correction_tag} | f {source_tag}",
+                accepted_total,
+                rejected_total,
+            )
+        )
+        self._refresh_cmrr_reference_figure(monitor_name, common_mode_voltage)
+        self._redraw_cmrr_sweep_fit()
+
+    def _clear_sweep_plot(self, prefix: str, plot: pg.PlotWidget) -> None:
+        """Remove the curves, the fit lines and the stale legend entries."""
+
+        for curve in getattr(self, f"{prefix}_sweep_curves", []):
+            plot.removeItem(curve)
+        getattr(self, f"{prefix}_sweep_curves", []).clear()
+        for curve in getattr(self, f"{prefix}_sweep_fit_curves", []):
+            plot.removeItem(curve)
+        setattr(self, f"{prefix}_sweep_fit_curves", [])
+        legend = getattr(self, f"{prefix}_sweep_legend", None)
+        if legend is not None:
+            # removeItem() leaves the legend label behind, so a re-run would
+            # otherwise stack duplicate channel names on every sweep.
+            legend.clear()
 
     def _clear_crosstalk_sweep_plot(self) -> None:
-        for curve in self.crosstalk_sweep_curves:
-            self.crosstalk_sweep_plot.removeItem(curve)
-        self.crosstalk_sweep_curves.clear()
+        self._clear_sweep_plot("crosstalk", self.crosstalk_sweep_plot)
 
     def _clear_gain_sweep_plot(self) -> None:
-        for curve in self.gain_sweep_curves:
-            self.gain_sweep_plot.removeItem(curve)
-        self.gain_sweep_curves.clear()
+        self._clear_sweep_plot("gain", self.gain_sweep_plot)
 
     def _clear_cmrr_sweep_plot(self) -> None:
-        for curve in self.cmrr_sweep_curves:
-            self.cmrr_sweep_plot.removeItem(curve)
-        self.cmrr_sweep_curves.clear()
+        self._clear_sweep_plot("cmrr", self.cmrr_sweep_plot)
 
     def _refresh_exclusion_overlays(self) -> None:
         for item in self.exclusion_items:
@@ -1946,6 +3126,12 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             available.append("gain_sweep")
         if not self.cmrr_sweep_df.empty:
             available.append("cmrr_sweep")
+        if not self.cmrr_sweep_fit_df.empty:
+            available += ["cmrr_fits", "cmrr_50hz"]
+        if not self.cmrr_mean_fit_df.empty:
+            available.append("cmrr_fit_mean")
+        if not self.cmrr_reference_df.empty:
+            available.append("reference")
         return available
 
     def open_export_dialog(self, focus_format: str = "pdf") -> None:
@@ -2069,6 +3255,14 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         )
         if self.gain_sweep_input_spin.value() > 0:
             lines.append(f"Gain-sweep stimulus: {self.gain_sweep_input_spin.value():.6g} V")
+        ratio = self._recorded_attenuator_ratio()
+        series = _metadata_float(self.source_metadata, "Input Attenuator Series (ohm)")
+        shunt = _metadata_float(self.source_metadata, "Input Attenuator Shunt (ohm)")
+        source = "recorded" if "Input Attenuator Ratio" in self.source_metadata else "default"
+        divider = f"Input attenuator: {ratio:.6g}"
+        if series > 0 and shunt > 0:
+            divider += f" ({shunt:g} ohm / ({series:g} + {shunt:g}) ohm)"
+        lines.append(f"{divider}, {source}")
         lines.append(
             f"Crosstalk source: {self.crosstalk_source_combo.currentText() or '-'}   "
             f"Channels in analysis: {len(self._last_enabled_names)}"
@@ -2076,6 +3270,27 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         if self._last_mean_names:
             lines.append("Averaged channels: " + ", ".join(self._last_mean_names))
         return lines
+
+    def _host_tab(self, widget: QWidget) -> Optional[tuple[QTabWidget, int]]:
+        """Find the tab page that owns ``widget``, so a hidden one can be shown.
+
+        QTabWidget inserts a QStackedWidget between itself and the pages, so the
+        page is not the direct child of the tab widget.
+        """
+
+        chain: list[QWidget] = []
+        page: Optional[QWidget] = widget
+        while page is not None:
+            chain.append(page)
+            parent = page.parentWidget()
+            if isinstance(parent, QTabWidget):
+                for candidate in chain:
+                    index = parent.indexOf(candidate)
+                    if index >= 0:
+                        return parent, index
+                return None
+            page = parent
+        return None
 
     def _plot_pixmap(self, plot_widget, aspect: Optional[float] = None):
         """Render a plot for the report at high resolution.
@@ -2091,23 +3306,40 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         width = max(plot_widget.width(), 1)
         height = max(plot_widget.height(), 1)
         restored = None
+        shown_tab = None
         if aspect:
+            # A widget on an inactive tab is still laid out at its minimum size,
+            # so resizing it there changes nothing. Show its tab for the render.
+            if not plot_widget.isVisible():
+                host = self._host_tab(plot_widget)
+                if host is not None:
+                    tab, index = host
+                    shown_tab = (tab, tab.currentIndex())
+                    tab.setCurrentIndex(index)
+                    QApplication.instance().processEvents()
             # The exporter keeps the scene's own proportions, so the only way to
-            # get a taller figure is to lay the plot out taller for the render.
-            # Updates stay off so the reflow never reaches the screen.
-            width = max(width, 640)
+            # get a different shape is to lay the plot out that way for the
+            # render. Updates stay off so the reflow never reaches the screen.
+            aspect = min(max(float(aspect), 0.15), 2.0)
+            width = max(plot_widget.width(), 900)
+            height = max(int(round(width * aspect)), 320)
             restored = (plot_widget.minimumSize(), plot_widget.maximumSize(), plot_widget.size())
             plot_widget.setUpdatesEnabled(False)
-            plot_widget.setFixedSize(width, max(int(width * float(aspect)), 480))
+            plot_widget.setFixedSize(width, height)
+            # ImageExporter derives its size from the scene rect, and a hidden
+            # widget only re-lays-out when it is painted, so grab() here is what
+            # actually applies the requested shape to the figure.
+            plot_widget.grab()
             QApplication.instance().processEvents()
-            height = max(plot_widget.height(), 1)
-        target_height = max(int(target_width * height / width), 600)
         exporter = pyqtgraph.exporters.ImageExporter(plot_widget.plotItem)
         params = exporter.parameters()
         try:
-            # ParameterTree does not support membership tests, so assign directly.
+            # The exporter links width and height through the scene's own aspect
+            # ratio, so setting both makes them fight. Width alone is enough and
+            # keeps the figure's proportions consistent.
             params["width"] = target_width
-            params["height"] = target_height
+            if not aspect:
+                params["height"] = max(int(target_width * height / width), 600)
         except (KeyError, TypeError):
             pass
         rendered = exporter.export(toBytes=True)
@@ -2116,6 +3348,13 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             plot_widget.setMaximumSize(restored[1])
             plot_widget.resize(restored[2])
             plot_widget.setUpdatesEnabled(True)
+            if shown_tab is not None:
+                shown_tab[0].setCurrentIndex(shown_tab[1])
+            QApplication.instance().processEvents()
+            # The scene kept the temporary shape and pyqtgraph only re-lays out
+            # when the view is painted, so paint once more at the real size to
+            # leave the widget exactly as it was found.
+            plot_widget.grab()
             QApplication.instance().processEvents()
         if isinstance(rendered, QImage):
             image = rendered
@@ -2150,7 +3389,14 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             )
         if options.enabled("fft"):
             writer.heading("FFT", keep_with_next=0.54)
-            writer.image(self._plot_pixmap(self.fft_plot), "RMS spectrum of the analysed channel", max_height=0.46)
+            # The FFT tab is a tall narrow column, so rendering it with its own
+            # proportions produced a strip in the middle of the page. Force a wide
+            # aspect: it is a spectrum, it belongs across the page.
+            writer.image(
+                self._plot_pixmap(self.fft_plot, aspect=FFT_FIGURE_ASPECT),
+                "RMS spectrum of the analysed channel",
+                max_height=0.55,
+            )
         if options.enabled("metrics"):
             writer.heading("Metrics", keep_with_next=0.14)
             writer.table(self.metrics_df, caption="Per-channel metrics")
@@ -2159,17 +3405,82 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             writer.table(self.crosstalk_df, caption="Crosstalk from the selected source")
         if options.enabled("crosstalk_sweep") and not self.crosstalk_sweep_df.empty:
             writer.heading("Crosstalk sweep", keep_with_next=0.42)
-            writer.image(self._plot_pixmap(self.crosstalk_sweep_plot), "Crosstalk versus frequency")
-            writer.table(self.crosstalk_sweep_df, max_rows=400, caption="Crosstalk sweep data")
+            writer.image(
+                self._plot_pixmap(self.crosstalk_sweep_plot, aspect=SWEEP_FIGURE_ASPECT),
+                "Crosstalk versus frequency",
+                max_height=SWEEP_FIGURE_MAX_HEIGHT,
+            )
         if options.enabled("gain_sweep") and not self.gain_sweep_df.empty:
             writer.heading("Gain sweep", keep_with_next=0.42)
-            writer.image(self._plot_pixmap(self.gain_sweep_plot), "Response versus applied level")
-            writer.table(self.gain_sweep_df, max_rows=400, caption="Gain sweep data")
-        if options.enabled("cmrr_sweep") and not self.cmrr_sweep_df.empty:
+            writer.image(
+                self._plot_pixmap(self.gain_sweep_plot, aspect=SWEEP_FIGURE_ASPECT),
+                "Response versus applied level",
+                max_height=SWEEP_FIGURE_MAX_HEIGHT,
+            )
+        # The CMRR figures are exported as one block that mirrors the tab: the
+        # measured points, the fits on their own, the mean of the fits and the
+        # reference input. Enabling the CMRR sweep is enough - the individual
+        # section keys only add nothing extra, so a saved checklist from an older
+        # version still produces the complete report.
+        cmrr_figures = options.enabled("cmrr_sweep") or any(
+            options.enabled(key) for key in ("cmrr_fits", "cmrr_fit_mean", "cmrr_50hz", "reference")
+        )
+        if cmrr_figures and not self.cmrr_sweep_df.empty:
             writer.heading("CMRR sweep", keep_with_next=0.42)
-            writer.image(self._plot_pixmap(self.cmrr_sweep_plot), "CMRR versus frequency")
-            writer.table(self.cmrr_sweep_df, max_rows=400, caption="CMRR sweep data")
+            writer.image(
+                self._plot_pixmap(self.cmrr_sweep_plot, aspect=SWEEP_FIGURE_ASPECT),
+                "Measured CMRR versus frequency, one curve per channel",
+                max_height=SWEEP_FIGURE_MAX_HEIGHT,
+            )
+        if cmrr_figures and not self.cmrr_sweep_fit_df.empty:
+            writer.heading("CMRR fitted curves", keep_with_next=0.42)
+            writer.image(
+                self._plot_pixmap(self.cmrr_fit_plot, aspect=SWEEP_FIGURE_ASPECT),
+                "Polynomial fit of each channel in log10(frequency), without the measured points",
+                max_height=SWEEP_FIGURE_MAX_HEIGHT,
+            )
+        if cmrr_figures and not self.cmrr_mean_fit_df.empty:
+            writer.heading("Mean of the fitted curves", keep_with_next=0.42)
+            writer.image(
+                self._plot_pixmap(self.cmrr_fit_mean_plot, aspect=SWEEP_FIGURE_ASPECT),
+                "Average fitted CMRR across the plotted channels, with the channel spread",
+                max_height=SWEEP_FIGURE_MAX_HEIGHT,
+            )
+        if cmrr_figures and not self.cmrr_reference_df.empty:
+            writer.heading("Reference channel", keep_with_next=0.42)
+            writer.image(
+                self._plot_pixmap(self.cmrr_reference_plot, aspect=SWEEP_FIGURE_ASPECT),
+                "Reference input actually measured (and its fit) against the amplitude the "
+                "generator was set to",
+                max_height=SWEEP_FIGURE_MAX_HEIGHT,
+            )
+        if cmrr_figures and not self.cmrr_sweep_fit_df.empty:
+            writer.heading(f"CMRR at {SWEEP_FIT_REFERENCE_HZ:g} Hz", keep_with_next=0.14)
+            writer.paragraph(
+                [
+                    f"Taken from each channel's fitted curve, not from a swept point, so no "
+                    f"measurement sits exactly on {SWEEP_FIT_REFERENCE_HZ:g} Hz."
+                ],
+                size=8.5,
+            )
+            writer.table(self._cmrr_50hz_frame(), caption="Fitted CMRR at the reference frequency")
         return writer.close()
+
+    def _cmrr_50hz_frame(self) -> pd.DataFrame:
+        """The 50 Hz table as a frame, with the mean of the channel fits appended."""
+
+        value_name = f"Fit @ {SWEEP_FIT_REFERENCE_HZ:g} Hz"
+        frame = self.cmrr_sweep_fit_df
+        if frame.empty or value_name not in frame:
+            return pd.DataFrame()
+        table = frame[["Channel", value_name, "R2", "Points"]].copy()
+        table.loc[len(table)] = [
+            "Mean of fits",
+            float(frame[value_name].mean()),
+            float(frame["R2"].mean()),
+            int(frame["Points"].sum()),
+        ]
+        return table.rename(columns={value_name: f"CMRR @ {SWEEP_FIT_REFERENCE_HZ:g} Hz (dB)", "R2": "R^2"})
 
     def _write_png(self, base: Path, options: ExportOptions) -> list[str]:
         written: list[str] = []
@@ -2179,6 +3490,9 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             ("crosstalk_sweep", self.crosstalk_sweep_plot, "crosstalk_sweep"),
             ("gain_sweep", self.gain_sweep_plot, "gain_sweep"),
             ("cmrr_sweep", self.cmrr_sweep_plot, "cmrr_sweep"),
+            ("cmrr_fits", self.cmrr_fit_plot, "cmrr_fits"),
+            ("cmrr_fit_mean", self.cmrr_fit_mean_plot, "cmrr_fit_mean"),
+            ("reference", self.cmrr_reference_plot, "reference_channel"),
         )
         for key, plot_widget, suffix in targets:
             if not options.enabled(key):
@@ -2192,6 +3506,12 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
                 }[key]
                 if frame.empty:
                     continue
+            if key in ("cmrr_fits", "cmrr_50hz") and self.cmrr_sweep_fit_df.empty:
+                continue
+            if key == "cmrr_fit_mean" and self.cmrr_mean_fit_df.empty:
+                continue
+            if key == "reference" and self.cmrr_reference_df.empty:
+                continue
             target = base.with_name(f"{base.stem}_{suffix_name}.png")
             exporter = pyqtgraph.exporters.ImageExporter(plot_widget.plotItem)
             try:
@@ -2233,6 +3553,12 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             dump(self.gain_sweep_df, "gain_sweep")
         if options.enabled("cmrr_sweep"):
             dump(self.cmrr_sweep_df, "cmrr_sweep")
+        if options.enabled("cmrr_50hz"):
+            dump(self._cmrr_50hz_frame(), "cmrr_50hz")
+        if options.enabled("cmrr_fit_mean"):
+            dump(self.cmrr_mean_fit_df, "cmrr_fit_mean")
+        if options.enabled("reference"):
+            dump(self.cmrr_reference_df, "reference_channel")
         return written
 
     # -- menu entry points (kept for muscle memory) ------------------------

@@ -12,6 +12,7 @@ the user-supplied sampling rate for reproducibility.
 from __future__ import annotations
 
 import csv
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -347,7 +348,14 @@ def _clean_channel_name(column_name: str, index: int) -> str:
 
 
 def read_openbci_metadata(file_path: str | Path, max_lines: int = 128) -> dict[str, str]:
-    """Parse the ``%Key = Value`` comment block of an OpenBCI-style CSV."""
+    """Parse the ``%Key = Value`` comment block of an OpenBCI-style CSV.
+
+    A recording also drops an ``.annotations.json`` sidecar next to the CSV, and
+    everything that is only known once the run is over (the applied sweep
+    schedule, for example) is written there instead of into the header, because
+    the header is flushed before the first sample. Those keys are merged in so
+    callers see one metadata dictionary either way.
+    """
 
     metadata: dict[str, str] = {}
     path = Path(file_path)
@@ -367,6 +375,16 @@ def read_openbci_metadata(file_path: str | Path, max_lines: int = 128) -> dict[s
                 metadata[key.strip()] = value.strip()
             else:
                 metadata.setdefault("format", body)
+    sidecar = path.with_suffix(path.suffix + ".annotations.json")
+    if sidecar.exists():
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {}
+        extra = payload.get("metadata") if isinstance(payload, dict) else None
+        if isinstance(extra, dict):
+            for key, value in extra.items():
+                metadata.setdefault(str(key), str(value))
     return metadata
 
 

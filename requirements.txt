@@ -5,3 +5,7 @@ scipy>=1.13
 pyqtgraph>=0.13
 PyQt6>=6.6
 pyserial>=3.5
+# Function-generator control for the automated CMRR/crosstalk sweeps.
+# The app runs without them; only the "Automated sweep" window needs this pair.
+pyvisa>=1.14
+pyvisa-py>=0.7

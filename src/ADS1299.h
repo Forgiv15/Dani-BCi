@@ -48,8 +48,15 @@ public:
     // nothing on the bus is driving.
     uint8_t probeIdleMiso();
 
+    // SCLK is shared by both converters, so a rate change has to be applied to
+    // every instance. 20 MHz is the ESP32 ceiling for this bus; the ADS1299
+    // datasheet allows register access and frame reads well beyond that.
+    void setSpiClock(uint32_t spiClockHz);
+    uint32_t spiClockHz() const;
+
     bool configureBasicEEG();
-    bool configureInternalTestSignal(uint8_t amplitudeCode = 0x04, uint8_t freqCode = 0x03);
+    bool configureInternalTestSignal(uint8_t amplitudeCode = 0x04, uint8_t freqCode = 0x03,
+                                     bool enable = true);
     bool applyCytonDefaults(uint8_t dataRateBits = 0x06);
     bool setDataRateBits(uint8_t dataRateBits);
 
@@ -105,6 +112,7 @@ private:
     uint8_t transfer(uint8_t data);
 
     SPISettings spiSettings;
+    uint32_t spiClock;
 
     int8_t pinDRDY;
     int8_t pinCS;
