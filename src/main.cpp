@@ -35,9 +35,13 @@
 // 2 ms is 16.5 kB/s, so 24 kB absorbs about 1.5 s of stall.
 #ifndef SZD_BT_TX_BUFFER_BYTES
 // The radio ring holds the outgoing stream while the SPP stack is busy. It absorbs
-// bursts; it does not raise the radio's average throughput. 32 kB is about one
-// second of the live link at 1 kSPS (33 B/packet), which is enough to ride out a
-// host that stalls momentarily - the case that used to end in dropped packets.
+// bursts; it does not raise the radio's average throughput.
+//
+// 32 kB is about one second of the live link at 1 kSPS (33 B/packet). It is
+// deliberately not larger: this is the biggest single allocation in the firmware
+// and it is taken *before* the Bluetooth stack starts, so an oversized ring eats
+// the heap Bluedroid needs for its own TX/RX buffers - which shows up as a device
+// that advertises and connects but never answers.
 #define SZD_BT_TX_BUFFER_BYTES 32768
 #endif
 #ifndef SZD_BT_TOUCH_PIN
@@ -57,6 +61,10 @@ static constexpr uint32_t BT_HEALTH_PERIOD_MS = 500;
 // applied, so it does not add latency to a text reply waiting behind it.
 static constexpr uint32_t BT_FLUSH_CHUNK = 1024;
 static constexpr size_t BT_MAX_BUFFER_BYTES = 65536;
+// Version of the Bluetooth throughput benchmark protocol. Reported in the [PWR]
+// status line, so the GUI can tell an image that carries the benchmark from one
+// that would silently ignore its commands.
+static constexpr int BENCH_PROTOCOL_VERSION = 2;
 static constexpr UBaseType_t BT_FLUSH_TASK_PRIO = 2;
 // Core 0, with the radio stack it writes to (see ACQUISITION_CORE for why).
 static constexpr int BT_FLUSH_TASK_CORE = 0;
@@ -139,6 +147,8 @@ static constexpr int32_t ADS_FULL_SCALE_COUNTS = (1 << 23) - 1;
 // The host may raise this at runtime ('o' command) so a 2000/4000 SPS output
 // data rate still fits inside one sample period.
 static constexpr uint32_t ADS_SPI_CLOCK_HZ = 2000000;
+// One RDATAC frame is 3 status bytes + 8 x 24-bit channel slots.
+static constexpr uint32_t ADS_SPI_FRAME_BITS = (3 + 8 * 3) * 8;
 static constexpr uint32_t ADS_SPI_CLOCK_MIN_HZ = 1000000;
 static constexpr uint32_t ADS_SPI_CLOCK_MAX_HZ = 8000000;
 static uint32_t adsSpiClockHz = ADS_SPI_CLOCK_HZ;
@@ -255,6 +265,82 @@ static volatile uint32_t btPacketsQueued = 0;
 static volatile uint32_t btPacketsDropped = 0;
 static volatile uint32_t btBytesSent = 0;
 static volatile bool btClientConnected = false;
+
+// Bluetooth SPP throughput benchmark. The flush task is the only place that
+// knows how many bytes the stack really took and how often it pushed back, so
+// those two counters live here next to the ring rather than with the generator.
+static volatile bool benchActive = false;
+static volatile uint32_t benchBytesOut = 0;
+static volatile uint32_t benchStalls = 0;
+// Progress watchdog. A benchmark that stops delivering must end itself: the direct
+// write path and the mirror flag are restored the moment it stops, so an automatic
+// stop is what keeps the link usable without the user reconnecting by hand.
+static uint32_t benchWatchdogBytes = 0;
+static uint32_t benchWatchdogMs = 0;
+static constexpr uint32_t BENCH_STALL_STOP_MS = 2500;
+
+// ---- direct SPP transmission ----------------------------------------------
+// The Arduino BluetoothSerial wrapper caps throughput: it splits every write
+// into 330-byte esp_spp_write() calls, blocks on a tx-done acknowledgement after
+// each one, and - the part that actually corrupts data - *discards the remainder
+// of a chunk* when the stack reports congestion. Measured on this board that
+// ceiling is about 32 KiB/s, and congested writes arrive at the host as truncated
+// frames.
+//
+// So the bulk stream is written with esp_spp_write() directly. The rules the API
+// imposes are simple and are followed here: only one write may be outstanding,
+// and after a write that reports congestion no further write may be issued until
+// ESP_SPP_CONG_EVT says the link is free again.
+// The Arduino library's own internal write size (SPP_TX_MAX in BluetoothSerial.cpp).
+// Anything at or below this is "the library path"; anything above it must be written
+// directly. Keeping these two constants separate matters: they were once the same
+// value, so `chunk > threshold` was never true and the direct path could not engage.
+static constexpr uint32_t BT_SPP_LIBRARY_CHUNK = 330;
+// Default direct-path chunk. 990 is the classic SPP payload size.
+static constexpr uint32_t BT_SPP_WRITE_CHUNK = 990;
+// Upper bound for the tunable size. Larger chunks mean fewer acknowledgement
+// round trips for the same bytes, which is the whole throughput lever; the stack
+// fragments anything above the L2CAP MTU itself.
+static constexpr uint32_t BT_SPP_WRITE_CHUNK_MAX = 4096;
+// Default is the library's own 330-byte chunk, i.e. "use the proven path". A larger
+// value switches the bulk stream to the direct esp_spp_write path, which is what
+// raises the throughput ceiling - and is therefore opt-in, chosen by the benchmark,
+// rather than something ordinary streaming has to survive.
+static volatile uint32_t btSppWriteChunk = BT_SPP_LIBRARY_CHUNK;
+static constexpr uint32_t BT_SPP_ACK_WAIT_MS = 100;
+// Acknowledgements missed in a row before the direct path is abandoned for the rest
+// of the session. One or two under congestion is normal; a run of them means the
+// link will not tolerate this write size, and silently stalling the stream is worse
+// than going back to the slower path that works.
+static constexpr uint32_t BT_SPP_MAX_ACK_MISSES = 8;
+static volatile uint32_t sppFastPathFallbacks = 0;
+static volatile uint32_t sppHandle = 0;
+static volatile bool sppCongested = false;
+static volatile bool sppWritePending = false;
+static volatile uint32_t sppCongestionEvents = 0;
+static volatile uint32_t sppAckTimeouts = 0;
+static volatile uint32_t sppAckMissesInRow = 0;
+static volatile uint32_t sppApiErrors = 0;
+static SemaphoreHandle_t sppWriteDone = nullptr;
+// Every wait below is bounded, and nothing here latches. A previous version set
+// "a write is in flight" from the congestion flag of the completed write, which
+// meant a write that reported congestion stalled the stream *permanently*: the
+// flag could only be cleared by another write, and no another write was allowed.
+// The board then spun in the flush task and had to be reconnected by hand. Now the
+// in-flight flag is cleared by the completion event *and* by a timeout, so a lost
+// event costs one write rather than the whole session.
+static volatile uint32_t sppWriteStartMs = 0;
+static volatile uint32_t sppCongestSinceMs = 0;
+static constexpr uint32_t BT_SPP_INFLIGHT_TIMEOUT_MS = 150;
+// Congestion is governed by ESP_SPP_CONG_EVT in normal operation; this is only the
+// safety net for a notification that never arrives, so it is generous.
+static constexpr uint32_t BT_SPP_CONGEST_STALE_MS = 1000;
+// Telemetry must never be able to starve the data path. A text line that cannot be
+// sent for this long is dropped: it describes a link that is already broken, and
+// holding it costs the stream everything.
+static constexpr uint32_t BT_TEXT_DROP_MS = 1000;
+static uint32_t btTextStallMs = 0;
+static volatile uint32_t btTextDropped = 0;
 
 // Measured throughput, refreshed once a second by the flush task. The point is to
 // compare what the link *has* to carry against what it actually carries: if the
@@ -425,6 +511,13 @@ static bool awaitingSdCommand = false;
 static bool parsingSdName = false;
 static char sdNamePayload[SD_SESSION_NAME_MAX + 1];
 static int sdNameLen = 0;
+// '|' prefixed power/hardware-enable controls, one ';' terminated key=value
+// line each. A prefix is needed for the same reason ':' exists for the card, and
+// '|' specifically because '!@#$%^&*' are the Cyton "activate channel" shortcuts
+// and every letter and digit is already taken.
+static bool parsingPowerLine = false;
+static char powerPayload[48];
+static int powerLen = 0;
 static char chipReferenceChip = 0;
 static bool parsingDecimation = false;
 static char decimationPayload[4];
@@ -448,6 +541,59 @@ static bool parsingDebugLine = false;
 static char debugLine[128];
 static uint8_t debugLineLen = 0;
 static bool lis3dhPresent = false;
+
+// ---------------------------------------------------------------------------
+// Power-control state.
+//
+// Every entry here is something the operator can switch to get the board into a
+// known current-consumption state and measure it. The firmware only *reports* and
+// *switches*; measuring the current is the bench instrument's job.
+//
+// Pin reality on this board, which the panel has to respect and therefore states:
+//   * PWDN and RESET are wired to BOTH ADS1299s, so those two are board-wide.
+//   * START is shared too, but the converters also honour the START/STOP SPI
+//     commands individually, so per-chip operating mode is possible through SPI.
+//   * The LIS3DH is on I2C and the SD card on its own SPI bus, so each is
+//     independently releasable.
+// ---------------------------------------------------------------------------
+static bool lis3dhPowered = true;
+// Bumped whenever the [PWR] line gains or changes a field, so the panel can tell
+// a matching image from a stale one instead of silently misreading it. Version 2
+// reports the physical PWDN/RESET pin levels and carries this tag.
+static constexpr int POWER_PROTOCOL_VERSION = 2;
+static bool adsPwdnLow = false;   // true = PWDN held low (both chips off)
+static bool adsResetLow = false;  // true = RESET held low (both chips held reset)
+static char adsModeName[DEVICE_COUNT][8] = {"run", "run"};
+static bool powerTestStream = false;  // synthetic stream, no converter traffic
+static int powerBtDbm = SZD_BT_TX_POWER_DBM;
+
+// Maps a requested dBm to the controller's own enumeration. BR/EDR accepts the
+// stepped levels below; anything else is snapped to the nearest that exists.
+static esp_power_level_t btPowerLevelFor(int dbm) {
+  if (dbm <= 0) return ESP_PWR_LVL_N0;
+  if (dbm <= 3) return ESP_PWR_LVL_P3;
+  if (dbm <= 6) return ESP_PWR_LVL_P6;
+  return ESP_PWR_LVL_P9;
+}
+
+static int btPowerDbmFor(esp_power_level_t level) {
+  switch (level) {
+    case ESP_PWR_LVL_N12: return -12;
+    case ESP_PWR_LVL_N9: return -9;
+    case ESP_PWR_LVL_N6: return -6;
+    case ESP_PWR_LVL_N3: return -3;
+    case ESP_PWR_LVL_N0: return 0;
+    case ESP_PWR_LVL_P3: return 3;
+    case ESP_PWR_LVL_P6: return 6;
+    case ESP_PWR_LVL_P9: return 9;
+    default: return -99;
+  }
+}
+static bool powerBtSleep = false;
+// A sleep request is deferred to the main loop so the acknowledgement can reach
+// the host before the chip stops executing.
+static uint32_t pendingSleepMs = 0;
+static uint8_t pendingSleepMode = 0;  // 0 none, 1 light, 2 deep
 static uint8_t lis3dhAddress = LIS3DH_ADDR_LOW;
 static uint8_t lis3dhWhoAmI = 0x00;
 static volatile int16_t gAuxData[3] = {0, 0, 0};
@@ -502,6 +648,16 @@ static uint32_t sdRecordStartMs = 0;
 static uint32_t sdRecordDurationMs = 0;
 static SemaphoreHandle_t sdMutex = nullptr;
 static QueueHandle_t sdQueue = nullptr;
+static volatile bool sdQueueReleasePending = false;
+// The queue is created on the first recording and destroyed when it stops, rather
+// than living for the whole session. It is 32 kB of sample storage - a quarter of
+// everything this firmware allocates - and with no card inserted it is pure waste.
+// Holding it unconditionally is what left the heap at 11.9 kB once Bluedroid had
+// taken its share, and Bluedroid cannot transmit without contiguous TX buffers: that
+// showed up as "SPP TX Packet Malloc Failed" and a link that connected but carried
+// nothing. The queue is allocated when a recording opens, which always frees it again.
+static bool ensureSdQueue();
+static void releaseSdQueue();
 
 // Session name used for the SD file and its header. Written into the config file
 // so a button-started recording carries the same name the GUI would have used.
@@ -643,6 +799,8 @@ static bool stopStreaming();
 static void startStreaming();
 static void programAllDevices();
 static void emitSdStatus(const char* event = nullptr);
+static void emitPowerStatus(const char* event = nullptr);
+static void handlePowerCommand(const char* payload);
 static void saveSdConfiguration();
 static bool loadSdConfiguration(bool applyToHardware);
 static void startSdRecordingFromBoard(const char* reason);
@@ -720,7 +878,14 @@ static bool btRingPush(const uint8_t* data, size_t length, bool dropOldest) {
 }
 
 static bool btHasClient() {
-  return btStackReady && btSerial.hasClient();
+  if (!btStackReady) {
+    return false;
+  }
+  // Either evidence of a client is enough. `hasClient()` reads the library's single
+  // tracked handle, which is momentarily zero at various points in its own connect
+  // and disconnect bookkeeping; the SPP handle comes from the stack's events. Requiring
+  // both made startBenchmark() refuse to run on a perfectly good link.
+  return btSerial.hasClient() || sppHandle != 0;
 }
 
 // Safe from any task and from the BT callback: no allocation, no printing.
@@ -759,6 +924,179 @@ static size_t btRingUsedBytes() {
                                                  : (btRingSize - btRingTail + btRingHead);
   portEXIT_CRITICAL(&btRingLock);
   return used;
+}
+
+// Replaces the transmit ring. Everything that is buffered is discarded, which is why
+// this is only safe at a point where the caller knows the stream is stopped - a ring
+// resize mid-stream would lose frames the host has already been promised.
+static bool resizeBluetoothRing(size_t bytes) {
+  if (bytes < 2048 || bytes > BT_MAX_BUFFER_BYTES) {
+    return false;
+  }
+  uint8_t* fresh = static_cast<uint8_t*>(malloc(bytes));
+  if (fresh == nullptr) {
+    return false;
+  }
+  portENTER_CRITICAL(&btRingLock);
+  uint8_t* previous = btRing;
+  btRing = fresh;
+  btRingSize = bytes;
+  btRingHead = 0;
+  btRingTail = 0;
+  portEXIT_CRITICAL(&btRingLock);
+  if (previous != nullptr) {
+    free(previous);
+  }
+  return true;
+}
+
+// Hands one chunk to the radio, and is the only writer of the SPP API.
+//
+// Returns the number of bytes accepted: the whole chunk, or zero when the stack
+// cannot take it right now. Never a partial count, so the caller either advances
+// its ring by what it passed in or by nothing - there is no path that loses bytes.
+//
+// Two transports, and the choice is deliberate:
+//
+// * the **library path** is the default and is what every reply and the ordinary
+//   sample stream use. It is the code that has always worked on this board.
+// * the **direct path** (esp_spp_write with a chunk larger than the library's own
+//   330 bytes) exists only to measure and raise the throughput ceiling. It is
+//   opted into by the benchmark, and it falls back to the library path on its own
+//   if the link stops acknowledging.
+// A benchmark must never run on the library path.
+//
+// BluetoothSerial queues a *copy* of every chunk (a malloc per write) and, when the
+// stack reports congestion, does `if(!_spp_send_buffer()){ len = 0; }` - it discards
+// the rest of that chunk. A throughput test is nothing but congestion, so on the
+// library path the stream is shredded into unparseable fragments and the heap fills
+// with queued 1 kB copies. Measured on this board: heap fell to 10 kB, write
+// failures climbed into the thousands, and the host parsed zero frames out of the
+// 3.5 kB that did arrive.
+//
+// The direct path takes no copy and never drops a partial chunk, so it is the only
+// one that can carry a benchmark. It stays active only while the test runs.
+static bool btFastPathActive() {
+#if SZD_BT_ENABLED
+  return benchActive && sppHandle != 0 && btSppWriteChunk > BT_SPP_LIBRARY_CHUNK;
+#else
+  return false;
+#endif
+}
+
+// Would the direct path engage at the currently selected write size? Answered
+// without needing a live handle, so the ring can be sized before the test starts.
+static bool btFastPathWanted() {
+  return btSppWriteChunk > BT_SPP_LIBRARY_CHUNK;
+}
+
+static constexpr size_t BENCH_RING_BYTES_DIRECT = 8192;
+static constexpr size_t BENCH_RING_BYTES_LIBRARY = 32768;
+
+// The largest chunk one write can carry on the path that is currently in use.
+//
+// The library path is capped at exactly the library's own internal buffer size, for
+// two reasons that both showed up as "a little data, then nothing":
+//
+// * BluetoothSerial mallocs a copy of every chunk it is handed, so asking for 1024
+//   means a 1 kB allocation per write on a heap that has no room for it - the
+//   failure is `_spp_queue_packet(): SPP TX Packet Malloc Failed` and the data
+//   simply does not go anywhere.
+// * when the stack reports congestion it discards the *rest* of the chunk it is
+//   assembling. Handing it 1024 bytes means 330 + 330 + 364, and the 364 is thrown
+//   away mid-frame. At 330 the send buffer is emptied on every call, so there is
+//   never a remainder to lose.
+//
+// 330 is also 10 whole 33-byte sample packets, so a fragmented frame cannot span a
+// write boundary either.
+static constexpr size_t BT_LIBRARY_WRITE_CHUNK = BT_SPP_LIBRARY_CHUNK;
+static size_t btMaxWriteChunk() {
+  return btFastPathActive() ? static_cast<size_t>(btSppWriteChunk) : BT_LIBRARY_WRITE_CHUNK;
+}
+
+static size_t btRawWrite(const uint8_t* data, size_t length) {
+  if (data == nullptr || length == 0) {
+    return 0;
+  }
+#if SZD_BT_ENABLED
+  if (btFastPathActive()) {
+    if (length > btSppWriteChunk) {
+      length = btSppWriteChunk;
+    }
+    const uint32_t nowMs = millis();
+    // Congestion is a hint, not a latch. The stack reports the *change*, so if the
+    // "free again" notification is ever lost the flag would otherwise block every
+    // later write for the rest of the session - which is exactly the wedge that
+    // made a stuck benchmark require a reconnect. After BT_SPP_CONGEST_STALE_MS it
+    // is treated as stale and the next write is attempted anyway.
+    if (sppCongested) {
+      if (nowMs - sppCongestSinceMs < BT_SPP_CONGEST_STALE_MS) {
+        return 0;
+      }
+      sppCongested = false;
+    }    // The API allows one outstanding write. Losing its completion event must cost
+    // one write, not everything after it.
+    if (sppWritePending) {
+      if (nowMs - sppWriteStartMs < BT_SPP_INFLIGHT_TIMEOUT_MS) {
+        return 0;
+      }
+      sppAckTimeouts++;
+      sppWritePending = false;
+    }
+    if (btApiMutex == nullptr || xSemaphoreTake(btApiMutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+      return 0;
+    }
+    if (sppWriteDone != nullptr) {
+      // Stale give from a previous write must not satisfy the wait below.
+      xSemaphoreTake(sppWriteDone, 0);
+    }
+    const esp_err_t result =
+        esp_spp_write(static_cast<uint32_t>(sppHandle), static_cast<int>(length),
+                      const_cast<uint8_t*>(data));
+    if (result != ESP_OK) {
+      // Most often ESP_FAIL because the previous write is still queued. Not an
+      // error condition, just backpressure: report it and try again next pass.
+      sppApiErrors++;
+      xSemaphoreGive(btApiMutex);
+      return 0;
+    }
+    sppWritePending = true;
+    sppWriteStartMs = millis();
+    bool acknowledged = true;
+    if (sppWriteDone != nullptr) {
+      // Wait for the acknowledgement before the next chunk: the API permits only
+      // one outstanding write, and the library's own 1000 ms wait is far too long
+      // for a stream.
+      acknowledged = xSemaphoreTake(sppWriteDone, pdMS_TO_TICKS(BT_SPP_ACK_WAIT_MS)) == pdTRUE;
+    }
+    xSemaphoreGive(btApiMutex);
+    if (!acknowledged) {
+      sppAckTimeouts++;
+      sppWritePending = false;
+      if (++sppAckMissesInRow >= BT_SPP_MAX_ACK_MISSES) {
+        // This link will not take this write size. Go back to the library path
+        // instead of stalling the stream, and say so once.
+        btSppWriteChunk = BT_SPP_LIBRARY_CHUNK;
+        sppAckMissesInRow = 0;
+        sppFastPathFallbacks++;
+        Serial.printf("[BT] fast write path abandoned after %u missed acknowledgements, "
+                      "back to the library path\n",
+                      static_cast<unsigned>(BT_SPP_MAX_ACK_MISSES));
+      }
+      return 0;
+    }
+    sppAckMissesInRow = 0;
+    return length;
+  }
+#endif
+  // The library path. Its own mutex is held because the supervisor tears the stack
+  // down under the same lock, and a write must never be in progress while it does.
+  size_t written = 0;
+  if (btApiMutex != nullptr && xSemaphoreTake(btApiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    written = btSerial.write(data, length);
+    xSemaphoreGive(btApiMutex);
+  }
+  return written;
 }
 
 static size_t btTextRingUsed() {
@@ -1330,6 +1668,31 @@ static void writeSampleToSd(const SdSample& sample) {
   xSemaphoreGive(sdMutex);
 }
 
+// Creates the sample queue on demand. Doing it lazily is what keeps ~32 kB of heap
+// available for Bluedroid in the common case where no card is inserted: a starved
+// heap does not fail loudly, it makes esp_spp_write() refuse and the link carry
+// nothing, which looks like a broken radio.
+static bool ensureSdQueue() {
+  if (sdQueue != nullptr) {
+    return true;
+  }
+  sdQueue = xQueueCreate(SD_QUEUE_LENGTH, sizeof(SdSample));
+  return sdQueue != nullptr;
+}
+
+static void releaseSdQueue() {
+  // Only ever called from the writer task itself, which is the sole task that blocks
+  // on the queue. Deleting it from another task would pull the handle out from under
+  // a blocked xQueueReceive().
+  if (sdQueue == nullptr) {
+    sdQueueReleasePending = false;
+    return;
+  }
+  vQueueDelete(sdQueue);
+  sdQueue = nullptr;
+  sdQueueReleasePending = false;
+}
+
 static void queueSampleForSd(uint8_t packetIndex, const int32_t channels[TOTAL_ADS_CHANNELS], const int16_t aux[3]) {
   if (sdQueue == nullptr || !sdRecording) {
     return;
@@ -1550,7 +1913,18 @@ static bool openSdFile(uint32_t durationMs, const char* label) {
   }
   sdBytesWritten = static_cast<uint32_t>(sdFile.position());
   sdHeaderWritten = true;
-
+  if (!ensureSdQueue()) {
+    // Never start a recording that cannot accept a single sample: the file would
+    // open, gain a header and stay empty.
+    sdFile.close();
+    sdFileName[0] = '\0';
+    if (sdMutex != nullptr) {
+      xSemaphoreGive(sdMutex);
+    }
+    emitFailure("not enough free memory for the SD sample queue - close Bluetooth or "
+                "reduce the transmit buffer, then try again");
+    return false;
+  }
   sdRecording = true;
   sdRecordStartMs = millis();
   sdRecordDurationMs = durationMs;
@@ -1587,6 +1961,11 @@ static void closeSdFile() {
   if (sdMutex != nullptr) {
     xSemaphoreGive(sdMutex);
   }
+  // Nothing can queue a sample now that sdRecording is false, so the queue is
+  // released as soon as the writer task next sees it idle: the 32 kB it returns is
+  // what makes a Bluetooth benchmark possible straight after a recording.
+  sdQueueReleasePending = true;
+  usbHostPort.printf("[SD] closed, %u B heap free\n", static_cast<unsigned>(ESP.getFreeHeap()));
 }
 
 static void updateSdRecordingTimeout() {
@@ -2922,7 +3301,9 @@ static void fillAuxPayload(uint8_t packet[33], int16_t auxOut[3]) {
 static void btFlushTask(void* parameter) {
   (void)parameter;
 
-  uint8_t chunk[BT_FLUSH_CHUNK];
+  // Static, not on the stack: this task gets 5 kB and the chunk is a third of it.
+  // There is exactly one flush task, so a single buffer is all that is needed.
+  static uint8_t chunk[BT_SPP_WRITE_CHUNK_MAX];
   for (;;) {
     if (!btStackReady || btRing == nullptr) {
       vTaskDelay(pdMS_TO_TICKS(50));
@@ -2944,31 +3325,55 @@ static void btFlushTask(void* parameter) {
 
     // Text replies first: a "Success:" line must not queue behind 1.5 s of
     // sample packets, or the GUI times the settings write out.
+    //
+    // Except during a benchmark, where nothing is waiting on a reply and a text line
+    // can only steal the one write the rate depends on. Telemetry then goes to the
+    // cable (see benchEmitDiagnostics) and the radio carries data only.
     char textChunk[256];
-    const size_t textTaken = btTextRingPeek(textChunk, sizeof(textChunk));
+    const size_t textTaken = benchActive ? 0 : btTextRingPeek(textChunk, sizeof(textChunk));
     if (textTaken > 0) {
-      size_t textWritten = 0;
-      if (btApiMutex != nullptr && xSemaphoreTake(btApiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        textWritten = btSerial.write(reinterpret_cast<const uint8_t*>(textChunk), textTaken);
-        xSemaphoreGive(btApiMutex);
-      }
-      if (textWritten == textTaken) {
-        btTextRingAdvance(textTaken);
+      // The text ring is small, but a small write size could still be smaller than
+      // what is queued, so only take what one write can carry.
+      const size_t textWant = min(textTaken, btMaxWriteChunk());
+      const size_t textWritten =
+          btRawWrite(reinterpret_cast<const uint8_t*>(textChunk), textWant);
+      if (textWritten == textWant) {
+        btTextRingAdvance(textWant);
         btBytesSent += static_cast<uint32_t>(textWritten);
         btLastWriteOkMs = millis();
+        btTextStallMs = 0;
       } else {
         btWriteFailures++;
+        // Never spin here. This branch used to `continue` with no delay, so one
+        // unsendable status line burned a core at 200000 iterations a second and the
+        // data ring was never reached again - the benchmark reported STACK=0 while
+        // FAILS climbed into the hundreds of thousands. Telemetry is diagnostic
+        // output; if it cannot be sent, drop it rather than starve the stream.
+        if (btTextStallMs == 0) {
+          btTextStallMs = millis();
+        } else if (millis() - btTextStallMs > BT_TEXT_DROP_MS) {
+          btTextRingAdvance(textWant);
+          btTextDropped++;
+          btTextStallMs = 0;
+        }
+        vTaskDelay(1);
       }
       continue;
     }
+    btTextStallMs = 0;
 
     // Snapshot and copy under one lock: the buffer can be reallocated by the
     // Q command between two separate critical sections.
+    //
+    // The copy is capped by the SPP write size, not just by the scratch buffer:
+    // if more were copied than one write can carry, the tail would never advance
+    // past the difference and the ring would jam.
     size_t take = 0;
+    const size_t maxTake = min(sizeof(chunk), btMaxWriteChunk());
     portENTER_CRITICAL(&btRingLock);
     const size_t availableBytes =
         (btRingHead >= btRingTail) ? (btRingHead - btRingTail) : (btRingSize - btRingTail + btRingHead);
-    take = min(availableBytes, sizeof(chunk));
+    take = min(availableBytes, maxTake);
     if (take > 0 && btRing != nullptr) {
       const size_t first = min(take, btRingSize - btRingTail);
       memcpy(chunk, btRing + btRingTail, first);
@@ -2982,17 +3387,18 @@ static void btFlushTask(void* parameter) {
       continue;
     }
 
-    size_t written = 0;
-    if (btApiMutex != nullptr && xSemaphoreTake(btApiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      written = btSerial.write(chunk, take);
-      xSemaphoreGive(btApiMutex);
-    }
+    size_t written = btRawWrite(chunk, take);
     if (written == take) {
       portENTER_CRITICAL(&btRingLock);
       btRingTail = (btRingTail + take) % btRingSize;
       portEXIT_CRITICAL(&btRingLock);
       btStreamCrc = crc16Update(btStreamCrc, chunk, take);
       btBytesSent += static_cast<uint32_t>(written);
+      if (benchActive) {
+        // What the stack actually accepted, which is not the same thing as what
+        // the generator queued: only the host count proves what was delivered.
+        benchBytesOut += static_cast<uint32_t>(written);
+      }
       btLastWriteOkMs = millis();
       // Measured rate, so "is the link keeping up" is a number rather than a guess.
       btRateWindowBytes += static_cast<uint32_t>(written);
@@ -3008,6 +3414,9 @@ static void btFlushTask(void* parameter) {
       // The SPP queue is full; keep the bytes and retry rather than dropping a
       // packet that the host would see as a gap.
       btWriteFailures++;
+      if (benchActive) {
+        benchStalls++;
+      }
       vTaskDelay(pdMS_TO_TICKS(2));
     }
   }
@@ -3027,8 +3436,18 @@ static void btSppEvent(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
   switch (event) {
     case ESP_SPP_SRV_OPEN_EVT: {
       btOpenEvents++;
+      if (param->srv_open.status != ESP_SPP_SUCCESS) {
+        // A failed open still fires this event. Adopting its handle would leave the
+        // direct path pointing at a client that does not exist, so every write would
+        // fail while the diagnostics claimed the link was up.
+        btLogEvent("open-failed status=%d", static_cast<int>(param->srv_open.status));
+        break;
+      }
       const bool already_open = btLinkOpen;
       btLinkOpen = true;
+      sppHandle = param->srv_open.handle;
+      sppCongested = false;
+      sppWritePending = false;
       if (already_open) {
         // A second client arrived while one was tracked, so the library has just
         // disconnected the new one and kept the stale handle.
@@ -3044,6 +3463,9 @@ static void btSppEvent(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
     case ESP_SPP_CLOSE_EVT:
       btCloseEvents++;
       btLinkOpen = false;
+      sppHandle = 0;
+      sppWritePending = false;
+      sppCongested = false;
       if (param->close.async) {
         btRemoteCloses++;
       }
@@ -3067,6 +3489,45 @@ static void btSppEvent(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
       break;
     case ESP_SPP_CONG_EVT:
       // Congestion is normal and transient; only report the recovery.
+      sppCongested = param->cong.cong;
+      if (param->cong.cong) {
+        sppCongestSinceMs = millis();
+        sppCongestionEvents++;
+      }
+      if (param->cong.handle != 0) {
+        // Any event that carries the handle can supply it. Waiting only for
+        // SRV_OPEN_EVT was not reliable: when that event was missed the direct path
+        // stayed disabled and the benchmark silently fell back to the library, which
+        // discards partial chunks.
+        sppHandle = param->cong.handle;
+      }
+      break;
+    case ESP_SPP_WRITE_EVT:
+      // The single permitted outstanding write has completed. This is the only
+      // thing that clears the in-flight flag on the happy path, and it must clear it
+      // *unconditionally*: deriving the flag from `write.cong` - as an earlier
+      // version did - meant "this write congested the link" was read as "a write is
+      // still in flight", which could never be cleared because no further write was
+      // then permitted. That single line wedged the whole Bluetooth link.
+      sppWritePending = false;
+      if (param->write.handle != 0) {
+        sppHandle = param->write.handle;
+      }
+      sppCongested = param->write.cong;
+      if (param->write.cong) {
+        sppCongestSinceMs = millis();
+        sppCongestionEvents++;
+      }
+      if (sppWriteDone != nullptr) {
+        xSemaphoreGive(sppWriteDone);
+      }
+      break;
+    case ESP_SPP_DATA_IND_EVT:
+      // A host that is sending commands is proof of a live client handle, and this
+      // event arrives for every command, so it is the most reliable source of all.
+      if (param->data_ind.handle != 0) {
+        sppHandle = param->data_ind.handle;
+      }
       break;
     default:
       break;
@@ -3157,22 +3618,11 @@ static void applyBluetoothBufferSize(int kilobytes) {
     return;
   }
   const size_t bytes = static_cast<size_t>(kilobytes) * 1024;
-  uint8_t* fresh = static_cast<uint8_t*>(malloc(bytes));
-  if (fresh == nullptr) {
+  char msg[96];
+  if (!resizeBluetoothRing(bytes)) {
     emitFailure("not enough memory for that buffer size");
     return;
   }
-  portENTER_CRITICAL(&btRingLock);
-  uint8_t* previous = btRing;
-  btRing = fresh;
-  btRingSize = bytes;
-  btRingHead = 0;
-  btRingTail = 0;
-  portEXIT_CRITICAL(&btRingLock);
-  if (previous != nullptr) {
-    free(previous);
-  }
-  char msg[96];
   snprintf(msg, sizeof(msg), "bluetooth buffer set to %d kB (latency at 500 SPS: %.1f s)", kilobytes,
            static_cast<double>(bytes) / 16500.0);
   emitSuccess(msg);
@@ -3184,10 +3634,18 @@ static void applyBluetoothBufferSize(int kilobytes) {
 // advance and nothing is hardcoded.
 static void bringUpBluetooth() {
 #if SZD_BT_ENABLED
+  if (sppWriteDone == nullptr) {
+    // Created before the stack can report a connection, so the first write always
+    // has somewhere to wait for its acknowledgement.
+    sppWriteDone = xSemaphoreCreateBinary();
+  }
   if (btSerial.begin(SZD_BT_DEVICE_NAME)) {
     btStackReady = true;
     btStreamToRadio = true;
     btLinkOpen = false;
+    sppHandle = 0;
+    sppCongested = false;
+    sppWritePending = false;
     // 2 ms: long enough that a read does not spin, short enough that a blocking
     // read can never delay the command parser.
     btSerial.setTimeout(2);
@@ -3195,23 +3653,16 @@ static void bringUpBluetooth() {
 
     // Ask the controller for a lower ceiling than its +9 dBm maximum: a bench
     // link does not need the power, and a quieter radio disturbs the ADC less.
-    esp_power_level_t level = ESP_PWR_LVL_P3;
-#if SZD_BT_TX_POWER_DBM >= 6
-    level = ESP_PWR_LVL_P6;
-#endif
-#if SZD_BT_TX_POWER_DBM >= 9
-    level = ESP_PWR_LVL_P9;
-#endif
-#if SZD_BT_TX_POWER_DBM <= 0
-    level = ESP_PWR_LVL_N0;
-#endif
+    // The level comes from the runtime setting so the host can change it without
+    // a reflash, and the same code path is used for both so they cannot diverge.
+    const esp_power_level_t level = btPowerLevelFor(powerBtDbm);
     // Applied last: the controller has to be enabled before it accepts a power
     // range, and a rejected setting must never abort the bring-up.
     const esp_err_t power_result = esp_bredr_tx_power_set(level, level);
     Serial.printf("[BT] SPP '%s' ready, tx power request %d dBm (%s), heap %u bytes\n", SZD_BT_DEVICE_NAME,
-                  SZD_BT_TX_POWER_DBM, power_result == ESP_OK ? "accepted" : "rejected, using the default",
+                  powerBtDbm, power_result == ESP_OK ? "accepted" : "rejected, using the default",
                   static_cast<unsigned>(ESP.getFreeHeap()));
-    btLogEvent("ready txdbm=%d power=%s heap=%u", SZD_BT_TX_POWER_DBM,
+    btLogEvent("ready txdbm=%d power=%s heap=%u", powerBtDbm,
                power_result == ESP_OK ? "ok" : "rejected", static_cast<unsigned>(ESP.getFreeHeap()));
   } else {
     btStackReady = false;
@@ -3805,14 +4256,72 @@ static void handleDecimationPayload(const char* payload) {
 // SCLK is shared by both converters, so the new rate has to reach both objects.
 // Streaming is stopped first: a rate change in the middle of a frame read is the
 // one way to get a torn sample out of the bus.
+//
+// Two things are checked, because both of them present as "the stream turned into
+// gibberish the moment I changed the clock" rather than as an error:
+//
+// * the bus must be able to carry the selected output data rate. A 216-bit frame per
+//   converter at 1 MHz is 216 us x 2 = 432 us, so 2 kSPS needs 864 ms of every second
+//   just for SPI - the frame read then overruns the next DRDY and every sample after
+//   it is taken from the wrong conversion.
+// * the converters must still answer correctly afterwards, so the device ID is read
+//   back over the new clock before the change is kept.
 static bool applySpiClockSetting(uint32_t hz) {
   if (hz < ADS_SPI_CLOCK_MIN_HZ || hz > ADS_SPI_CLOCK_MAX_HZ) {
     return false;
   }
+  const uint32_t frameUs = (ADS_SPI_FRAME_BITS * DEVICE_COUNT * 1000000UL + hz - 1UL) / hz;
+  const uint32_t busLimit = frameUs > 0 ? (900000UL / frameUs) : 0;
+  const uint32_t wantedRate = sampleRateFromCode(sampleRateCode);
+  if (busLimit != 0 && wantedRate > busLimit) {
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "SPI %lukHz only carries %lu SPS, but %lu SPS is selected - lower the data "
+             "rate first or the frames will overrun the converters",
+             static_cast<unsigned long>(hz / 1000UL), static_cast<unsigned long>(busLimit),
+             static_cast<unsigned long>(wantedRate));
+    emitFailure(msg);
+    return false;
+  }
+
+  const uint32_t previousHz = adsSpiClockHz;
   const bool wasStreaming = stopStreaming();
   adsSpiClockHz = hz;
   for (size_t i = 0; i < DEVICE_COUNT; ++i) {
     devices[i].ads->setSpiClock(hz);
+  }
+  // Read the identity back over the new clock. A device that answers with the wrong
+  // ID - or not at all - is not running at this rate, so the change is undone rather
+  // than leaving a stream of plausible-looking nonsense behind.
+  bool identityOk = true;
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    if (!devices[i].linkOk) {
+      continue;
+    }
+    const uint8_t id = devices[i].ads->readRegister(0x00);
+    if (id != devices[i].deviceId) {
+      identityOk = false;
+      char msg[128];
+      snprintf(msg, sizeof(msg),
+               "ADS%u answered 0x%02X at %lukHz instead of 0x%02X - reverting to %lukHz",
+               static_cast<unsigned>(i + 1), id, static_cast<unsigned long>(hz / 1000UL),
+               devices[i].deviceId, static_cast<unsigned long>(previousHz / 1000UL));
+      emitFailure(msg);
+      break;
+    }
+  }
+  if (!identityOk) {
+    adsSpiClockHz = previousHz;
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+      devices[i].ads->setSpiClock(previousHz);
+    }
+    // The converters were addressed while streaming was stopped, so RDATAC has to be
+    // re-armed either way; restarting from here does that.
+    programAllDevices();
+    if (wasStreaming) {
+      startStreaming();
+    }
+    return true;
   }
   if (wasStreaming) {
     startStreaming();
@@ -4234,7 +4743,1158 @@ static void handleDebugLine(const char* line) {
   emitDebugLine("#ERR ", "unknown");
 }
 
+static void handlePowerStopStreaming() {
+  if (!streaming) {
+    return;
+  }
+  suppressAutoStream = true;
+  stopStreaming();
+  emitSuccess("stream stopped for the power test");
+}
+
+// Restores the accelerometer to its configured rate, or parks it in power-down.
+// CTRL_REG1 = 0 stops the internal oscillator and puts the part in its lowest
+// current state (about 0.5 uA instead of ~11 uA at 100 Hz).
+static bool setLis3dhPowered(bool enabled) {
+  if (!lis3dhPresent) {
+    emitFailure("the accelerometer is not present");
+    return false;
+  }
+  const uint8_t value = enabled ? LIS3DH_CTRL1_100HZ_XYZ : 0x00;
+  if (!lis3dhWriteRegister(LIS3DH_REG_CTRL1, value)) {
+    emitFailure("the accelerometer did not accept the CTRL1 write");
+    return false;
+  }
+  uint8_t readback = 0xFF;
+  lis3dhReadRegister(LIS3DH_REG_CTRL1, readback);
+  lis3dhPowered = enabled;
+  char msg[80];
+  snprintf(msg, sizeof(msg), "LIS3DH %s (CTRL1=0x%02X)", enabled ? "running" : "powered down", readback);
+  emitSuccess(msg);
+  return true;
+}
+
+static bool adsReleaseHeldReset();
+
+// Re-detect and fully re-programme both converters after a power cycle.
+//
+// A converter that comes back from PWDN or RESET is *not* configured: it answers
+// on SPI with its register defaults, which means no reference buffer, no clock
+// output and every channel in its power-down state. Detecting it and leaving it
+// there is what made the converters look dead after a power test, so the recovery
+// re-runs the same path the boot sequence uses.
+static void restoreConverters(const char* reason) {
+  if (adsResetLow) {
+    digitalWrite(PIN_ADS_RESET, HIGH);
+    adsResetLow = false;
+    // RESET release: the part re-runs its power-on sequence and needs its
+    // reference to settle before SPI is meaningful.
+    delay(150);
+  }
+  if (adsPwdnLow) {
+    digitalWrite(PIN_ADS_PWDN, HIGH);
+    adsPwdnLow = false;
+    delay(150);
+  }
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    devices[i].linkOk = false;
+  }
+  // recoverMissingDevices() is the boot path for "a converter that is not linked
+  // yet": detect, apply Cyton defaults, lead-off, reference, every channel, and
+  // re-attach DRDY. Reusing it keeps a powered-down chip and a chip that failed
+  // to start up identical to the rest of the firmware.
+  //
+  // It is retried because a converter coming out of PWDN or RESET is not ready on
+  // the first attempt: ADS2 in particular is clocked by ADS1, so it has to wait for
+  // ADS1 to be configured and driving CLK before it answers at all.
+  for (uint8_t attempt = 0; attempt < 5; ++attempt) {
+    recoverMissingDevices();
+    if (devices[0].linkOk) {
+      break;
+    }
+    delay(30);
+  }
+  programAllDevices();
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    if (devices[i].linkOk) {
+      snprintf(adsModeName[i], sizeof(adsModeName[i]), "run");
+    }
+  }
+  char msg[128];
+  snprintf(msg, sizeof(msg), "converters reprogrammed after %s: ADS1 %s, ADS2 %s", reason,
+           devices[0].linkOk ? "ok" : "no answer", devices[1].linkOk ? "ok" : "no answer");
+  emitSuccess(msg);
+}
+
+// How many DRDY edges the converter produced in a short window. This is the only
+// honest answer to "is it really converting": a register readback proves the
+// configuration, an edge count proves data is being produced.
+static uint32_t measureDrdyWindow(size_t index, uint32_t windowMs, uint32_t& secondChip) {
+  if (index >= DEVICE_COUNT) {
+    return 0;
+  }
+  const uint32_t before0 = devices[0].drdyCount;
+  const uint32_t before1 = DEVICE_COUNT > 1 ? devices[1].drdyCount : 0;
+  delay(windowMs);
+  secondChip = (DEVICE_COUNT > 1) ? (devices[1].drdyCount - before1) : 0;
+  return devices[0].drdyCount - before0;
+}
+
+static bool setAdsMode(uint8_t index, const char* mode) {
+  if (index >= DEVICE_COUNT) {
+    return false;
+  }
+  DeviceCtx& dev = devices[index];
+  if (adsPwdnLow) {
+    emitFailure("PWDN is held low, so both converters are off - release it first");
+    return false;
+  }
+  if (adsResetLow) {
+    emitFailure("RESET is held low, so both converters are held reset - release it first");
+    return false;
+  }
+  if (!dev.linkOk && !dev.ads->detect()) {
+    emitFailure("that converter is not answering on SPI");
+    return false;
+  }
+  dev.linkOk = true;
+
+  // Only the SPI opcodes are used for starting and stopping. The pin-driving
+  // helpers also move the *shared* START pin, which would silently change the
+  // other converter's state.
+  if (strcmp(mode, "run") == 0) {
+    dev.ads->WAKEUP();
+    delay(1);
+    dev.ads->SDATAC();
+    // Re-programme before converting, so "run" means "running with the settings
+    // this app holds", not "running with whatever the chip had in its registers".
+    programAllDevices();
+    dev.ads->RDATAC();
+    delay(1);
+    dev.ads->START();
+    digitalWrite(PIN_ADS_START, HIGH);
+  } else if (strcmp(mode, "idle") == 0) {
+    dev.ads->WAKEUP();
+    dev.ads->STOP();
+    dev.ads->SDATAC();
+  } else if (strcmp(mode, "standby") == 0) {
+    dev.ads->STOP();
+    dev.ads->SDATAC();
+    delay(1);
+    dev.ads->STANDBY();
+  } else {
+    emitFailure("mode must be run, idle or standby");
+    return false;
+  }
+  snprintf(adsModeName[index], sizeof(adsModeName[index]), "%s", mode);
+
+  // Prove it: count edges for a few periods and report the number.
+  uint32_t otherChip = 0;
+  const uint32_t edges = measureDrdyWindow(index, 60, otherChip);
+  const uint16_t rate = sampleRateFromCode(sampleRateCode);
+  char msg[144];
+  if (strcmp(mode, "run") == 0 && edges == 0) {
+    snprintf(msg, sizeof(msg),
+             "%s is in run mode but produced no DRDY in 60 ms - it is not converting", dev.name);
+    emitFailure(msg);
+    return false;
+  }
+  snprintf(msg, sizeof(msg), "%s -> %s, %lu DRDY edges in 60 ms (%.0f SPS expected)", dev.name, mode,
+           static_cast<unsigned long>(edges), static_cast<double>(rate) * 0.060);
+  emitSuccess(msg);
+  return true;
+}
+
+static bool setChipDataRate(uint8_t index, uint8_t code) {
+  if (index >= DEVICE_COUNT || code > 6) {
+    return false;
+  }
+  if (!devices[index].linkOk) {
+    emitFailure("that converter is not answering on SPI");
+    return false;
+  }
+  const bool ok = devices[index].ads->setDataRateBits(code);
+  char msg[64];
+  snprintf(msg, sizeof(msg), "%s data rate %s (%lu SPS)", devices[index].name, ok ? "set" : "FAILED",
+           static_cast<unsigned long>(sampleRateFromCode(code)));
+  if (ok) {
+    emitSuccess(msg);
+  } else {
+    emitFailure(msg);
+  }
+  return ok;
+}
+
+static bool setChipGain(uint8_t index, uint8_t gainOrdinal) {
+  if (index >= DEVICE_COUNT || gainOrdinal > 6) {
+    return false;
+  }
+  if (!devices[index].linkOk) {
+    emitFailure("that converter is not answering on SPI");
+    return false;
+  }
+  // The PGA is per channel, so "chip gain" means every channel of that chip.
+  for (uint8_t ch = 0; ch < devices[index].channelCount; ++ch) {
+    const uint8_t real = static_cast<uint8_t>(devices[index].channelOffset + ch);
+    channelSettings[real].gainOrdinal = gainOrdinal;
+  }
+  bool ok = true;
+  for (uint8_t ch = 0; ch < devices[index].channelCount; ++ch) {
+    ok = applyChannelToHardware(static_cast<uint8_t>(devices[index].channelOffset + ch)) && ok;
+  }
+  static const char* kGainNames[] = {"x1", "x2", "x4", "x6", "x8", "x12", "x24"};
+  char msg[64];
+  snprintf(msg, sizeof(msg), "%s gain %s on every channel%s", devices[index].name,
+           kGainNames[gainOrdinal > 6 ? 6 : gainOrdinal], ok ? "" : " (write failed)");
+  if (ok) {
+    emitSuccess(msg);
+  } else {
+    emitFailure(msg);
+  }
+  return ok;
+}
+
+static bool setAdsPwdnLow(bool low) {
+  // Powering a converter down mid-stream would stream garbage, so refuse.
+  if (low && streaming) {
+    emitFailure("stop the stream before powering the converters down");
+    return false;
+  }
+  if (!low) {
+    // Leave adsPwdnLow set: restoreConverters() drives the pin high and then waits
+    // for the reference to settle, which is the only place that delay can run.
+    restoreConverters(adsPwdnLow ? "PWDN release" : "reprogram request");
+    return true;
+  }
+  digitalWrite(PIN_ADS_PWDN, LOW);
+  adsPwdnLow = true;
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    devices[i].linkOk = false;
+    snprintf(adsModeName[i], sizeof(adsModeName[i]), "pwdn");
+  }
+  emitSuccess("ADS1299 PWDN held low (both converters off)");
+  return true;
+}
+
+static bool adsReleaseHeldReset() {
+  if (!adsResetLow) {
+    restoreConverters("reprogram request");
+    return true;
+  }
+  restoreConverters("RESET release");
+  return true;
+}
+
+static bool setAdsResetLow(bool low) {
+  if (low && streaming) {
+    emitFailure("stop the stream before holding the converters in reset");
+    return false;
+  }
+  if (!low) {
+    return adsReleaseHeldReset();
+  }
+  digitalWrite(PIN_ADS_RESET, LOW);
+  adsResetLow = true;
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    devices[i].linkOk = false;
+    snprintf(adsModeName[i], sizeof(adsModeName[i]), "reset");
+  }
+  emitSuccess("ADS1299 RESET held low (both converters held in reset)");
+  return true;
+}
+
+static bool setSdCardEnabled(bool enabled) {
+  if (!enabled) {
+    if (sdRecording) {
+      emitFailure("stop the card recording first");
+      return false;
+    }
+    SD.end();
+    sdPresent = false;
+    sdCapacityValid = false;
+    // Park the bus: CS high, clock idle low. Without this the card keeps its
+    // internal pull-ups referenced and never really idles.
+    digitalWrite(PIN_SD_CS, HIGH);
+    digitalWrite(PIN_SD_SCLK, LOW);
+    digitalWrite(PIN_SD_MOSI, LOW);
+    emitSuccess("SD card released (CS high, bus parked)");
+    return true;
+  }
+  const bool ok = bringUpSdCard();
+  emitSuccess(ok ? "SD card mounted again" : "the SD card did not come back");
+  return ok;
+}
+
+static bool setBluetoothEnabled(bool enabled) {
+  if (enabled == btStackReady) {
+    emitSuccess(enabled ? "Bluetooth is already running" : "Bluetooth is already off");
+    return true;
+  }
+  if (!enabled) {
+    btStreamToRadio = false;
+    if (btApiMutex != nullptr && xSemaphoreTake(btApiMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+      btSerial.disconnect();
+      btSerial.end();
+      xSemaphoreGive(btApiMutex);
+    }
+    btStackReady = false;
+    btLinkOpen = false;
+    btNeedsRecovery = false;
+    emitSuccess("Bluetooth stack stopped - the controller is still clocked");
+    return true;
+  }
+  bringUpBluetooth();
+  emitSuccess(btStackReady ? "Bluetooth stack restarted" : "Bluetooth did not restart");
+  return btStackReady;
+}
+
+// The Bluetooth power helpers only exist when the radio is compiled in; without it
+// there is no controller to talk to and no esp_power_level_t to name.
+#if SZD_BT_ENABLED
+static int levelToDbm(esp_power_level_t level) {
+  // ESP_PWR_LVL_N12 .. ESP_PWR_LVL_P9 are consecutive, in 3 dBm steps.
+  static const int kSteps[] = {-12, -9, -6, -3, 0, 3, 6, 9};
+  const int index = static_cast<int>(level);
+  return (index >= 0 && index < 8) ? kSteps[index] : -99;
+}
+
+// What the controller is actually holding, as opposed to what was asked for. The
+// two can differ: esp_bredr_tx_power_set() accepts a level and the controller may
+// clamp it, so every report reads this back instead of echoing the request.
+static int readBluetoothPowerDbm() {
+  esp_power_level_t minimum = ESP_PWR_LVL_N0;
+  esp_power_level_t maximum = ESP_PWR_LVL_N0;
+  if (esp_bredr_tx_power_get(&minimum, &maximum) != ESP_OK) {
+    return powerBtDbm;
+  }
+  return levelToDbm(maximum);
+}
+#endif
+
+static bool setBluetoothPowerDbm(int dbm) {
+#if !SZD_BT_ENABLED
+  (void)dbm;
+  emitFailure("this build has no Bluetooth");
+  return false;
+#else
+  // The controller only has discrete steps, so the request is snapped to the
+  // nearest one and the achieved level is read back.
+  static const int kSteps[] = {-12, -9, -6, -3, 0, 3, 6, 9};
+  static const esp_power_level_t kLevels[] = {ESP_PWR_LVL_N12, ESP_PWR_LVL_N9, ESP_PWR_LVL_N6,
+                                              ESP_PWR_LVL_N3,  ESP_PWR_LVL_N0, ESP_PWR_LVL_P3,
+                                              ESP_PWR_LVL_P6,  ESP_PWR_LVL_P9};
+  int best = 0;
+  for (int i = 0; i < 8; ++i) {
+    if (abs(dbm - kSteps[i]) < abs(dbm - kSteps[best])) {
+      best = i;
+    }
+  }
+  if (!btStackReady) {
+    emitFailure("start Bluetooth before setting its power");
+    return false;
+  }
+  const esp_err_t result = esp_bredr_tx_power_set(kLevels[best], kLevels[best]);
+  // Read back what the controller took. Reporting the request alone was
+  // misleading: the call can succeed and still leave the radio at another level,
+  // and this panel exists to prove things rather than assume them.
+  esp_power_level_t achievedMin = ESP_PWR_LVL_N0;
+  esp_power_level_t achievedMax = ESP_PWR_LVL_N0;
+  const esp_err_t readback = esp_bredr_tx_power_get(&achievedMin, &achievedMax);
+  if (readback == ESP_OK) {
+    powerBtDbm = levelToDbm(achievedMax);
+  } else {
+    powerBtDbm = kSteps[best];
+  }
+  char msg[192];
+  if (result != ESP_OK) {
+    // The usual causes here are worth naming, because "rejected" alone sends the
+    // operator looking in the wrong place.
+    snprintf(msg, sizeof(msg),
+             "Bluetooth tx power NOT set: controller refused %d dBm (esp_err 0x%X)%s",
+             kSteps[best], static_cast<unsigned>(result),
+             readback == ESP_OK ? " - still holding the old level" : " - and the level cannot be read back");
+    emitFailure(msg);
+    return false;
+  }
+  snprintf(msg, sizeof(msg), "Bluetooth tx power requested %d dBm, controller holds %d dBm (%s)",
+           kSteps[best], powerBtDbm,
+           readback != ESP_OK ? "no read-back" : (powerBtDbm == kSteps[best] ? "confirmed" : "clamped"));
+  emitSuccess(msg);
+  // A power change only shows on a current meter while the radio is actually
+  // transmitting, so say that here rather than let it look like nothing happened.
+  if (readback == ESP_OK && powerBtDbm != kSteps[best]) {
+    emitSuccess("the controller clamped the request to the nearest level it supports");
+  }
+  return true;
+#endif  // SZD_BT_ENABLED
+}
+
+static bool setBluetoothSleep(bool enabled) {
+#if !SZD_BT_ENABLED
+  (void)enabled;
+  emitFailure("this build has no Bluetooth");
+  return false;
+#else
+  if (!btStackReady) {
+    emitFailure("start Bluetooth before changing its sleep mode");
+    return false;
+  }
+  const esp_err_t result = enabled ? esp_bt_sleep_enable() : esp_bt_sleep_disable();
+  powerBtSleep = enabled;
+  char msg[96];
+  snprintf(msg, sizeof(msg), "Bluetooth modem sleep %s (%s)", enabled ? "enabled" : "disabled",
+           result == ESP_OK ? "accepted" : "rejected - the controller or host does not allow it");
+  if (result == ESP_OK) {
+    emitSuccess(msg);
+  } else {
+    emitFailure(msg);
+  }
+  return result == ESP_OK;
+#endif  // SZD_BT_ENABLED
+}
+
+static void enterLightSleep(uint32_t durationMs) {
+  // Light sleep keeps RAM and the program counter, so the board continues where
+  // it left off - no reset. The radio has to be off: the Bluetooth controller is
+  // not quiesced by light sleep and wakes the chip immediately.
+  handlePowerStopStreaming();
+  setBluetoothEnabled(false);
+  char msg[96];
+  snprintf(msg, sizeof(msg), "light sleep for %lu ms (the link will be silent)",
+           static_cast<unsigned long>(durationMs));
+  emitSuccess(msg);
+  Serial.flush();
+  delay(20);
+  esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(durationMs) * 1000ULL);
+  esp_light_sleep_start();
+  const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  // Light sleep changes the APB clock, which leaves the UART divisor stale on the
+  // way back up: without this the first lines after waking come out as garbage.
+  usbHostPort.updateBaudRate(SERIAL_BAUD);
+  powerTestStream = false;
+  snprintf(msg, sizeof(msg), "awake after %lu ms (wake cause %d), reset reason still %d",
+           static_cast<unsigned long>(durationMs), static_cast<int>(cause),
+           static_cast<int>(esp_reset_reason()));
+  emitSuccess(msg);
+  emitPowerStatus("light-wake");
+}
+
+static void enterDeepSleep(uint32_t durationMs) {
+  // Deep sleep powers everything down except the RTC domain and restarts the chip
+  // on wake. There is no way around the restart; the panel says so before doing it.
+  handlePowerStopStreaming();
+  char msg[96];
+  snprintf(msg, sizeof(msg), "deep sleep for %lu ms - the board restarts on wake",
+           static_cast<unsigned long>(durationMs));
+  emitSuccess(msg);
+  Serial.flush();
+  delay(50);
+  esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(durationMs) * 1000ULL);
+  esp_deep_sleep_start();
+}
+
+static void emitPowerStatus(const char* event) {
+  // This line is the feedback the operator actually needs: what each converter
+  // reports, whether it is really producing data, and whether the stream is
+  // running. The DRDY window is measured here rather than inferred, because a
+  // register readback cannot tell a configured chip from a converting one.
+  uint32_t drdy2 = 0;
+  const uint32_t drdy1 = measureDrdyWindow(0, 60, drdy2);
+
+  // Register verification needs SDATAC and an RREG, and on the ADS1299 *any*
+  // command other than SDATAC while RDATAC is active is ignored while its bytes
+  // corrupt the data framing. Reading registers here therefore used to break a
+  // running stream the moment the state was queried. It is only done when nothing
+  // is converting; while streaming the DRDY counter is the health proof, and the
+  // device ID comes from the value cached at detection time instead of a live read.
+  const int problems1 = streaming ? -1 : static_cast<int>(verifyDeviceRegisters(0));
+  const int problems2 = streaming ? -1 : static_cast<int>(verifyDeviceRegisters(1));
+
+  char line[512];
+  snprintf(line, sizeof(line),
+           "[PWR] EVENT=%s FW=%d ADS1=%s ADS1_LINK=%d ADS1_ID=0x%02X ADS1_PROB=%d ADS1_DRDY=%lu "
+           "ADS2=%s ADS2_LINK=%d ADS2_ID=0x%02X ADS2_PROB=%d ADS2_DRDY=%lu "
+           "SPS=%lu PWDN=%d RESET=%d CLKOUT=%d LIS3DH=%d SD=%d BT=%d BTDBM=%d BTSLEEP=%d "
+           "TEST=%d STREAM=%d TX=%lu HEAP=%u BENCH=%d DONE=1\n",
+           (event != nullptr && event[0] != '\0') ? event : "status", POWER_PROTOCOL_VERSION,
+           adsModeName[0],
+           devices[0].linkOk ? 1 : 0, devices[0].deviceId, problems1,
+           static_cast<unsigned long>(drdy1), adsModeName[1], devices[1].linkOk ? 1 : 0,
+           devices[1].deviceId, problems2, static_cast<unsigned long>(drdy2),
+           static_cast<unsigned long>(sampleRateFromCode(sampleRateCode)),
+           // The physical pin level, not the firmware's belief about it. This is the
+           // question the operator is actually asking, and it stays true even if the
+           // tracked flag and the line ever disagree.
+           digitalRead(PIN_ADS_PWDN) == HIGH ? 1 : 0, digitalRead(PIN_ADS_RESET) == HIGH ? 1 : 0,
+           (devices[0].linkOk && devices[0].ads->isClockOutputEnabled()) ? 1 : 0,
+           lis3dhPresent ? (lis3dhPowered ? 1 : 0) : -1, sdPresent ? 1 : 0, btStackReady ? 1 : 0,
+#if SZD_BT_ENABLED
+           btStackReady ? readBluetoothPowerDbm() : powerBtDbm,
+#else
+           powerBtDbm,
+#endif
+           powerBtSleep ? 1 : 0,
+           powerTestStream ? 1 : 0, streaming ? 1 : 0,
+           static_cast<unsigned long>(publishedConversions),
+           static_cast<unsigned>(ESP.getFreeHeap()), BENCH_PROTOCOL_VERSION);
+  Serial.print(line);
+}
+
+// ---------------------------------------------------------------------------
+// Bluetooth SPP throughput benchmark
+//
+// The measurement that matters is what the *host received*, not what the firmware
+// handed to BluetoothSerial::write(). So the frames are generated in memory and
+// pushed through the real path - the same ring, the same flush task, the same
+// radio, the same Windows virtual COM port - and the PC recomputes the payload
+// from the sequence number, so "the bytes arrived intact" is proven rather than
+// assumed.
+//
+// The ADS1299 is not involved at all: no SPI traffic, no conversion, nothing that
+// could make a converter measurement look different while the radio is under test.
+// ---------------------------------------------------------------------------
+static constexpr uint32_t BENCH_SYNC = 0x3CC35AA5u;  // on the wire: A5 5A C3 3C
+static constexpr uint8_t BENCH_TYPE_DATA = 1;
+static constexpr uint8_t BENCH_TYPE_STATS = 2;
+static constexpr size_t BENCH_HEADER_BYTES = 16;
+static constexpr size_t BENCH_TRAILER_BYTES = 4;
+static constexpr size_t BENCH_STATS_BYTES = 64;
+static constexpr uint16_t BENCH_MIN_PAYLOAD = 16;
+static constexpr uint16_t BENCH_MAX_PAYLOAD = 4096;
+// How much of one loop() iteration the generator may take. The remainder belongs
+// to the command parser, so STOP still lands while the radio is saturated.
+static constexpr uint32_t BENCH_WORK_BUDGET_US = 4000;
+
+static bool benchPrevStreamToRadio = false;
+static size_t benchPrevRingSize = 0;
+static uint32_t benchRateBps = 0;  // 0 = as fast as the link takes it
+static uint16_t benchPayloadBytes = 1024;
+static uint32_t benchDurationMs = 30000;
+static uint32_t benchSeq = 0;
+static uint32_t benchStatsSeq = 0;
+static uint32_t benchPacketsQueued = 0;
+static uint32_t benchBytesQueued = 0;
+static uint32_t benchPeakFill = 0;
+static uint32_t benchStartedMs = 0;
+static uint32_t benchNextStatsMs = 0;
+static uint32_t benchNextSendUs = 0;
+static uint8_t* benchScratch = nullptr;
+static size_t benchScratchSize = 0;
+
+// CRC-32/ISO-HDLC, the same polynomial zlib.crc32() uses on the host, so both
+// sides agree without any lookup table in flash.
+static uint32_t benchCrc32(const uint8_t* data, size_t length) {
+  uint32_t crc = 0xFFFFFFFFu;
+  for (size_t index = 0; index < length; ++index) {
+    crc ^= data[index];
+    for (uint8_t bit = 0; bit < 8; ++bit) {
+      crc = (crc & 1u) ? ((crc >> 1) ^ 0xEDB88320u) : (crc >> 1);
+    }
+  }
+  return ~crc;
+}
+
+// Deterministic payload: byte j of packet `seq` is a pure function of (seq, j).
+//
+// Deliberately *not* a sequential generator: the host has to recompute this payload
+// for every frame to prove integrity, and a byte-at-a-time xorshift in Python costs
+// about a million interpreted iterations per second at line rate - enough to starve
+// the GUI. This form is elementwise, so the host computes it with numpy in
+// microseconds. It still varies per packet and per byte, so a flipped byte, a
+// truncated frame or a duplicated payload is caught.
+static void benchFillPayload(uint8_t* out, size_t length, uint32_t seq) {
+  const uint32_t base = seq * 2654435761u;
+  for (size_t index = 0; index < length; ++index) {
+    uint32_t value = base + static_cast<uint32_t>(index) * 2246822519u;
+    value ^= value >> 15;
+    out[index] = static_cast<uint8_t>((value >> 13) & 0xFFu);
+  }
+}
+
+static void benchPut16(uint8_t* target, uint16_t value) {
+  target[0] = static_cast<uint8_t>(value & 0xFF);
+  target[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+}
+
+static void benchPut32(uint8_t* target, uint32_t value) {
+  target[0] = static_cast<uint8_t>(value & 0xFF);
+  target[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+  target[2] = static_cast<uint8_t>((value >> 16) & 0xFF);
+  target[3] = static_cast<uint8_t>((value >> 24) & 0xFF);
+}
+
+static size_t benchFrameBytes() {
+  return BENCH_HEADER_BYTES + static_cast<size_t>(benchPayloadBytes) + BENCH_TRAILER_BYTES;
+}
+
+static bool benchEnsureScratch() {
+  // Sized to the frame actually in use, not to BENCH_MAX_PAYLOAD. A 256-byte payload
+  // needs 276 bytes, and the difference between that and 4 kB is the difference
+  // between a benchmark that runs and one that cannot get a transmit buffer at all.
+  const size_t wanted = benchFrameBytes();
+  if (benchScratch != nullptr && benchScratchSize >= wanted) {
+    return true;
+  }
+  if (benchScratch != nullptr) {
+    free(benchScratch);
+    benchScratch = nullptr;
+    benchScratchSize = 0;
+  }
+  benchScratch = static_cast<uint8_t*>(malloc(wanted));
+  if (benchScratch != nullptr) {
+    benchScratchSize = wanted;
+  }
+  return benchScratch != nullptr;
+}
+
+// One complete frame: header, payload, CRC. Queued into the same ring the sample
+// packets use, so the benchmark exercises the production transmission path.
+static bool benchQueueFrame(uint8_t type, const uint8_t* payload, size_t payloadBytes, uint32_t seq) {
+  if (benchScratch == nullptr) {
+    return false;
+  }
+  const size_t total = BENCH_HEADER_BYTES + payloadBytes + BENCH_TRAILER_BYTES;
+  if (total > benchScratchSize) {
+    return false;
+  }
+  benchPut32(benchScratch + 0, BENCH_SYNC);
+  benchScratch[4] = static_cast<uint8_t>(BENCH_PROTOCOL_VERSION);
+  benchScratch[5] = type;
+  benchPut32(benchScratch + 6, seq);
+  benchPut16(benchScratch + 10, static_cast<uint16_t>(payloadBytes));
+  benchPut32(benchScratch + 12, millis());
+  if (payload != nullptr) {
+    memcpy(benchScratch + BENCH_HEADER_BYTES, payload, payloadBytes);
+  }
+  // Everything after the sync word, up to and including the payload.
+  benchPut32(benchScratch + BENCH_HEADER_BYTES + payloadBytes,
+             benchCrc32(benchScratch + 4, BENCH_HEADER_BYTES - 4 + payloadBytes));
+  if (!btRingPush(benchScratch, total, false)) {
+    return false;
+  }
+  benchBytesQueued += static_cast<uint32_t>(total);
+  return true;
+}
+
+static bool benchQueueData() {
+  if (benchScratch == nullptr) {
+    return false;
+  }
+  benchFillPayload(benchScratch + BENCH_HEADER_BYTES, benchPayloadBytes, benchSeq);
+  // The payload is already in place, so it must not be copied again.
+  const size_t total = BENCH_HEADER_BYTES + static_cast<size_t>(benchPayloadBytes) + BENCH_TRAILER_BYTES;
+  if (total > benchScratchSize) {
+    return false;
+  }
+  benchPut32(benchScratch + 0, BENCH_SYNC);
+  benchScratch[4] = static_cast<uint8_t>(BENCH_PROTOCOL_VERSION);
+  benchScratch[5] = BENCH_TYPE_DATA;
+  benchPut32(benchScratch + 6, benchSeq);
+  benchPut16(benchScratch + 10, benchPayloadBytes);
+  benchPut32(benchScratch + 12, millis());
+  benchPut32(benchScratch + BENCH_HEADER_BYTES + benchPayloadBytes,
+             benchCrc32(benchScratch + 4, BENCH_HEADER_BYTES - 4 + benchPayloadBytes));
+  if (!btRingPush(benchScratch, total, false)) {
+    return false;
+  }
+  benchBytesQueued += static_cast<uint32_t>(total);
+  ++benchSeq;
+  ++benchPacketsQueued;
+  return true;
+}
+
+// The firmware's own view of the test, sent as a packet rather than as text: at
+// full speed there is no room in the stream for chatty lines, and a fixed-size
+// packet cannot be truncated by a flush boundary.
+static void benchQueueStats() {
+  if (benchScratch == nullptr) {
+    return;
+  }
+  uint8_t stats[BENCH_STATS_BYTES] = {0};
+  benchPut32(stats + 0, benchBytesQueued);
+  benchPut32(stats + 4, benchBytesOut);
+  benchPut32(stats + 8, static_cast<uint32_t>(btRingUsedBytes()));
+  benchPut32(stats + 12, benchPeakFill);
+  benchPut32(stats + 16, benchStalls);
+  benchPut32(stats + 20, millis() - benchStartedMs);
+  benchPut32(stats + 24, benchRateBps);
+  benchPut16(stats + 28, benchPayloadBytes);
+  benchPut16(stats + 30, static_cast<uint16_t>(benchFrameBytes()));
+  benchPut32(stats + 32, benchPacketsQueued);
+  benchPut32(stats + 36, static_cast<uint32_t>(btRingSize));
+  benchPut32(stats + 40, static_cast<uint32_t>(sppCongestionEvents));
+  benchPut32(stats + 44, static_cast<uint32_t>(sppAckTimeouts));
+  benchPut32(stats + 48, static_cast<uint32_t>(btSppWriteChunk));
+  benchPut32(stats + 52, btFastPathActive() ? 1u : 0u);
+  benchPut32(stats + 56, static_cast<uint32_t>(sppFastPathFallbacks));
+  benchPut32(stats + 60, static_cast<uint32_t>(sppHandle));
+  benchQueueFrame(BENCH_TYPE_STATS, stats, sizeof(stats), benchStatsSeq++);
+}
+
+static void stopBenchmark(const char* reason) {
+  if (!benchActive) {
+    return;
+  }
+  benchActive = false;
+  // Put the write size back, so the fast path stops being used the moment the test
+  // ends: ordinary streaming must run on the library path it always has.
+  btSppWriteChunk = BT_SPP_LIBRARY_CHUNK;
+  sppWritePending = false;
+  btStreamToRadio = benchPrevStreamToRadio;
+  if (benchPrevRingSize != 0 && btRingSize != benchPrevRingSize) {
+    resizeBluetoothRing(benchPrevRingSize);
+    benchPrevRingSize = 0;
+  }
+  char msg[192];
+  snprintf(msg, sizeof(msg),
+           "[BENCH] EVENT=stopped REASON=%s PACKETS=%lu QUEUED=%lu STACK=%lu STALLS=%lu PEAK=%lu MS=%lu\n",
+           (reason != nullptr && reason[0] != '\0') ? reason : "requested",
+           static_cast<unsigned long>(benchPacketsQueued),
+           static_cast<unsigned long>(benchBytesQueued),
+           static_cast<unsigned long>(benchBytesOut),
+           static_cast<unsigned long>(benchStalls),
+           static_cast<unsigned long>(benchPeakFill),
+           static_cast<unsigned long>(millis() - benchStartedMs));
+  usbHostPort.print(msg);
+  // The scratch buffer is one frame plus overhead - about 4 kB, which is a fifth of
+  // what this board has spare once Bluedroid is up. Held only for the run, so an
+  // ordinary streaming session is not paying for a benchmark buffer it does not use.
+  if (benchScratch != nullptr) {
+    free(benchScratch);
+    benchScratch = nullptr;
+    benchScratchSize = 0;
+  }
+}
+
+// Printed raw rather than through emitSuccess(): the GUI routes on a line that
+// starts with "[BENCH]", and emitSuccess prefixes a "Success: " that would hide it.
+// Everything that decides whether the generator can actually transmit. Printed on
+// the USB port once a second during a run, because "nothing arrived" has several
+// possible causes and guessing between them wastes a reflash each time.
+static void benchEmitDiagnostics(const char* event) {
+  char line[384];
+  snprintf(line, sizeof(line),
+           "[BENCH] EVENT=%s ACTIVE=%d FAST=%d HANDLE=%lu SPP=%lu THRESH=%lu RING=%p RINGSZ=%u "
+           "USED=%u QUEUED=%lu STACK=%lu STALLS=%lu FAILS=%lu ERR=%lu ACK=%lu S2R=%d CLIENT=%d "
+           "STREAMING=%d HEAP=%u\n",
+           (event != nullptr && event[0] != '\0') ? event : "diag", benchActive ? 1 : 0,
+           btFastPathActive() ? 1 : 0, static_cast<unsigned long>(sppHandle),
+           static_cast<unsigned long>(btSppWriteChunk),
+           static_cast<unsigned long>(BT_SPP_LIBRARY_CHUNK), static_cast<void*>(btRing),
+           static_cast<unsigned>(btRingSize), static_cast<unsigned>(btRingUsedBytes()),
+           static_cast<unsigned long>(benchBytesQueued),
+           static_cast<unsigned long>(benchBytesOut), static_cast<unsigned long>(benchStalls),
+           static_cast<unsigned long>(btWriteFailures),
+           static_cast<unsigned long>(sppApiErrors),
+           static_cast<unsigned long>(sppAckTimeouts), btStreamToRadio ? 1 : 0,
+           btHasClient() ? 1 : 0, streaming ? 1 : 0,
+           static_cast<unsigned>(ESP.getFreeHeap()));
+  // The cable, never the radio. This line used to go through `Serial`, which routes
+  // to Bluetooth whenever the host is on Bluetooth - so the once-per-second
+  // diagnostics competed with the data being measured. They could not be sent (the
+  // stack is saturated by definition during a throughput test), so the flush task
+  // retried them, and the retries are relaying nothing while the ring fills. That is
+  // what `FAILS=50186` on a 21 s run was.
+  usbHostPort.print(line);
+}
+
+static void benchReport(const char* event, const char* reason) {
+  char line[192];
+  snprintf(line, sizeof(line), "[BENCH] EVENT=%s REASON=%s\n", event,
+           (reason != nullptr && reason[0] != '\0') ? reason : "-");
+  usbHostPort.print(line);
+}
+
+static bool startBenchmark() {
+  if (!btStackReady) {
+    benchReport("failed", "bluetooth stack not running");
+    emitFailure("the Bluetooth stack is not running");
+    return false;
+  }
+  if (!btHasClient()) {
+    benchReport("failed", "no-bluetooth-host");
+    emitFailure("no Bluetooth host is connected, so there is nothing to measure");
+    return false;
+  }
+  if (!benchEnsureScratch()) {
+    benchReport("failed", "out-of-memory");
+    emitFailure("not enough heap for the benchmark buffer - the link needs contiguous "
+                "memory, so disconnect other Bluetooth users or reduce the transmit buffer");
+    return false;
+  }
+  // Bluedroid allocates its own transmit buffers lazily, one per write. Below this
+  // the write fails with ESP_FAIL and the run produces errors rather than throughput,
+  // which is worse than saying so up front.
+  static constexpr uint32_t BENCH_MIN_HEAP_BYTES = 20 * 1024;
+  if (ESP.getFreeHeap() < BENCH_MIN_HEAP_BYTES) {
+    benchReport("failed", "heap-too-low");
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "only %u B of heap is free - a Bluetooth test needs %u B for the radio's "
+             "own transmit buffers",
+             static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(BENCH_MIN_HEAP_BYTES));
+    emitFailure(msg);
+    return false;
+  }
+  if (streaming) {
+    // The generator and the sample stream both fill the same ring, and a test
+    // that shares the link with EEG data measures neither of them.
+    stopStreaming();
+    delay(50);
+  }
+  if (streaming) {
+    benchReport("failed", "stream-would-not-stop");
+    emitFailure("the stream did not stop, refusing to start the benchmark");
+    return false;
+  }
+  benchPrevStreamToRadio = btStreamToRadio;
+  btStreamToRadio = true;
+  // Ring sizing depends on the path the test will use.
+  //
+  // The *direct* path blocks its producer on each acknowledgement, so it needs heap
+  // headroom far more than it needs ring depth: every kilobyte left in the ring is a
+  // kilobyte Bluedroid cannot use for the transmit buffers it allocates per write.
+  // The *library* path is the opposite - it queues and returns, so a deep ring is
+  // what absorbs Windows' read jitter, and it needs no extra heap at all.
+  //
+  // Measured on this board: library 330 B -> 88-99 KiB/s, direct 990 B -> 1.3 KiB/s.
+  // The library path is the fast one; it is not a fallback.
+  benchPrevRingSize = btRingSize;
+  const size_t wantedRing = btFastPathWanted() ? BENCH_RING_BYTES_DIRECT : BENCH_RING_BYTES_LIBRARY;
+  if (btRingSize != wantedRing && !resizeBluetoothRing(wantedRing)) {
+    // No headroom to rebuild it: keep the existing ring rather than fail the test.
+    benchPrevRingSize = 0;
+  }
+  // Guarantee the non-dropping write path for the duration of the test. Below the
+  // library chunk a write cannot work at all, so those sizes are raised. Exactly the
+  // library chunk stays put: that is the deliberate "library path, lossy" reference
+  // run, and quietly turning it into 990 would hide the very loss it exists to show.
+  if (btSppWriteChunk < BT_SPP_LIBRARY_CHUNK) {
+    btSppWriteChunk = BT_SPP_LIBRARY_CHUNK;
+  }
+  // Clear any state left by a previous run: a stale congestion or in-flight flag
+  // would make every write refuse, which is what made a second run look dead.
+  sppCongested = false;
+  sppWritePending = false;
+  sppAckMissesInRow = 0;
+  benchSeq = 0;
+  benchStatsSeq = 0;
+  benchPacketsQueued = 0;
+  benchBytesQueued = 0;
+  benchBytesOut = 0;
+  benchStalls = 0;
+  benchPeakFill = 0;
+  benchStartedMs = millis();
+  benchNextStatsMs = benchStartedMs + 1000;
+  benchNextSendUs = micros();
+  benchWatchdogBytes = 0;
+  benchWatchdogMs = benchStartedMs;
+  benchActive = true;
+  char msg[128];
+  snprintf(msg, sizeof(msg),
+           "[BENCH] EVENT=started RATE=%lu CHUNK=%u SPP=%lu DUR=%lu RING=%u\n",
+           static_cast<unsigned long>(benchRateBps), static_cast<unsigned>(benchPayloadBytes),
+           static_cast<unsigned long>(btSppWriteChunk),
+           static_cast<unsigned long>(benchDurationMs), static_cast<unsigned>(btRingSize));
+  usbHostPort.print(msg);
+  benchEmitDiagnostics("started-diag");
+  return true;
+}
+
+// Runs from loop(), never from the conversion path. Bounded in time so the
+// command parser still gets the CPU: a max-throughput test that cannot be stopped
+// would be worse than no test at all.
+static void benchmarkService() {
+  if (!benchActive) {
+    return;
+  }
+  if (!btStackReady) {
+    stopBenchmark("bluetooth-stopped");
+    return;
+  }
+  if (!btHasClient()) {
+    stopBenchmark("host-disconnected");
+    return;
+  }
+  const uint32_t nowMs = millis();
+  if (benchDurationMs > 0 && nowMs - benchStartedMs >= benchDurationMs) {
+    stopBenchmark("duration-elapsed");
+    return;
+  }
+  const uint32_t fill = static_cast<uint32_t>(btRingUsedBytes());
+  if (fill > benchPeakFill) {
+    benchPeakFill = fill;
+  }
+  if (static_cast<int32_t>(nowMs - benchNextStatsMs) >= 0) {
+    benchNextStatsMs = nowMs + 1000;
+    benchQueueStats();
+    // Once a second is cheap on the cable and answers "is the generator even
+    // running, is the ring accepting, is anything reaching the radio".
+    benchEmitDiagnostics("diag");
+  }
+
+  // If the radio has accepted nothing for BENCH_STALL_STOP_MS the run is dead, and
+  // leaving it "active" is what used to force a manual reconnect: the direct write
+  // path stays engaged and the mirror flag stays set. Ending it here restores both.
+  if (benchBytesOut != benchWatchdogBytes) {
+    benchWatchdogBytes = benchBytesOut;
+    benchWatchdogMs = nowMs;
+  } else if (nowMs - benchWatchdogMs > BENCH_STALL_STOP_MS) {
+    stopBenchmark("no-progress");
+    return;
+  }
+
+  const uint32_t startUs = micros();
+  while (micros() - startUs < BENCH_WORK_BUDGET_US) {
+    if (benchRateBps > 0) {
+      const uint32_t nowUs = micros();
+      if (static_cast<int32_t>(benchNextSendUs - nowUs) > 0) {
+        // Rate limited: the next frame is not due yet, so give the CPU back.
+        return;
+      }
+      if (static_cast<int32_t>(nowUs - benchNextSendUs) > 50000) {
+        // Fell behind, or the requested rate is slower than one frame per 50 ms.
+        // Re-anchor instead of firing a catch-up burst, which would report a rate
+        // the link never actually sustained.
+        benchNextSendUs = nowUs;
+      }
+    }
+    if (!benchQueueData()) {
+      // The ring is full, which is the radio pushing back. Count it and retry on
+      // the next iteration instead of spinning here.
+      ++benchStalls;
+      return;
+    }
+    if (benchRateBps > 0) {
+      benchNextSendUs += static_cast<uint32_t>(
+          (static_cast<uint64_t>(benchFrameBytes()) * 1000000ULL) / benchRateBps);
+    }
+  }
+}
+
+static void handlePowerCommand(const char* payload) {
+  if (payload == nullptr || payload[0] == '\0') {
+    emitPowerStatus("status");
+    return;
+  }
+  char key[16] = {0};
+  char value[16] = {0};
+  const char* equals = strchr(payload, '=');
+  if (equals == nullptr) {
+    snprintf(key, sizeof(key), "%s", payload);
+  } else {
+    const size_t keyLen = static_cast<size_t>(equals - payload);
+    snprintf(key, sizeof(key), "%.*s", static_cast<int>(keyLen > 15 ? 15 : keyLen), payload);
+    snprintf(value, sizeof(value), "%s", equals + 1);
+  }
+  for (char* p = key; *p != '\0'; ++p) {
+    *p = static_cast<char>(tolower(static_cast<unsigned char>(*p)));
+  }
+
+  const int intValue = atoi(value);
+
+  if (strcmp(key, "status") == 0) {
+    emitPowerStatus("status");
+    return;
+  }
+  if (strcmp(key, "lis3dh") == 0) {
+    setLis3dhPowered(intValue != 0);
+  } else if (strcmp(key, "ads1") == 0) {
+    setAdsMode(0, value);
+  } else if (strcmp(key, "ads2") == 0) {
+    setAdsMode(1, value);
+  } else if (strcmp(key, "ads1rate") == 0) {
+    setChipDataRate(0, static_cast<uint8_t>(intValue));
+  } else if (strcmp(key, "ads2rate") == 0) {
+    setChipDataRate(1, static_cast<uint8_t>(intValue));
+  } else if (strcmp(key, "ads1gain") == 0) {
+    setChipGain(0, static_cast<uint8_t>(intValue));
+  } else if (strcmp(key, "ads2gain") == 0) {
+    setChipGain(1, static_cast<uint8_t>(intValue));
+  } else if (strcmp(key, "adspwdn") == 0) {
+    setAdsPwdnLow(intValue == 0);
+  } else if (strcmp(key, "adsreset") == 0) {
+    setAdsResetLow(intValue == 0);
+  } else if (strcmp(key, "adsclkout") == 0) {
+    if (devices[0].linkOk) {
+      devices[0].ads->setClockOutput(intValue != 0);
+      emitSuccess(intValue != 0 ? "CLK_EN set: clock is driven out on the CLK pin"
+                                : "CLK_EN clear: the clock output driver is off");
+    } else {
+      emitFailure("ADS1 is not answering on SPI");
+    }
+  } else if (strcmp(key, "sd") == 0) {
+    setSdCardEnabled(intValue != 0);
+  } else if (strcmp(key, "bt") == 0) {
+    setBluetoothEnabled(intValue != 0);
+  } else if (strcmp(key, "btdbm") == 0) {
+    setBluetoothPowerDbm(intValue);
+    // Report the state straight back, so the panel shows the level the
+    // controller actually holds rather than the one that was requested.
+    emitPowerStatus("btdbm");
+  } else if (strcmp(key, "btsleep") == 0) {
+    setBluetoothSleep(intValue != 0);
+  } else if (strcmp(key, "test") == 0) {
+    powerTestStream = intValue != 0;
+    if (powerTestStream) {
+      // Starting the stream is what makes the synthetic data actually flow: the
+      // generator lives inside the streaming task, so without this the setting
+      // was accepted and nothing was ever sent.
+      suppressAutoStream = false;
+      if (!streaming) {
+        startStreaming();
+      }
+      emitSuccess(streaming ? "synthetic test stream on - the converters are not read"
+                            : "synthetic stream requested but the stream did not start");
+    } else {
+      emitSuccess("synthetic test stream off");
+    }
+  } else if (strcmp(key, "restore") == 0) {
+    if (streaming) {
+      emitFailure("stop the stream before reprogramming the converters");
+      return;
+    }
+    restoreConverters("restore request");
+  } else if (strcmp(key, "stream") == 0) {
+    // An explicit stream control, so the panel can start and stop acquisition
+    // without going back to the main window. That matters for a current test:
+    // "converters running, link idle" and "link running, converters idle" are two
+    // very different measurements.
+    if (intValue != 0) {
+      if (adsPwdnLow || adsResetLow) {
+        emitFailure("release PWDN and RESET before streaming");
+        return;
+      }
+      suppressAutoStream = false;
+      if (!streaming) {
+        startStreaming();
+      }
+      emitSuccess(streaming ? "stream started" : "the stream did not start");
+    } else {
+      suppressAutoStream = true;
+      stopStreaming();
+      emitSuccess("stream stopped");
+    }
+  } else if (strcmp(key, "bench") == 0) {
+    if (intValue != 0) {
+      startBenchmark();
+    } else {
+      stopBenchmark("host-request");
+    }
+  } else if (strcmp(key, "benchrate") == 0) {
+    benchRateBps = intValue > 0 ? static_cast<uint32_t>(intValue) : 0;
+    char msg[80];
+    snprintf(msg, sizeof(msg), "benchmark rate %s", benchRateBps > 0 ? "limited" : "unlimited");
+    emitSuccess(msg);
+  } else if (strcmp(key, "benchchunk") == 0) {
+    if (intValue < static_cast<int>(BENCH_MIN_PAYLOAD) || intValue > static_cast<int>(BENCH_MAX_PAYLOAD)) {
+      emitFailure("benchmark chunk must be between 16 and 4096 bytes");
+    } else {
+      benchPayloadBytes = static_cast<uint16_t>(intValue);
+      char msg[64];
+      snprintf(msg, sizeof(msg), "benchmark chunk %u bytes", static_cast<unsigned>(benchPayloadBytes));
+      emitSuccess(msg);
+    }
+  } else if (strcmp(key, "benchspp") == 0) {
+    if (intValue < 128 || intValue > static_cast<int>(BT_SPP_WRITE_CHUNK_MAX)) {
+      char msg[80];
+      snprintf(msg, sizeof(msg), "SPP write chunk must be 128..%u bytes",
+               static_cast<unsigned>(BT_SPP_WRITE_CHUNK_MAX));
+      emitFailure(msg);
+    } else {
+      btSppWriteChunk = static_cast<uint32_t>(intValue);
+      char msg[64];
+      snprintf(msg, sizeof(msg), "SPP write chunk %lu bytes", static_cast<unsigned long>(btSppWriteChunk));
+      emitSuccess(msg);
+    }
+  } else if (strcmp(key, "benchdur") == 0) {
+    benchDurationMs = intValue > 0 ? static_cast<uint32_t>(intValue) : 0;
+    char msg[64];
+    snprintf(msg, sizeof(msg), "benchmark duration %lu ms",
+             static_cast<unsigned long>(benchDurationMs));
+    emitSuccess(msg);
+  } else if (strcmp(key, "benchstats") == 0) {
+    benchQueueStats();
+  } else if (strcmp(key, "btdrop") == 0) {
+    // Drop the SPP client from the firmware's side.
+    //
+    // Windows can close the COM handle without the radio ever being told: the
+    // pairing then still reads "connected" while the board keeps the handle in its
+    // single-client slot, so the next connection is refused as a second client.
+    // This is the cure - one command that clears both ends.
+    if (!btStackReady) {
+      emitFailure("the Bluetooth stack is not running");
+      return;
+    }
+    if (btApiMutex != nullptr && xSemaphoreTake(btApiMutex, pdMS_TO_TICKS(300)) == pdTRUE) {
+      btSerial.disconnect();
+      xSemaphoreGive(btApiMutex);
+    }
+    btLinkOpen = false;
+    sppHandle = 0;
+    sppWritePending = false;
+    sppCongested = false;
+    emitSuccess("Bluetooth client dropped; the board accepts a new connection");
+  } else if (strcmp(key, "benchdiag") == 0) {
+    benchEmitDiagnostics("diag");
+  } else if (strcmp(key, "btpower") == 0) {
+    // Runtime BR/EDR transmit power. Read back from the controller rather than
+    // echoing the request: a level the controller refuses must not be reported as
+    // applied, which is exactly how "the setting does not work" starts.
+    powerBtDbm = intValue;
+    const esp_power_level_t wanted = btPowerLevelFor(powerBtDbm);
+    const esp_err_t set_result = esp_bredr_tx_power_set(wanted, wanted);
+    esp_power_level_t readBack = ESP_PWR_LVL_N0;
+    const esp_err_t get_result = esp_bredr_tx_power_get(&readBack, nullptr);
+    char msg[128];
+    if (set_result != ESP_OK || get_result != ESP_OK) {
+      snprintf(msg, sizeof(msg), "bluetooth power rejected by the controller (0x%X / 0x%X)",
+               static_cast<unsigned>(set_result), static_cast<unsigned>(get_result));
+      emitFailure(msg);
+    } else {
+      powerBtDbm = btPowerDbmFor(readBack);
+      snprintf(msg, sizeof(msg), "bluetooth tx power %d dBm (read back %d dBm)",
+               btPowerDbmFor(wanted), powerBtDbm);
+      emitSuccess(msg);
+    }
+    emitPowerStatus("btpower");
+  } else if (strcmp(key, "light") == 0) {
+    // Deferred: the reply has to reach the host before the chip stops running.
+    pendingSleepMs = intValue > 0 ? static_cast<uint32_t>(intValue) : 2000;
+    pendingSleepMode = 1;
+  } else if (strcmp(key, "deep") == 0) {
+    pendingSleepMs = intValue > 0 ? static_cast<uint32_t>(intValue) : 5000;
+    pendingSleepMode = 2;
+  } else {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "unknown power key '%s'", key);
+    emitFailure(msg);
+    return;
+  }
+  emitPowerStatus("applied");
+}
+
 static void handleCommandChar(char cmd) {
+  // The power line is free text up to a ';' terminator, like the SD name, so it is
+  // consumed before any single-character command could read its letters.
+  if (parsingPowerLine) {
+    if (cmd == ';') {
+      powerPayload[powerLen] = '\0';
+      parsingPowerLine = false;
+      powerLen = 0;
+      handlePowerCommand(powerPayload);
+      return;
+    }
+    if (powerLen + 1 < static_cast<int>(sizeof(powerPayload))) {
+      powerPayload[powerLen++] = cmd;
+      return;
+    }
+    parsingPowerLine = false;
+    powerLen = 0;
+    emitFailure("power command too long");
+    return;
+  }
+
   // The SD name is free text up to a ';' terminator, so it is consumed before any
   // single-character command could interpret its letters as channel selectors.
   if (parsingSdName) {
@@ -4428,6 +6088,10 @@ static void handleCommandChar(char cmd) {
       if (USE_DEBUG_APP_MODE) {
         emitDebugLine("#OK ", "b");
       }
+      break;
+    case '|':
+      parsingPowerLine = true;
+      powerLen = 0;
       break;
     case ':':
       awaitingSdCommand = true;
@@ -4680,12 +6344,21 @@ static void streamingTask(void* parameter) {
     }
     // Block until the next conversion. This yields the CPU, so the idle task
     // and the task watchdog keep running.
+    //
+    // With the synthetic stream there is no DRDY to wait for (the converters may
+    // be in standby or powered down), so the period is timed from the data rate
+    // instead. The acquisition path is otherwise identical, which is the point:
+    // the host sees the same framing and the same packet rate.
     const uint32_t wokeUs = micros();
-    if (xSemaphoreTake(conversionSem, pdMS_TO_TICKS(50)) != pdTRUE) {
+    if (powerTestStream) {
+      const uint32_t periodTicks = static_cast<uint32_t>(1000.0 / sampleRateFromCode(sampleRateCode));
+      vTaskDelay(pdMS_TO_TICKS(periodTicks > 0 ? periodTicks : 1));
+    } else if (xSemaphoreTake(conversionSem, pdMS_TO_TICKS(50)) != pdTRUE) {
       missedConversions++;
       continue;
     }
 
+    if (!powerTestStream) {
     // How long this conversion waited. Anything over 1.5 periods means another
     // task or an interrupt kept the acquisition task off the CPU.
     static uint32_t lastGapReportMs = 0;
@@ -4720,6 +6393,7 @@ static void streamingTask(void* parameter) {
       }
     }
     previousUs = wokeUs;
+    }
 
     // Seed with the previous conversion so a failed read holds the last good
     // sample instead of publishing zeros or a spike.
@@ -4730,9 +6404,28 @@ static void streamingTask(void* parameter) {
       memset(fresh, 0, sizeof(fresh));
     }
 
+    if (powerTestStream) {
+      // Synthetic stream: no SPI transaction at all, so the converters and the
+      // accelerometer stay out of the picture. This is what makes "how much
+      // current does the link alone draw" measurable, and it gives the host a
+      // known signal to check the packet path with.
+      static uint32_t testPhase = 0;
+      for (uint8_t ch = 0; ch < TOTAL_ADS_CHANNELS; ++ch) {
+        // ~1000 counts peak, one eighth of a cycle per channel so the traces are
+        // distinguishable without clipping.
+        const float step = 2.0f * 3.14159265f * (1.0f + 0.25f * ch) / 512.0f;
+        fresh[ch] = static_cast<int32_t>(1000.0f * sinf(static_cast<float>(testPhase) * step));
+      }
+      testPhase++;
+      if (testPhase >= 512) {
+        testPhase = 0;
+      }
+    }
+
     bool anyLinked = false;
     bool readFailed = false;
     const uint32_t readStartUs = micros();
+    if (!powerTestStream) {
     for (size_t i = 0; i < DEVICE_COUNT; ++i) {
       if (!devices[i].linkOk) {
         continue;
@@ -4757,6 +6450,7 @@ static void streamingTask(void* parameter) {
         }
       }
     }
+    }
 
     const uint32_t readUs = micros() - readStartUs;
     spiReadLastUs = readUs;
@@ -4770,7 +6464,7 @@ static void streamingTask(void* parameter) {
     while (xSemaphoreTake(conversionSem, 0) == pdTRUE) {
     }
 
-    if (!anyLinked) {
+    if (!anyLinked && !powerTestStream) {
       missedConversions++;
       continue;
     }
@@ -4823,10 +6517,21 @@ static void sdWriterTask(void* parameter) {
     // buffer is 50 pointless scheduler entries on the same core as the radio.
     // When a recording is active the queue is never empty for long, and the tail of
     // a recording still reaches the card within 200 ms of the last sample.
+    if (sdQueue == nullptr) {
+      // No recording has been opened yet, so nothing can arrive. Waiting on a queue
+      // that does not exist is not an option; a slow tick is all this task owes.
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
     if (xQueueReceive(sdQueue, &sample, pdMS_TO_TICKS(200)) == pdTRUE) {
       writeSampleToSd(sample);
     } else {
       sdFlushWriteBuffer();
+      // The writer owns the deletion: it is the only task blocked on this queue, so
+      // releasing it here cannot pull the handle out from under a waiter.
+      if (sdQueueReleasePending && uxQueueMessagesWaiting(sdQueue) == 0) {
+        releaseSdQueue();
+      }
     }
   }
 }
@@ -5443,33 +7148,42 @@ void setup() {
   // The radio ring is the largest single allocation in the firmware, so it shrinks
   // rather than failing: a smaller ring only means less tolerance for a host that
   // stalls, while a failed allocation would mean no Bluetooth stream at all.
-  static const size_t kBtRingSizes[] = {SZD_BT_TX_BUFFER_BYTES, 24576, 16384, 8192};
+  //
+  // It also refuses to eat the heap the Bluetooth stack needs. This allocation runs
+  // *before* bringUpBluetooth(), and Bluedroid's TX/RX buffers come out of what is
+  // left - so an oversized ring produces the worst possible failure: the device
+  // advertises and connects, then never answers.
+  static constexpr size_t BT_HEAP_RESERVE_BYTES = 96 * 1024;
+  static const size_t kBtRingSizes[] = {SZD_BT_TX_BUFFER_BYTES, 32768, 24576, 16384, 8192};
   for (size_t candidate : kBtRingSizes) {
     if (candidate > SZD_BT_TX_BUFFER_BYTES) {
+      continue;
+    }
+    if (ESP.getFreeHeap() < candidate + BT_HEAP_RESERVE_BYTES) {
       continue;
     }
     btRing = static_cast<uint8_t*>(malloc(candidate));
     if (btRing != nullptr) {
       btRingSize = candidate;
       if (candidate != SZD_BT_TX_BUFFER_BYTES) {
-        usbHostPort.printf("[BT] only %u B of transmit buffer available (wanted %u B)\n",
+        usbHostPort.printf("[BT] only %u B of transmit buffer available (wanted %u B, heap %u)\n",
                            static_cast<unsigned>(candidate),
-                           static_cast<unsigned>(SZD_BT_TX_BUFFER_BYTES));
+                           static_cast<unsigned>(SZD_BT_TX_BUFFER_BYTES),
+                           static_cast<unsigned>(ESP.getFreeHeap()));
       }
       break;
     }
   }
   if (btRing == nullptr) {
     usbHostPort.println("[BT] WARNING: no transmit buffer - the stream will only go over USB");
+  } else {
+    usbHostPort.printf("[BT] transmit ring %u B, heap after %u B\n", static_cast<unsigned>(btRingSize),
+                       static_cast<unsigned>(ESP.getFreeHeap()));
   }
   calibrateTouchKey();
 
-  sdQueue = xQueueCreate(SD_QUEUE_LENGTH, sizeof(SdSample));
-  if (sdQueue == nullptr) {
-    // Without the queue the card cannot record at all, so say so instead of
-    // silently writing header-only files.
-    usbHostPort.println("[SD] WARNING: could not allocate the sample queue - SD recording is disabled");
-  }
+  usbHostPort.printf("[HEAP] %u B free before Bluetooth, SD queue is allocated on demand\n",
+                     static_cast<unsigned>(ESP.getFreeHeap()));
   auxMutex = xSemaphoreCreateMutex();
   btApiMutex = xSemaphoreCreateMutex();
   sdMutex = xSemaphoreCreateMutex();
@@ -5509,11 +7223,28 @@ void setup() {
 
 void loop() {
   pollSerialCommands();
+  // Bounded in time, and always after the command poll, so a saturated radio can
+  // never make the board unresponsive to STOP.
+  benchmarkService();
   if (recordButtonPressed) {
     recordButtonPressed = false;
     toggleSdRecordingFromButton();
   }
   updateSdRecordingTimeout();
+  // A sleep request is acted on here, not in the command handler: the reply has to
+  // leave the chip first, and the acquisition task must already be stopped.
+  if (pendingSleepMode != 0) {
+    const uint32_t sleepMs = pendingSleepMs;
+    const uint8_t mode = pendingSleepMode;
+    pendingSleepMode = 0;
+    pendingSleepMs = 0;
+    delay(50);
+    if (mode == 1) {
+      enterLightSleep(sleepMs);
+    } else {
+      enterDeepSleep(sleepMs);
+    }
+  }
   // The touch pad needs an ADC1 conversion, and the measurement owns the front
   // end: it is only polled when nothing is being acquired, so no analog activity
   // of the firmware's own can land inside a capture.

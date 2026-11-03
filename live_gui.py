@@ -98,9 +98,19 @@ from utg_control import (
     per_channel_amplitude_vrms,
     selftest as run_generator_selftest,
 )
+from bluetooth_benchmark import (
+    PAYLOAD_CHOICES,
+    RATE_CHOICES,
+    SWEEP_STEPS,
+    BenchmarkReceiver,
+    BenchmarkResult,
+    is_sustainable,
+    summarize_sweep,
+)
 from live_protocol import (
     ADS_SPI_CLOCK_HZ,
     ADS_SPI_CLOCK_MAX_HZ,
+    BLUETOOTH_POWER_CHOICES,
     BOARD_CHANNEL_CHOICES,
     DECIMATION_CHOICES,
     DemoBoardPort,
@@ -113,6 +123,7 @@ from live_protocol import (
     REFERENCE_MODE_DIFFERENTIAL,
     REFERENCE_MODE_SRB1,
     REFERENCE_MODE_SRB2,
+    SPP_WRITE_CHOICES,
     SPI_CLOCK_CHOICES,
     RingBuffer,
     Annotation,
@@ -372,6 +383,18 @@ class SerialWorker(QThread):
         self._commands: "queue.Queue[bytes]" = queue.Queue()
         self._stop_event = threading.Event()
         self._gain_lock = threading.Lock()
+        # Optional raw-byte tap: a callable that consumes benchmark frames and
+        # returns whatever was not part of one, so the normal parser still sees
+        # text replies and packet traffic during a throughput test.
+        self._benchmark_sink = None
+        self._sink_lock = threading.Lock()
+
+    def set_benchmark_sink(self, sink) -> None:
+        with self._sink_lock:
+            self._benchmark_sink = sink
+        # Restart the text/packet parser so a half-consumed frame cannot leave it
+        # hunting for a 0xFF that will never come.
+        self._parser = MixedStreamParser()
 
     def send(self, payload: bytes) -> None:
         self._commands.put(payload)
@@ -431,16 +454,24 @@ class SerialWorker(QThread):
                     return
 
                 if chunk:
-                    for event in self._parser.feed(chunk):
-                        if isinstance(event, TextLine):
-                            texts.append(event)
-                            continue
-                        with self._gain_lock:
-                            block = self._decoder.push(event)
-                            aux = self._decoder.last_aux.copy() if block is not None else None
-                        if block is not None:
-                            samples.append(block)
-                            aux_values.append(aux if aux is not None else np.zeros(3))
+                    with self._sink_lock:
+                        sink = self._benchmark_sink
+                    if sink is not None:
+                        try:
+                            chunk = sink(chunk)
+                        except Exception:  # noqa: BLE001 - a bad sink must not kill the link
+                            chunk = b""
+                    if chunk:
+                        for event in self._parser.feed(chunk):
+                            if isinstance(event, TextLine):
+                                texts.append(event)
+                                continue
+                            with self._gain_lock:
+                                block = self._decoder.push(event)
+                                aux = self._decoder.last_aux.copy() if block is not None else None
+                            if block is not None:
+                                samples.append(block)
+                                aux_values.append(aux if aux is not None else np.zeros(3))
 
                 now = time.monotonic()
                 if (samples or texts) and (now - last_emit) >= 0.02:
@@ -1727,6 +1758,8 @@ class HardwareSettingsDialog(QDialog):
         self._reference_mode = hardware.normalised_reference_mode()
         self._chip_modes = hardware.normalised_chip_modes()
         self._spi_clock_hz = clamp_spi_clock(hardware.spi_clock_hz)
+        self._bt_power_dbm = int(getattr(hardware, "bluetooth_power_dbm", 4) or 0)
+        self._spp_write_bytes = int(getattr(hardware, "spp_write_bytes", 330) or 330)
         self._decimation = clamp_decimation(hardware.decimation)
         self._reference_channel = str(reference_channel or "").strip()
         self._connected = False
@@ -1790,6 +1823,34 @@ class HardwareSettingsDialog(QDialog):
             "two 216-bit frames per sample must fit inside one sample period."
         )
         form.addWidget(self.spi_combo)
+        form.addSpacing(12)
+        form.addWidget(QLabel("Bluetooth power"))
+        self.bt_power_combo = QComboBox()
+        for dbm, label in BLUETOOTH_POWER_CHOICES:
+            self.bt_power_combo.addItem(label, dbm)
+        self.bt_power_combo.setCurrentIndex(
+            max(self.bt_power_combo.findData(int(hardware.bluetooth_power_dbm)), 0)
+        )
+        self.bt_power_combo.setToolTip(
+            "BR/EDR transmit power the board is asked for on connect, and read back from "
+            "the controller. Higher survives a worse RF path; lower radiates less into the "
+            "front end."
+        )
+        form.addWidget(self.bt_power_combo)
+        form.addSpacing(12)
+        form.addWidget(QLabel("Bluetooth SPP write"))
+        self.spp_combo = QComboBox()
+        for size, label in SPP_WRITE_CHOICES:
+            self.spp_combo.addItem(label, size)
+        self.spp_combo.setCurrentIndex(
+            max(self.spp_combo.findData(int(hardware.spp_write_bytes)), 0)
+        )
+        self.spp_combo.setToolTip(
+            "Bytes per SPP write for streaming and benchmark tests. 330 uses the Arduino "
+            "library's own queue and is measured fastest on this board; above that the "
+            "firmware writes to the stack directly, one acknowledged write at a time."
+        )
+        form.addWidget(self.spp_combo)
         form.addStretch(1)
         layout.addLayout(form)
 
@@ -2130,6 +2191,8 @@ class HardwareSettingsDialog(QDialog):
             chip_reference_modes=list(self._chip_modes),
             spi_clock_hz=self._spi_clock_hz,
             decimation=self._decimation,
+            bluetooth_power_dbm=self._bt_power_dbm,
+            spp_write_bytes=self._spp_write_bytes,
             channels=[channel.copy() for channel in self._channels],
         )
         # The rows are the master, so the chip modes are derived from them rather
@@ -2146,6 +2209,8 @@ class HardwareSettingsDialog(QDialog):
             reference_mode=self._reference_mode,
             spi_clock_hz=self._spi_clock_hz,
             decimation=self._decimation,
+            bluetooth_power_dbm=self._bt_power_dbm,
+            spp_write_bytes=self._spp_write_bytes,
             channels=[channel.copy() for channel in self._channels],
         )
 
@@ -2346,9 +2411,11 @@ class HardwareSettingsDialog(QDialog):
             self.chip_ref_buttons[1].setEnabled(two_chips)
 
     def _on_rate_changed(self) -> None:
-        self._rate_code = int(self.rate_combo.currentData() or 6)
+        self._rate_code = int(self.rate_combo.currentData() if self.rate_combo.currentData() is not None else 6)
         self._decimation = clamp_decimation(self.decimation_combo.currentData() or 1)
         self._spi_clock_hz = clamp_spi_clock(self.spi_combo.currentData() or ADS_SPI_CLOCK_HZ)
+        self._bt_power_dbm = int(self.bt_power_combo.currentData() or 0)
+        self._spp_write_bytes = int(self.spp_combo.currentData() or 330)
         self._update_rate_note()
 
     def _update_rate_note(self) -> None:
@@ -2374,9 +2441,19 @@ class HardwareSettingsDialog(QDialog):
         parts.append(f"SPI {self._spi_clock_hz / 1e6:g} MHz serves {max_sample_rate_from_spi(self._spi_clock_hz, 2)} SPS")
         if self._link_limit:
             parts.append(f"serial carries {self._link_limit} packets/s")
-        fits, reason = rate_fits_link(rate, packets, 921600, self._spi_clock_hz, 2)
+        # Judged against the limit the window actually reports, not a hardcoded
+        # 921600: assuming the slowest link made a 2 Mbaud port look over budget when
+        # it was not, which is what pushed the data rate and the decimation around.
+        serial_limit = self._link_limit or max_sustained_packet_rate(921600)
+        fits = packets <= serial_limit and rate <= max_sample_rate_from_spi(self._spi_clock_hz, 2)
         if not fits:
-            parts.append("OVER BUDGET: " + reason)
+            reasons = []
+            if packets > serial_limit:
+                reasons.append(f"{packets:g} packets/s exceeds the link's {serial_limit} packets/s")
+            spi_limit = max_sample_rate_from_spi(self._spi_clock_hz, 2)
+            if rate > spi_limit:
+                reasons.append(f"{rate:g} SPS exceeds the bus limit of {spi_limit} SPS")
+            parts.append("OVER BUDGET: " + "; ".join(reasons))
         self.rate_note.setText("  |  ".join(parts))
         self.rate_note.setStyleSheet(
             "color: #b91c1c; font-size: 11px;" if not fits else "color: #475569; font-size: 11px;"
@@ -3113,6 +3190,11 @@ class LiveRecorderWindow(QMainWindow):
         self.bluetooth_log: list[str] = []
         self._gap_events = 0
         self._last_gap: dict[str, str] = {}
+        self._power_dialog = None
+        self.power_state: dict[str, str] = {}
+        self._benchmark_dialog = None
+        self._benchmark_receiver: Optional[BenchmarkReceiver] = None
+        self.benchmark_reports: list[str] = []
         # Board-side acquisition health: what the ESP32 actually produced, as
         # opposed to what this window managed to receive.
         self.board_dx: dict[str, str] = {}
@@ -4310,6 +4392,10 @@ class LiveRecorderWindow(QMainWindow):
         hardware_action = QAction("Hardware settings...", self)
         hardware_action.triggered.connect(self.open_hardware_settings)
         device_menu.addAction(hardware_action)
+        power_action = QAction("Power control...", self)
+        power_action.setToolTip("Switch converters, accelerometer, card, radio and sleep modes for current measurement")
+        power_action.triggered.connect(self.open_power_control)
+        device_menu.addAction(power_action)
         defaults_action = QAction("Restore board defaults", self)
         defaults_action.triggered.connect(self.restore_board_defaults)
         device_menu.addAction(defaults_action)
@@ -4334,6 +4420,17 @@ class LiveRecorderWindow(QMainWindow):
         sweep_action = QAction("Automated sweep (function generator)...", self)
         sweep_action.triggered.connect(self.open_auto_sweep)
         measure_menu.addAction(sweep_action)
+
+        # Link diagnostics live apart from the measurement menus: a throughput
+        # test is a bench question about the radio, not part of an experiment.
+        tools_menu = self.menuBar().addMenu("Tools")
+        benchmark_action = QAction("Bluetooth throughput benchmark...", self)
+        benchmark_action.setToolTip(
+            "Measure the real SPP throughput to this PC with synthetic frames. Nothing is read "
+            "from the ADS1299, so the result is the link and only the link."
+        )
+        benchmark_action.triggered.connect(self.open_bluetooth_benchmark)
+        tools_menu.addAction(benchmark_action)
 
     def _load_settings_into_ui(self) -> None:
         index = self.baud_combo.findData(self.settings.baud_rate)
@@ -4777,6 +4874,11 @@ class LiveRecorderWindow(QMainWindow):
             return
         self._set_connection_state(True, f"Connected to {self._port_short_label()}")
         self._probe_timer.start(1200)
+        # The benchmark's options depend on which transport this window now holds:
+        # it must switch to "main window link" the moment Bluetooth is taken, or its
+        # next connection attempt would break this one.
+        if self._benchmark_dialog is not None:
+            self._benchmark_dialog.refresh_link_state()
 
     def _on_open_watchdog(self) -> None:
         """The port open has neither succeeded nor failed - report and retry."""
@@ -4848,6 +4950,10 @@ class LiveRecorderWindow(QMainWindow):
         self._verify_lines = []
         self._set_dialog_connected(False)
         self._set_verify_result("")
+        if self._benchmark_dialog is not None:
+            # The benchmark may have been reading this link; it has to stop using it
+            # rather than hold a handle to a port that is closing.
+            self._benchmark_dialog.refresh_link_state()
         if self.recording is not None:
             self.stop_recording()
         worker = self.worker
@@ -4855,6 +4961,13 @@ class LiveRecorderWindow(QMainWindow):
         if worker is not None:
             try:
                 worker.send(b"s")
+                if self._selected_port_is_bluetooth():
+                    # Windows can close the COM handle without telling the radio, and
+                    # the board then keeps that client in its single slot - so the next
+                    # connect is refused and the device still reads "connected". Ask the
+                    # firmware to drop the client while the link is still open.
+                    worker.send(b"|btdrop;")
+                    time.sleep(0.15)
             except Exception:  # noqa: BLE001
                 pass
             worker.stop()
@@ -4998,6 +5111,8 @@ class LiveRecorderWindow(QMainWindow):
         self.connection_label.setStyleSheet("color: #15803d;" if connected else "color: #475569;")
         # The card is never read automatically: SD.usedBytes() walks the FAT and
         # that shows up as a jump in the traces, so the panel waits for Refresh.
+        if self._power_dialog is not None:
+            self._power_dialog.set_connected(connected)
         if not connected:
             self._sd_pending = False
             self.sd_status_label.setText("Connect the board to read the card.")
@@ -5283,16 +5398,53 @@ class LiveRecorderWindow(QMainWindow):
         stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         record = (stamp, direction, text, kind)
         self._text_backlog.append(record)
+        # Bounded: a long session with a chatty board must not grow without limit.
+        if len(self._text_backlog) > 5000:
+            del self._text_backlog[:-4000]
         for monitor in list(self.monitors):
             if monitor.isVisible():
                 monitor.append_record(*record)
+
+    def bluetooth_budget_bytes_per_second(self) -> float:
+        """Planned SPP capacity, after the user's safety margin.
+
+        The built-in 32 KiB/s is a conservative estimate, not a physical limit. A
+        measured figure only replaces it when the user adopts one from the
+        throughput benchmark, and the margin is subtracted on top, so a peak burst
+        is never mistaken for a sustainable rate.
+        """
+
+        link = self.settings.link if isinstance(self.settings.link, dict) else {}
+        try:
+            stored = float(link.get("bluetooth_budget_bps", 0) or 0)
+        except (TypeError, ValueError):
+            stored = 0.0
+        try:
+            margin = float(link.get("bluetooth_margin_percent", 0) or 0)
+        except (TypeError, ValueError):
+            margin = 0.0
+        base = stored if stored > 0 else float(BLUETOOTH_SPP_BYTES_PER_SECOND)
+        margin = min(max(margin, 0.0), 90.0)
+        return max(base * (1.0 - margin / 100.0), 1.0)
+
+    def set_bluetooth_budget(self, bytes_per_second: Optional[float], margin_percent: float) -> None:
+        """Adopt (or clear) a measured link capacity and keep it in the settings."""
+
+        if bytes_per_second is not None and bytes_per_second > 0:
+            self.settings.link["bluetooth_budget_bps"] = float(bytes_per_second)
+            self.settings.link["bluetooth_margin_percent"] = float(margin_percent)
+        else:
+            self.settings.link.pop("bluetooth_budget_bps", None)
+            self.settings.link.pop("bluetooth_margin_percent", None)
+        self.store.save(self.settings)
+        self._refresh_link_note()
 
     def _link_description(self, baud: int) -> str:
         """Name the transport in a budget message, without inventing a baud rate."""
 
         if self._selected_port_is_bluetooth():
             return (
-                f"the Bluetooth link ({BLUETOOTH_SPP_BYTES_PER_SECOND / 1024:.0f} kB/s budget)"
+                f"the Bluetooth link ({self.bluetooth_budget_bytes_per_second() / 1024:.0f} kB/s budget)"
             )
         return f"the {baud / 1000:.0f} kbit/s USB link"
 
@@ -5423,6 +5575,11 @@ class LiveRecorderWindow(QMainWindow):
                 None,
                 build_spi_clock_command(self.hardware.spi_clock_hz),
                 f"SPI clock {self.hardware.spi_clock_hz / 1000:.0f} kHz",
+            ),
+            (
+                None,
+                f"|btpower={int(self.hardware.bluetooth_power_dbm)};".encode("ascii"),
+                f"Bluetooth power {int(self.hardware.bluetooth_power_dbm)} dBm",
             ),
             (
                 None,
@@ -5841,7 +5998,7 @@ class LiveRecorderWindow(QMainWindow):
         """
 
         if self._selected_port_is_bluetooth():
-            return max(int(BLUETOOTH_SPP_BYTES_PER_SECOND / 33), 1)
+            return max(int(self.bluetooth_budget_bytes_per_second() / 33), 1)
         return max_sustained_packet_rate(self._current_baud())
 
     def _effective_baud_for_budget(self) -> int:
@@ -5855,7 +6012,7 @@ class LiveRecorderWindow(QMainWindow):
             return self._current_baud()
         # 10 bits per byte, 90 % usable, 33-byte packets - the inverse of
         # max_sustained_packet_rate().
-        packet_rate = BLUETOOTH_SPP_BYTES_PER_SECOND / 33.0
+        packet_rate = self.bluetooth_budget_bytes_per_second() / 33.0
         return int(packet_rate * 33 * 10 / 0.9)
 
     def _refresh_link_note(self) -> None:
@@ -5867,7 +6024,7 @@ class LiveRecorderWindow(QMainWindow):
         if self._selected_port_is_bluetooth():
             label.setText(
                 f"Bluetooth SPP: the baud rate is not used. The link runs at the radio's rate "
-                f"(budget {BLUETOOTH_SPP_BYTES_PER_SECOND / 1024:.0f} kB/s)."
+                f"(budget {self.bluetooth_budget_bytes_per_second() / 1024:.0f} kB/s)."
             )
             label.setStyleSheet("color: #b45309; font-size: 11px;")
         elif self.port_combo.currentData() == DEMO_PORT:
@@ -5948,6 +6105,109 @@ class LiveRecorderWindow(QMainWindow):
 
     def _on_settings_dialog_closed(self, *_args) -> None:
         self._settings_dialog = None
+
+    def open_power_control(self) -> None:
+        """Open the current-consumption test panel."""
+
+        if self._power_dialog is not None:
+            self._power_dialog.raise_()
+            self._power_dialog.activateWindow()
+            return
+        # Only the Bluetooth ports are offered for the panel's own link: the USB
+        # port is already held by this window, and a second handle on one COM port
+        # is not possible.
+        table = getattr(self, "_port_is_bluetooth", {})
+        bt_ports = []
+        for index in range(self.port_combo.count()):
+            device = str(self.port_combo.itemData(index) or "")
+            if device and table.get(device):
+                bt_ports.append((self.port_combo.itemText(index), device))
+        dialog = PowerControlDialog(self._send, self.connected, self, bluetooth_ports=bt_ports)
+        dialog.finished.connect(self._on_power_dialog_closed)
+        self._power_dialog = dialog
+        dialog.show()
+        if self.connected:
+            # A read only. Opening this window must not change the board - the whole
+            # point of a current measurement is that nothing moves except the thing
+            # being switched. Everything else in the panel is an explicit action, and
+            # "Restore converters to normal" is there for when a chip really is left
+            # in a test state.
+            dialog.refresh()
+
+    def _on_power_dialog_closed(self, *_args) -> None:
+        if self._power_dialog is not None:
+            self._power_dialog.shutdown()
+        self._power_dialog = None
+
+    # -- Bluetooth throughput benchmark ------------------------------------
+
+    def _set_benchmark_receiver(self, receiver: Optional[BenchmarkReceiver]) -> None:
+        """Point the reader thread at (or away from) a benchmark receiver.
+
+        Installed and removed from the GUI thread only, so the worker never sees a
+        sink appear halfway through a chunk.
+        """
+
+        self._benchmark_receiver = receiver
+        worker = getattr(self, "worker", None)
+        if worker is None:
+            return
+        if receiver is None:
+            worker.set_benchmark_sink(None)
+        else:
+            worker.set_benchmark_sink(receiver.feed)
+
+    def open_bluetooth_benchmark(self) -> None:
+        """Open the SPP throughput benchmark window (own top-level dialog)."""
+
+        if self._benchmark_dialog is None:
+            self._benchmark_dialog = BluetoothBenchmarkDialog(self)
+            self._benchmark_dialog.finished.connect(self._on_benchmark_dialog_closed)
+        self._benchmark_dialog.refresh_link_state()
+        if self.connected:
+            # Ask once for the board's state, so the dialog can tell an image with
+            # the benchmark from one that would silently ignore it.
+            self._send(b"|status;")
+        self._benchmark_dialog.show()
+        self._benchmark_dialog.raise_()
+        self._benchmark_dialog.activateWindow()
+
+    def _on_benchmark_dialog_closed(self, *_args) -> None:
+        if self._benchmark_dialog is not None:
+            self._benchmark_dialog.shutdown()
+        self._set_benchmark_receiver(None)
+        self._benchmark_dialog = None
+
+    @staticmethod
+    def _benchmark_sustainable_rate(
+        result: Optional[BenchmarkResult],
+        sweep: Sequence[tuple[int, BenchmarkResult]] = (),
+    ) -> float:
+        """The verified rate worth adopting, never the peak.
+
+        From a sweep that is the highest step that passed every check. From a
+        single run it is only adoptable if that run itself was stable - adopting
+        the average of a run that was losing packets would bake the failure into
+        every later feasibility calculation.
+        """
+
+        if sweep:
+            passing = [rate for rate, item in sweep if is_sustainable(item)[0]]
+            return float(max(passing)) if passing else 0.0
+        if result is None:
+            return 0.0
+        ok, _reason = is_sustainable(result)
+        return result.average_bytes_per_second if ok else 0.0
+
+    def _on_power_status_line(self, text: str) -> None:
+        """Route one ``[PWR] ... DONE=1`` line into the power panel."""
+
+        if "DONE=1" not in text:
+            return
+        fields = dict(token.split("=", 1) for token in text[len("[PWR]"):].split() if "=" in token)
+        self.power_state = fields
+        if self._power_dialog is not None:
+            self._power_dialog.apply_state(fields)
 
     def _on_dialog_verify(self, hardware: HardwareSettings) -> None:
         if self.recording is not None:
@@ -6242,6 +6502,17 @@ class LiveRecorderWindow(QMainWindow):
             self._log("in", line.text, line.kind)
             if line.text.strip().startswith("[SD]"):
                 self._on_sd_status_line(line.text.strip())
+                continue
+            if line.text.strip().startswith("[PWR]"):
+                self._on_power_status_line(line.text.strip())
+                continue
+            if line.text.strip().startswith("[BENCH]"):
+                # The board's own verdict on the throughput test: started,
+                # stopped with its counters, or refused and why.
+                self.benchmark_reports.append(line.text.strip())
+                del self.benchmark_reports[:-40]
+                if self._benchmark_dialog is not None:
+                    self._benchmark_dialog.on_firmware_report(line.text.strip())
                 continue
             if self._verify_pending and line.text.strip().startswith("[CFG]"):
                 if self._on_verify_line(line.text):
@@ -7164,6 +7435,10 @@ class LiveRecorderWindow(QMainWindow):
         self._autoconnect_timer.stop()
         self._open_watchdog.stop()
         self._reconnect_timer.stop()
+        if self._power_dialog is not None:
+            self._power_dialog.shutdown()
+            self._power_dialog.close()
+            self._power_dialog = None
         self._save_settings()
         if self._sweep_worker is not None:
             self._sweep_worker.stop()
@@ -7190,6 +7465,1987 @@ class LiveRecorderWindow(QMainWindow):
         if scanner is not None:
             scanner.stop()
         event.accept()
+
+
+class BluetoothBenchmarkDialog(QDialog):
+    """Measures the real application-level throughput of the Bluetooth SPP link.
+
+    The firmware generates frames in memory and pushes them through the production
+    transmission path; this window reads them off the same COM port the recorder
+    uses, proves each one, and reports what actually arrived. Nothing here talks
+    to the ADS1299: the converters are not read, so the number is the link and only
+    the link.
+
+    Three figures are shown side by side on purpose - verified, stack-accepted and
+    queued - because a link that accepts bytes and delivers none is exactly the
+    failure this test exists to catch.
+    """
+
+    MODE_FIXED = "fixed"
+    MODE_MAX = "max"
+    MODE_SWEEP = "sweep"
+
+    def __init__(self, window: "LiveRecorderWindow") -> None:
+        super().__init__(window)
+        self.setWindowTitle("Bluetooth throughput benchmark")
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.resize(1080, 760)
+        self._window = window
+        self._receiver = BenchmarkReceiver()
+        self._running = False
+        self._run_mode = ""
+        self._run_rate = 0
+        self._run_payload = 0
+        self._sweep_index = 0
+        self._sweep_results: list[tuple[int, BenchmarkResult]] = []
+        self._sweep_phase = "idle"
+        self._sweep_phase_until = 0.0
+        self._last_plot_s = 0.0
+        self._plot_ymax = 0.0
+        self._bt_link = None
+        self._last_result: Optional[BenchmarkResult] = None
+        self._relink_attempts = 0
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(200)
+        self._timer.timeout.connect(self._tick)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        self.link_label = QLabel("")
+        self.link_label.setWordWrap(True)
+        layout.addWidget(self.link_label)
+
+        layout.addWidget(self._build_link_group())
+        layout.addWidget(self._build_controls())
+        layout.addWidget(self._build_stats(), 0)
+        layout.addWidget(self._build_plot(), 1)
+
+        self.summary_label = QLabel("Idle. Press Start to measure the link.")
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        # Live firmware diagnostics: one line, refreshed every second while a test
+        # runs. Text is selectable so it can be pasted back verbatim.
+        self.diag_label = QLabel("Board diagnostics appear here while a test runs.")
+        self.diag_label.setWordWrap(True)
+        self.diag_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.diag_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        layout.addWidget(self.diag_label)
+
+        row = QHBoxLayout()
+        self.save_json_button = QPushButton("Save JSON...")
+        self.save_json_button.clicked.connect(lambda: self._save_result("json"))
+        self.save_json_button.setEnabled(False)
+        row.addWidget(self.save_json_button)
+        self.save_csv_button = QPushButton("Save CSV...")
+        self.save_csv_button.clicked.connect(lambda: self._save_result("csv"))
+        self.save_csv_button.setEnabled(False)
+        row.addWidget(self.save_csv_button)
+        self.apply_budget_button = QPushButton("Use measured rate as link budget...")
+        self.apply_budget_button.setToolTip(
+            "Adopt the verified sustainable rate (with a safety margin) as the capacity the "
+            "sample-rate planner assumes for Bluetooth. Peak throughput is never adopted."
+        )
+        self.apply_budget_button.clicked.connect(self._apply_measured_budget)
+        self.apply_budget_button.setEnabled(False)
+        row.addWidget(self.apply_budget_button)
+        row.addStretch(1)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        row.addWidget(close_button)
+        layout.addLayout(row)
+
+        self.refresh_link_state()
+
+    # -- construction ------------------------------------------------------
+
+    def _build_link_group(self) -> QWidget:
+        """The benchmark's own Bluetooth connection.
+
+        The whole point of this group is that the cable stays free: holding USB for
+        commands and Bluetooth for the measured data means the board is controllable
+        while the radio is saturated, and a command can never queue behind 200 KiB/s
+        of test traffic. It also keeps the board in Bluetooth mode, which it leaves
+        when nothing is using the SPP link.
+        """
+
+        group = QGroupBox("Benchmark link")
+        layout = QHBoxLayout(group)
+
+        layout.addWidget(QLabel("Data link"))
+        self.data_link_combo = QComboBox()
+        self.data_link_combo.addItem("Main window link (already open)", "main")
+        self.data_link_combo.addItem("This window's own Bluetooth port", "bt")
+        self.data_link_combo.addItem("USB (reference only)", "usb")
+        self.data_link_combo.setToolTip(
+            "Where the benchmark bytes are received. The board serves one Bluetooth client at a "
+            "time, so when the main window is already streaming over Bluetooth the test has to "
+            "read from that same connection - opening a second one makes the firmware drop the "
+            "first. Use this window's own port when the cable carries the commands."
+        )
+        self.data_link_combo.currentIndexChanged.connect(self._on_data_link_changed)
+        layout.addWidget(self.data_link_combo)
+
+        layout.addWidget(QLabel("Port"))
+        self.bt_port_combo = QComboBox()
+        self.bt_port_combo.setMinimumWidth(150)
+        layout.addWidget(self.bt_port_combo)
+
+        self.connect_button = QPushButton("Connect")
+        self.connect_button.clicked.connect(self.toggle_link)
+        layout.addWidget(self.connect_button)
+
+        self.link_state_label = QLabel("Not connected")
+        self.link_state_label.setStyleSheet("color: #b91c1c;")
+        layout.addWidget(self.link_state_label, 1)
+        return group
+
+    def _build_controls(self) -> QWidget:
+        group = QGroupBox("Test")
+        layout = QHBoxLayout(group)
+
+        layout.addWidget(QLabel("Mode"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Maximum throughput", self.MODE_MAX)
+        self.mode_combo.addItem("Fixed rate", self.MODE_FIXED)
+        self.mode_combo.addItem("Automatic sweep", self.MODE_SWEEP)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        layout.addWidget(self.mode_combo)
+
+        layout.addWidget(QLabel("Duration"))
+        self.duration_spin = QDoubleSpinBox()
+        self.duration_spin.setRange(2.0, 600.0)
+        self.duration_spin.setDecimals(0)
+        self.duration_spin.setValue(30.0)
+        self.duration_spin.setSuffix(" s")
+        layout.addWidget(self.duration_spin)
+
+        layout.addWidget(QLabel("Payload"))
+        self.payload_combo = QComboBox()
+        for size in PAYLOAD_CHOICES:
+            self.payload_combo.addItem(f"{size} B", size)
+        self.payload_combo.setCurrentIndex(max(self.payload_combo.findData(1024), 0))
+        self.payload_combo.setToolTip(
+            "Bytes of payload per frame. Larger frames mean fewer write calls; 990 is the "
+            "classic SPP-friendly size, 1024 matches the firmware's flush chunk."
+        )
+        layout.addWidget(self.payload_combo)
+
+        layout.addWidget(QLabel("Target rate"))
+        self.rate_combo = QComboBox()
+        for rate, label in RATE_CHOICES:
+            self.rate_combo.addItem(label, rate)
+        self.rate_combo.setCurrentIndex(max(self.rate_combo.findData(64 * 1024), 0))
+        layout.addWidget(self.rate_combo)
+
+        layout.addWidget(QLabel("Sweep"))
+        self.sweep_settle_spin = QDoubleSpinBox()
+        self.sweep_settle_spin.setRange(1.0, 60.0)
+        self.sweep_settle_spin.setDecimals(0)
+        self.sweep_settle_spin.setValue(3.0)
+        self.sweep_settle_spin.setSuffix(" s settle")
+        layout.addWidget(self.sweep_settle_spin)
+        self.sweep_measure_spin = QDoubleSpinBox()
+        self.sweep_measure_spin.setRange(1.0, 120.0)
+        self.sweep_measure_spin.setDecimals(0)
+        self.sweep_measure_spin.setValue(5.0)
+        self.sweep_measure_spin.setSuffix(" s measure")
+        layout.addWidget(self.sweep_measure_spin)
+
+        layout.addWidget(QLabel("SPP write"))
+        self.spp_chunk_combo = QComboBox()
+        for size, label in SPP_WRITE_CHOICES:
+            self.spp_chunk_combo.addItem(label, size)
+        preferred = int(
+            getattr(getattr(self._window, "hardware", None), "spp_write_bytes", 330) or 330
+        )
+        self.spp_chunk_combo.setCurrentIndex(max(self.spp_chunk_combo.findData(preferred), 0))
+        self.spp_chunk_combo.setToolTip(
+            "Bytes per SPP write. Measured on this board: 330 through the Arduino library "
+            "sustained 88-99 KiB/s and lost under 4% of frames, while the direct write at "
+            "990 B managed 1.3 KiB/s and at 4096 B about 11 KiB/s.\n\n"
+            "The library queues each chunk and returns, so its own task keeps the radio fed "
+            "while the sample ring refills - it is pipelined. The direct path has to wait for "
+            "every acknowledgement before it may write again, so its chunk divided by that "
+            "round trip is the whole ceiling.\n\n"
+            "330 is therefore the default and the fastest option. The larger sizes are kept "
+            "as an experimental path for links where the acknowledgement is much faster than "
+            "this one's."
+        )
+        layout.addWidget(self.spp_chunk_combo)
+
+        self.start_button = QPushButton("Start benchmark")
+        self.start_button.clicked.connect(self.start_benchmark)
+        layout.addWidget(self.start_button)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(lambda: self.stop_benchmark("stopped by user"))
+        layout.addWidget(self.stop_button)
+        layout.addStretch(1)
+
+        self._on_mode_changed()
+        return group
+
+    def _build_stats(self) -> QWidget:
+        group = QGroupBox("Live")
+        grid = QGridLayout(group)
+        grid.setHorizontalSpacing(14)
+        self._stat_labels: dict[str, QLabel] = {}
+
+        rows = [
+            ("current", "Current"),
+            ("average", "Average"),
+            ("peak", "Peak (1 s)"),
+            ("verified", "Verified payload"),
+            ("received", "Received"),
+            ("raw", "Raw bytes"),
+            ("packets", "Data packets"),
+            ("corrupt", "Corrupt / bad CRC"),
+            ("missing", "Missing"),
+            ("sequence", "Sequence errors"),
+            ("queue", "Firmware queue"),
+            ("queue_peak", "Peak queue"),
+            ("stalls", "Transmission stalls"),
+            ("congestion", "SPP congestion"),
+            ("spopath", "Write path"),
+            ("handle", "SPP handle"),
+            ("elapsed", "Elapsed"),
+            ("verdict", "Status"),
+        ]
+        for index, (key, label) in enumerate(rows):
+            column = (index % 5) * 2
+            row = index // 5
+            grid.addWidget(QLabel(label), row, column)
+            value = QLabel("-")
+            value.setStyleSheet("font-weight: 600;")
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            grid.addWidget(value, row, column + 1)
+            self._stat_labels[key] = value
+        return group
+
+    def _build_plot(self) -> QWidget:
+        self.plot = pg.PlotWidget()
+        self.plot.setMinimumHeight(230)
+        self.plot.setLabel("bottom", "Time", units="s")
+        self.plot.setLabel("left", "Throughput", units="kB/s")
+        self.plot.showGrid(x=True, y=True, alpha=0.3)
+        self.plot.addLegend(offset=(-10, 10))
+        self.plot.setYRange(0, 100)
+        self._rate_curve = self.plot.plot(
+            [], [], pen=pg.mkPen((37, 99, 235), width=2),
+            symbol="o", symbolSize=5, symbolBrush=(37, 99, 235), name="kB/s",
+        )
+        self._queue_curve = self.plot.plot(
+            [], [], pen=pg.mkPen((190, 90, 60), width=1.4, style=Qt.PenStyle.DashLine),
+            name="queue (KiB)",
+        )
+        # Fixed ranges with no autoranging: a live plot that rescales itself every
+        # half second is unreadable, and with a single point in it pyqtgraph would
+        # otherwise pick an arbitrary range and the trace would sit off-screen.
+        self.plot.setXRange(0, 30, padding=0)
+        self.plot.setYRange(0, 100, padding=0)
+        self.plot.enableAutoRange(False)
+        return self.plot
+
+    # -- link description --------------------------------------------------
+
+    def refresh_link_state(self) -> None:
+        """Re-read the transport and offer only what is actually possible."""
+
+        self.refresh_ports()
+        self._refresh_link_label()
+
+    def on_firmware_report(self, text: str) -> None:
+        """Take one ``[BENCH] EVENT=...`` line from the board.
+
+        A refusal is the single most misleading case: the firmware declines to
+        start and stops answering, which looks exactly like a dead link. Showing
+        the board's own reason turns that into a message.
+        """
+
+        fields = dict(token.split("=", 1) for token in text[len("[BENCH]"):].split() if "=" in token)
+        event = fields.get("EVENT", "")
+        reason = fields.get("REASON", "")
+        if event == "failed":
+            self._running = False
+            self._timer.stop()
+            self._install_data_sink(False)
+            self._receiver.stop()
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            if reason in ("no-bluetooth-host", "heap-too-low") and self._relink_attempts < 2:
+                # Do not tear the port down on the first refusal: the board can report
+                # "no host" for a moment while its own connect bookkeeping settles, and
+                # dropping a working link is a much worse outcome than waiting. Retry
+                # first, and only release the port if the board still says no.
+                self._relink_attempts += 1
+                self.summary_label.setText(
+                    f"The board was not ready ({reason.replace('-', ' ')}). Retrying start "
+                    f"({self._relink_attempts}/2) - the link is left alone for now."
+                )
+                QTimer.singleShot(900, self.start_benchmark)
+                return
+            self._relink_attempts = 0
+            if reason == "no-bluetooth-host" and self._data_link() == "bt":
+                # The board no longer sees a client, even though this window still
+                # holds the COM handle. That stale handle is what used to force a
+                # manual disconnect-and-reconnect, so release it and reopen once.
+                self._close_link()
+                self.summary_label.setText(
+                    "The board no longer sees a Bluetooth client, so the handle this window was "
+                    "holding had gone stale. It has been released and is being reopened - press "
+                    "Start again in a moment."
+                )
+                QTimer.singleShot(600, self.toggle_link)
+                return
+            if reason == "no-bluetooth-host" and self._data_link() == "main":
+                self.summary_label.setText(
+                    "The board no longer sees a Bluetooth client, so the main window's link has "
+                    "gone stale. Disconnect and reconnect it in the main window, then press Start."
+                )
+                return
+            self.summary_label.setText(
+                f"The board refused to start the benchmark: {reason.replace('-', ' ')}.\n"
+                "Nothing was measured. Check that the Bluetooth link is up, then press Start again."
+            )
+        elif event in ("diag", "started-diag"):
+            # The board's own view of the generator. Kept on screen because it is the
+            # only way to tell "the firmware never queued anything" from "the PC
+            # never received anything".
+            self.diag_label.setText(text)
+            fields = dict(token.split("=", 1) for token in text[len("[BENCH]"):].split() if "=" in token)
+            colour = "#475569"
+            active = fields.get("ACTIVE") == "1"
+            fast = fields.get("FAST") == "1"
+            stack = int(fields.get("STACK", "0") or 0)
+            api_errors = int(fields.get("ERR", "0") or 0)
+            if active and not fast:
+                colour = "#b45309"
+                # Say which input failed, so this is diagnosable at a glance rather
+                # than needing another reflash to find out.
+                handle = fields.get("HANDLE", "0")
+                spp = fields.get("SPP", "?")
+                thresh = fields.get("THRESH", "?")
+                why = (
+                    "the board has no SPP handle yet" if handle == "0"
+                    else f"write size {spp} is not above the library threshold {thresh}"
+                )
+                self.link_state_label.setText(
+                    f"Benchmark running on the library write path ({why}): frames will be lost."
+                )
+                self.link_state_label.setStyleSheet("color: #b45309;")
+            elif active and fast and stack == 0 and api_errors > 0:
+                # The direct path is engaged but nothing is being accepted. Before the
+                # retry logic was fixed this was the permanent state of every run, and
+                # it looked identical to a dead link.
+                colour = "#b45309"
+                self.link_state_label.setText(
+                    f"The direct write path is engaged but the stack has accepted nothing "
+                    f"({api_errors} API errors, {fields.get('ACK', '0')} missed acknowledgements)."
+                )
+                self.link_state_label.setStyleSheet("color: #b45309;")
+            self.diag_label.setStyleSheet(f"color: {colour}; font-size: 11px;")
+        elif event == "stopped":
+            explanations = {
+                "no-progress": "the radio accepted no data, so this write size is too large for the link",
+                "duration-elapsed": "the requested duration ran out",
+                "host-request": "you pressed Stop",
+                "bluetooth-stopped": "Bluetooth stopped",
+                "host-disconnected": "the host disconnected",
+            }
+            detail = explanations.get(reason, reason.replace("-", " "))
+            note = f"the board stopped the test ({detail})"
+            if self._running:
+                # The board ended the run itself - its progress watchdog, or a write
+                # size the link stopped acknowledging. Ignoring this used to leave the
+                # window waiting on a link that had already stopped, so Start never
+                # came back and the only way out was to reconnect.
+                self._end_run(note)
+            else:
+                self.summary_label.setText(self.summary_label.text() + f"\nBoard stopped the test: {detail}.")
+
+    def _refresh_link_label(self) -> None:
+        link = self._data_link()
+        window = self._window
+        if link == "bt":
+            port = str(self.bt_port_combo.currentData() or "")
+            if self._bt_link is not None:
+                self.link_label.setText(
+                    f"Measuring Bluetooth SPP on {port} over this window's own connection - the "
+                    "cable stays free for commands. Payload throughput is application bytes the "
+                    "PC verified; it is not the radio's PHY bitrate."
+                )
+                self.link_label.setStyleSheet("color: #166534;")
+            elif not self._allows_own_link():
+                self.link_label.setText(
+                    "The main window is streaming over Bluetooth, so a second connection cannot "
+                    "be opened - the board drops the first one. Switch Data link to "
+                    "'Main window link' to measure the connection that is already running."
+                )
+                self.link_label.setStyleSheet("color: #b91c1c;")
+            else:
+                self.link_label.setText(
+                    "Connect the Bluetooth port above to measure it. The cable can stay connected "
+                    "for commands, which is what keeps the board controllable during the test."
+                )
+                self.link_label.setStyleSheet("color: #b45309;")
+            return
+
+        if link == "main":
+            port = window.port_combo.currentData() if hasattr(window, "port_combo") else ""
+            if not window.connected:
+                self.link_label.setText(
+                    "Connect the board in the main window first, then measure that same link."
+                )
+                self.link_label.setStyleSheet("color: #b91c1c;")
+            elif window._selected_port_is_bluetooth():
+                self.link_label.setText(
+                    f"Measuring {port} over the main window's own Bluetooth connection. This is "
+                    "the real SPP link, and no second connection is opened - the board only "
+                    "serves one client."
+                )
+                self.link_label.setStyleSheet("color: #166534;")
+            else:
+                self.link_label.setText(
+                    f"USB reference: {port} is a cable port, not Bluetooth. This must not be "
+                    "reported as Bluetooth performance."
+                )
+                self.link_label.setStyleSheet("color: #b45309;")
+            return
+
+        port = window.port_combo.currentData() if hasattr(window, "port_combo") else ""
+        if not window.connected:
+            self.link_label.setText("Connect the board, or connect a Bluetooth port above.")
+            self.link_label.setStyleSheet("color: #b91c1c;")
+        elif window._selected_port_is_bluetooth():
+            self.link_label.setText(
+                f"Warning: the main link is Bluetooth ({port}), so a USB reference is not "
+                "available here. Use 'Main window link' to measure it."
+            )
+            self.link_label.setStyleSheet("color: #b45309;")
+        else:
+            self.link_label.setText(
+                f"USB reference on {port}: a useful baseline, but it is a different link and must "
+                "not be reported as Bluetooth performance."
+            )
+            self.link_label.setStyleSheet("color: #b45309;")
+
+    # -- the benchmark's own Bluetooth link --------------------------------
+
+    def _data_link(self) -> str:
+        return str(self.data_link_combo.currentData() or "bt")
+
+    def _bluetooth_ports(self) -> list[tuple[str, str]]:
+        """Bluetooth COM ports the main window knows about (label, device)."""
+
+        table = getattr(self._window, "_port_is_bluetooth", {}) or {}
+        wanted: list[tuple[str, str]] = []
+        last = str(getattr(self._window.settings, "last_port", "") or "")
+        combo = getattr(self._window, "port_combo", None)
+        if combo is not None:
+            for index in range(combo.count()):
+                device = str(combo.itemData(index) or "")
+                if device and table.get(device):
+                    wanted.append((combo.itemText(index), device))
+        if last and last not in [device for _label, device in wanted]:
+            wanted.append((f"{last} (last used)", last))
+        return wanted
+
+    def _allows_own_link(self) -> bool:
+        """Whether a second Bluetooth connection is possible right now.
+
+        The board serves **one** SPP client. A second connection makes the firmware
+        treat the existing one as stale: it disconnects the tracked handle and starts
+        link recovery, which drops the live stream and leaves the port unusable until
+        a reconnect. So the benchmark may only open its own link when the main window
+        is not already using Bluetooth.
+        """
+
+        window = self._window
+        if not window.connected:
+            return True
+        return not window._selected_port_is_bluetooth()
+
+    def _default_data_link(self) -> str:
+        return "main" if not self._allows_own_link() else "bt"
+
+    def refresh_ports(self) -> None:
+        previous = str(self.bt_port_combo.currentData() or "")
+        held = ""
+        self.bt_port_combo.blockSignals(True)
+        self.bt_port_combo.clear()
+        for label, device in self._bluetooth_ports():
+            if self._window.connected and device == str(self._window.port_combo.currentData() or ""):
+                held = device
+                continue  # opening it again is the one thing that must not happen
+            self.bt_port_combo.addItem(label, device)
+        if self.bt_port_combo.count() == 0:
+            self.bt_port_combo.addItem("(no free Bluetooth port)", "")
+        position = self.bt_port_combo.findData(previous)
+        self.bt_port_combo.setCurrentIndex(max(position, 0))
+        self.bt_port_combo.blockSignals(False)
+
+        # Pick the data link that is actually possible, so the default can never be
+        # the option that breaks the connection.
+        wanted = self._default_data_link()
+        combo = self.data_link_combo
+        combo.blockSignals(True)
+        position = combo.findData(wanted)
+        if position >= 0:
+            combo.setCurrentIndex(position)
+        combo.blockSignals(False)
+        self._on_data_link_changed()
+        if held:
+            self.link_state_label.setText(
+                f"{held} is held by the main window. The board accepts one Bluetooth "
+                "client, so the test reads its data from that link instead."
+            )
+            self.link_state_label.setStyleSheet("color: #b45309;")
+
+    def _on_data_link_changed(self, *_args) -> None:
+        own = self._data_link() == "bt"
+        self.bt_port_combo.setEnabled(own and self._bt_link is None)
+        self.connect_button.setEnabled(own or self._bt_link is not None)
+        if not own and self._bt_link is not None:
+            # Leaving "own port" must release it: a dangling handle is exactly the
+            # "port is always busy" symptom.
+            self._close_link()
+        self._refresh_link_label()
+
+    def toggle_link(self) -> None:
+        if self._bt_link is not None:
+            self._close_link()
+            return
+        if not self._allows_own_link():
+            QMessageBox.information(
+                self,
+                "Benchmark",
+                "The main window is already streaming over Bluetooth, and the board accepts "
+                "only one Bluetooth client at a time.\n\n"
+                "Opening a second connection makes the firmware treat the first as stale and "
+                "drop it, which is what leaves the port unusable afterwards.\n\n"
+                "Set Data link to 'Main window link' to measure over the connection that is "
+                "already open.",
+            )
+            return
+        port = str(self.bt_port_combo.currentData() or "")
+        if not port:
+            QMessageBox.information(
+                self, "Benchmark", "No Bluetooth COM port to connect to. Pair SZD_EEG first."
+            )
+            return
+        if port == str(getattr(self._window, "port_combo", None) and self._window.port_combo.currentData() or ""):
+            # The main window already owns that handle; a second open would fail
+            # anyway, and the message is clearer than the driver error.
+            QMessageBox.information(
+                self,
+                "Benchmark",
+                f"{port} is already open in the main window. Either disconnect it there, or set "
+                "the main window to the USB port so the benchmark can hold Bluetooth.",
+            )
+            return
+        link = PowerSerialLink(port, parent=self)
+        link.opened.connect(self._on_link_opened)
+        link.failed.connect(self._on_link_failed)
+        link.closed.connect(self._on_link_closed)
+        link.lineReceived.connect(self._on_link_line)
+        self._bt_link = link
+        self.connect_button.setText("Disconnect")
+        self.bt_port_combo.setEnabled(False)
+        self.link_state_label.setText(f"Opening {port}...")
+        self.link_state_label.setStyleSheet("color: #b45309;")
+        link.start()
+
+    def _close_link(self) -> None:
+        """Release the port completely - the handle, the thread and the object.
+
+        A COM port that is still held after the dialog closes is the difference
+        between "the test is finished" and "Bluetooth is dead until a reboot", so
+        this waits for the reader thread to exit rather than trusting it to.
+        """
+
+        link = self._bt_link
+        self._bt_link = None
+        if link is None:
+            return
+        try:
+            link.set_byte_sink(None)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            link.stop()
+            # stop() asks and waits; this makes sure the OS handle is really closed
+            # even if the thread was mid-read when it was interrupted.
+            link.wait(2000)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            link.deleteLater()
+        except Exception:  # noqa: BLE001
+            pass
+        self.connect_button.setText("Connect")
+        self.bt_port_combo.setEnabled(self._data_link() == "bt")
+        self.link_state_label.setText("Not connected")
+        self.link_state_label.setStyleSheet("color: #b91c1c;")
+        self._refresh_link_label()
+
+    def _on_link_opened(self, port: str) -> None:
+        self.link_state_label.setText(f"Connected to {port}")
+        self.link_state_label.setStyleSheet("color: #166534;")
+        # A test in progress wants its bytes on this link immediately.
+        if self._running:
+            self._install_data_sink(True)
+        self._refresh_link_label()
+
+    def _on_link_failed(self, message: str) -> None:
+        self.link_state_label.setText(message)
+        self.link_state_label.setStyleSheet("color: #b91c1c;")
+        # A failed open must not leave the button reading "Disconnect" over a handle
+        # that does not exist, which is how the port looked permanently busy.
+        self._close_link()
+
+    def _on_link_closed(self) -> None:
+        if self._running:
+            self.stop_benchmark("Bluetooth link closed")
+        self._close_link()
+
+    def _on_link_line(self, text: str) -> None:
+        if text.startswith("[BENCH]"):
+            self.on_firmware_report(text)
+
+    def _install_data_sink(self, active: bool) -> None:
+        """Attach the receiver to exactly one link - never two, or it counts bytes twice."""
+
+        link = self._data_link()
+        use_main = active and link == "main"
+        use_own = active and link == "bt"
+        # The main window's reader is only tapped when it is the chosen source: its
+        # text parser must keep working otherwise.
+        self._window._set_benchmark_receiver(self._receiver if (use_main or link == "usb") else None)
+        reader = self._bt_link
+        if reader is not None:
+            try:
+                reader.set_byte_sink(self._receiver.feed if use_own else None)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def shutdown(self) -> None:
+        """Release the link and any attached sink; safe to call twice."""
+
+        try:
+            self._install_data_sink(False)
+        except Exception:  # noqa: BLE001
+            pass
+        self._close_link()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self._running:
+            self.stop_benchmark("window closed")
+        self.shutdown()
+        super().closeEvent(event)
+
+    def _on_mode_changed(self, *_args) -> None:
+        mode = str(self.mode_combo.currentData())
+        self.rate_combo.setEnabled(mode == self.MODE_FIXED)
+        self.duration_spin.setEnabled(mode != self.MODE_SWEEP)
+        self.sweep_settle_spin.setEnabled(mode == self.MODE_SWEEP)
+        self.sweep_measure_spin.setEnabled(mode == self.MODE_SWEEP)
+
+    # -- firmware commands -------------------------------------------------
+
+    def _send(self, payload: bytes) -> bool:
+        """Send a command, preferring the cable.
+
+        Control must stay responsive while the radio is saturated, and the cable is
+        never the link under test - so it is tried first whenever the main window
+        holds it. Failing that, the command goes over whichever Bluetooth link is
+        actually open, which is what makes the window usable on Bluetooth alone.
+        """
+
+        if self._window.connected:
+            try:
+                self._window._send(payload)
+                return True
+            except Exception:  # noqa: BLE001
+                pass
+        link = self._bt_link
+        if link is not None:
+            try:
+                return link.send(payload)
+            except Exception:  # noqa: BLE001
+                return False
+        return False
+
+    def _effective_payload(self) -> tuple[int, str]:
+        """Payload to use, plus a note when the write size forces it down.
+
+        The Arduino library writes in 330-byte pieces and discards the rest of a
+        piece when the stack congests, so a frame larger than one piece cannot
+        arrive intact. That is exactly why a 990-byte payload on the 330-byte path
+        produced thousands of received bytes and not one parseable frame.
+        """
+
+        chunk = int(self.payload_combo.currentData() or 1024)
+        spp = int(self.spp_chunk_combo.currentData() or 990)
+        limit = 330 - 20
+        if spp <= 330 and chunk > limit:
+            fits = [size for size in PAYLOAD_CHOICES if size <= limit]
+            chunk = max(fits) if fits else PAYLOAD_CHOICES[0]
+            return chunk, (
+                f"The 330 B library write cannot carry a frame above 330 B, so the payload "
+                f"was reduced to {chunk} B for this run."
+            )
+        return chunk, ""
+
+    def _configure_firmware(self, rate_bps: int, duration_s: float) -> None:
+        chunk = self._run_payload
+        self._send(f"|benchchunk={chunk};".encode("ascii"))
+        self._send(f"|benchspp={int(self.spp_chunk_combo.currentData() or 990)};".encode("ascii"))
+        self._send(f"|benchrate={max(int(rate_bps), 0)};".encode("ascii"))
+        self._send(f"|benchdur={max(int(duration_s * 1000), 1000)};".encode("ascii"))
+
+    # -- run control -------------------------------------------------------
+
+    def start_benchmark(self) -> None:
+        link = self._data_link()
+        if link == "main" and not self._window.connected:
+            QMessageBox.information(
+                self, "Benchmark", "Connect the board in the main window first."
+            )
+            return
+        if link == "bt" and self._bt_link is None:
+            QMessageBox.information(
+                self, "Benchmark", "Connect the Bluetooth port above first, or switch Data link."
+            )
+            return
+        if link == "usb" and not self._window.connected:
+            QMessageBox.information(
+                self, "Benchmark", "Connect the board over USB first."
+            )
+            return
+        # The firmware advertises the benchmark in its status line. A board that
+        # does not is running an older image that would accept the commands and
+        # transmit nothing, which looks exactly like a broken link.
+        reported = str(self._window.power_state.get("BENCH", "") or "")
+        if reported and reported.isdigit() and int(reported) < 1:
+            QMessageBox.warning(
+                self,
+                "Benchmark",
+                "The board does not report benchmark support (BENCH). Reflash it: an older "
+                "firmware image accepts these commands and sends nothing.",
+            )
+            return
+        if self._window.recording is not None:
+            QMessageBox.information(
+                self, "Benchmark", "Stop the recording first: the test stops the sample stream."
+            )
+            return
+        if self._window.streaming:
+            # Stop the stream from here rather than letting the firmware do it behind
+            # the GUI's back: the button state, the packet counters and the port all
+            # have to agree that acquisition has stopped.
+            self._window.stream_button.setChecked(False)
+
+        mode = str(self.mode_combo.currentData())
+        if mode == self.MODE_SWEEP:
+            self._sweep_index = 0
+            self._sweep_results = []
+            self._start_sweep_step()
+            return
+        rate = 0 if mode == self.MODE_MAX else int(self.rate_combo.currentData() or 0)
+        self._begin_run(rate, float(self.duration_spin.value()), mode)
+
+    def _begin_run(self, rate_bps: int, duration_s: float, mode: str) -> None:
+        self._run_payload, note = self._effective_payload()
+        # The sink must be installed before the first frame can arrive.
+        self._window._set_benchmark_receiver(None)
+        self._receiver.payload_bytes = self._run_payload
+        self._receiver.start()
+        self._install_data_sink(True)
+        self._configure_firmware(rate_bps, duration_s)
+        self._send(b"|bench=1;")
+        self._running = True
+        self._run_mode = mode
+        self._run_rate = rate_bps
+        self._run_until = time.monotonic() + duration_s
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.save_json_button.setEnabled(False)
+        self.save_csv_button.setEnabled(False)
+        self.apply_budget_button.setEnabled(False)
+        # Clear the traces, not the plot: plot.clear() removes the curve items too,
+        # and every later setData() then writes to an orphaned item - which is why
+        # the graph stayed blank through an entire run.
+        self._rate_curve.setData([], [])
+        self._queue_curve.setData([], [])
+        self._plot_ymax = 0.0
+        self.plot.setYRange(0, 100, padding=0)
+        self.plot.setXRange(0, 30, padding=0)
+        self.summary_label.setText(
+            f"Running: {'unlimited' if rate_bps <= 0 else f'{rate_bps / 1024:.0f} KiB/s target'}, "
+            f"{self._run_payload} B payload, {duration_s:.0f} s."
+            + (f"\n{note}" if note else "")
+        )
+        self._timer.start()
+
+    def _end_run(self, reason: str) -> None:
+        """Finish a run that is already over, whoever ended it."""
+
+        if self._run_mode == self.MODE_SWEEP and self._sweep_phase != "idle":
+            # A sweep step ended early - the board's progress watchdog, or a link that
+            # will not take that rate. That is a *result*, not a failure of the sweep:
+            # record the step and move on instead of abandoning the whole run.
+            self._complete_sweep_step(extra_note=reason)
+            return
+        self._timer.stop()
+        self._running = False
+        self._sweep_phase = "idle"
+        self._install_data_sink(False)
+        self._receiver.stop()
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        result = self._receiver.result(
+            mode=self._run_mode,
+            rate_target_bps=getattr(self, "_run_rate", 0),
+            payload_bytes=getattr(self, "_run_payload", 0) or int(self.payload_combo.currentData() or 1024),
+        )
+        self._publish(result, reason)
+
+    def stop_benchmark(self, reason: str) -> None:
+        self._send(b"|bench=0;")
+        self._end_run(reason)
+
+    def _publish(self, result: BenchmarkResult, reason: str) -> None:
+        self._last_result = result
+        link = self._data_link()
+        if link == "main":
+            over_bluetooth = self._window._selected_port_is_bluetooth()
+            label = "Bluetooth SPP (main window link)" if over_bluetooth else "USB reference (NOT Bluetooth)"
+        elif link == "bt":
+            label = "Bluetooth SPP (own port)"
+        else:
+            label = "USB reference (NOT Bluetooth)"
+        ok, why = is_sustainable(result)
+        self.summary_label.setText(
+            f"{label} - {reason}.\n"
+            f"Average {result.average_kib_s:.1f} KiB/s ({result.average_kb_s:.1f} kB/s, "
+            f"{result.average_mbit_s:.2f} Mbit/s), peak {result.peak_kib_s:.1f} KiB/s.\n"
+            f"Verified {result.verified_bytes} bytes in {result.packets} packets; "
+            f"{result.missing_packets} missing, {result.corrupt_packets} corrupt, "
+            f"{result.stalls} stalls, queue peak {result.peak_queue_fill}/{result.ring_bytes} bytes.\n"
+            f"Verdict: {result.verdict} - {why}."
+        )
+        self.save_json_button.setEnabled(True)
+        self.save_csv_button.setEnabled(True)
+        self.apply_budget_button.setEnabled(result.average_bytes_per_second > 0)
+
+    # -- sweep ------------------------------------------------------------
+
+    def _start_sweep_step(self) -> None:
+        if self._sweep_index >= len(SWEEP_STEPS):
+            self._finish_sweep()
+            return
+        rate = SWEEP_STEPS[self._sweep_index]
+        settle = float(self.sweep_settle_spin.value())
+        measure = float(self.sweep_measure_spin.value())
+        self._begin_run(rate, settle + measure, self.MODE_SWEEP)
+        self._sweep_phase = "settle"
+        self._sweep_phase_until = time.monotonic() + settle
+        self._sweep_measure_s = measure
+        self.summary_label.setText(
+            f"Sweep step {self._sweep_index + 1}/{len(SWEEP_STEPS)}: {rate / 1024:.0f} KiB/s "
+            f"({settle:.0f} s settle, {measure:.0f} s measure)."
+        )
+
+    def _complete_sweep_step(self, extra_note: str = "") -> None:
+        """Record the current sweep step and either start the next or finish."""
+
+        self._sweep_phase = "idle"
+        self._send(b"|bench=0;")
+        self._receiver.stop()
+        result = self._receiver.result(
+            mode=self.MODE_SWEEP,
+            rate_target_bps=SWEEP_STEPS[self._sweep_index],
+            payload_bytes=self._run_payload or int(self.payload_combo.currentData() or 1024),
+        )
+        self._sweep_results.append((SWEEP_STEPS[self._sweep_index], result))
+        if extra_note:
+            result.notes.append(extra_note)
+        self._sweep_index += 1
+        self._window._set_benchmark_receiver(None)
+        if self._sweep_index >= len(SWEEP_STEPS):
+            self._finish_sweep()
+        else:
+            self._start_sweep_step()
+
+    def _finish_sweep(self) -> None:
+        self._timer.stop()
+        self._running = False
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        text = summarize_sweep(self._sweep_results)
+        lines = [text, ""]
+        for rate, result in self._sweep_results:
+            ok, why = is_sustainable(result)
+            lines.append(
+                f"  {rate / 1024:5.0f} KiB/s -> {result.average_kib_s:6.1f} KiB/s verified, "
+                f"{result.missing_packets} missing, {result.corrupt_packets} corrupt, "
+                f"{result.stalls} stalls  [{'OK' if ok else 'FAIL'}: {why}]"
+            )
+        self.summary_label.setText("\n".join(lines))
+        best = max(
+            (rate for rate, result in self._sweep_results if is_sustainable(result)[0]), default=0
+        )
+        if best:
+            self._last_result = next(r for rate, r in self._sweep_results if rate == best)
+            self.apply_budget_button.setEnabled(True)
+        self.save_json_button.setEnabled(bool(self._sweep_results))
+        self.save_csv_button.setEnabled(bool(self._sweep_results))
+
+    # -- periodic update ---------------------------------------------------
+
+    def _tick(self) -> None:
+        self._receiver.poll()
+        if self._sweep_phase == "settle" and time.monotonic() >= self._sweep_phase_until:
+            # Restart the counters so the step is judged on the measurement window
+            # only, not on the ramp into it.
+            self._receiver.start()
+            self._receiver.payload_bytes = self._run_payload or int(self.payload_combo.currentData() or 1024)
+            self._sweep_phase = "measure"
+            self._sweep_phase_until = time.monotonic() + self._sweep_measure_s
+        elif self._sweep_phase == "measure" and time.monotonic() >= self._sweep_phase_until:
+            self._complete_sweep_step()
+
+        if self._running:
+            if self._run_mode == self.MODE_SWEEP:
+                # The sweep drives its own step boundaries; a duration stop here would
+                # cut a step short and then fight the phase timer for the next one.
+                pass
+            elif time.monotonic() >= self._run_until:
+                self.stop_benchmark("duration elapsed")
+            elif self._receiver.raw_bytes == 0 and self._receiver.elapsed_s > 4.0:
+                # Nothing at all has arrived - not even a firmware stats packet. Saying
+                # so beats showing a row of zeros that looks like a measurement.
+                self.summary_label.setText(
+                    "Running, but nothing has arrived on this link after "
+                    f"{self._receiver.elapsed_s:.0f} s - not even the firmware's once-per-second "
+                    "stats packet. The board is not sending, so the problem is the connection "
+                    "rather than the throughput. The board diagnostics line above shows whether "
+                    "the generator is running and whether the ring is accepting data."
+                )
+            elif self._receiver.raw_bytes > 0 and self._receiver.packets == 0 and self._receiver.elapsed_s > 4.0:
+                self.summary_label.setText(
+                    f"{self._receiver.raw_bytes} bytes have arrived but none of them parsed as a "
+                    "benchmark frame. The link is delivering data, so the fault is in the framing "
+                    "- most likely a firmware image older than this window."
+                )
+        self._update_stats()
+        self._update_plot()
+
+    def _update_stats(self) -> None:
+        receiver = self._receiver
+        rate = receiver.current_bytes_per_second
+        firmware = receiver.firmware
+        values = {
+            "current": f"{rate / 1024:.1f} KiB/s  ({rate / 1000:.1f} kB/s, {rate * 8 / 1e6:.2f} Mbit/s)",
+            "average": f"{receiver.average_bytes_per_second / 1024:.1f} KiB/s",
+            "peak": f"{receiver.peak_bytes_per_second / 1024:.1f} KiB/s",
+            "verified": f"{receiver.verified_bytes} B",
+            "received": f"{receiver.received_bytes} B",
+            "raw": f"{receiver.raw_bytes} B",
+            "packets": f"{receiver.packets}",
+            "corrupt": f"{receiver.corrupt_packets}",
+            "missing": f"{receiver.missing_packets}",
+            "sequence": f"{receiver.sequence_errors}",
+            "queue": f"{firmware.queue_fill} / {firmware.ring_bytes or '?'} B",
+            "queue_peak": f"{firmware.peak_fill} B",
+            "stalls": f"{firmware.stalls}",
+            "congestion": (
+                f"{firmware.congestion_events} (ack timeouts {firmware.ack_timeouts})"
+            ),
+            "spopath": (
+                f"{'direct ' + str(firmware.spp_write_chunk) + ' B' if firmware.fast_path else 'library ' + str(firmware.spp_write_chunk) + ' B'}"
+                + (f" - {firmware.fast_path_fallbacks} fallback(s)" if firmware.fast_path_fallbacks else "")
+            ),
+            "handle": f"{firmware.spp_handle}",
+            "elapsed": f"{receiver.elapsed_s:.1f} s",
+            "verdict": receiver.verdict() if receiver.packets else "-",
+        }
+        for key, text in values.items():
+            label = self._stat_labels.get(key)
+            if label is not None:
+                label.setText(text)
+
+    def _update_plot(self) -> None:
+        samples = self._receiver.samples
+        if not samples:
+            return
+        # Throttled and incremental: rebuilding the whole figure ten times a second
+        # was a measurable part of why the window felt dead during a test.
+        now = time.monotonic()
+        if now - self._last_plot_s < 0.4:
+            return
+        self._last_plot_s = now
+        times = np.fromiter((s["t"] for s in samples), dtype=float, count=len(samples))
+        rates = np.fromiter((s["kib_per_second"] for s in samples), dtype=float, count=len(samples))
+        fills = np.fromiter((s["queue_fill"] / 1024.0 for s in samples), dtype=float, count=len(samples))
+        # setData on persistent curves: no item churn, no legend rebuild.
+        self._rate_curve.setData(times, rates)
+        self._queue_curve.setData(times, fills)
+        # Grow the range to fit, and only ever grow: a shrinking axis during a run
+        # makes a dip look like a collapse.
+        span = max(float(times[-1]), 5.0)
+        self.plot.setXRange(0, span * 1.05, padding=0)
+        top = max(float(rates.max()) if rates.size else 0.0, float(fills.max()) if fills.size else 0.0)
+        if top > self._plot_ymax:
+            self._plot_ymax = top * 1.25
+            self.plot.setYRange(0, self._plot_ymax, padding=0)
+
+    # -- results -----------------------------------------------------------
+
+    def _save_result(self, kind: str) -> None:
+        if kind == "json" and self._sweep_results:
+            results = [
+                {"rate_bps": rate, "sustainable": is_sustainable(result)[0], **result.as_dict()}
+                for rate, result in self._sweep_results
+            ]
+            file_name, _filter = QFileDialog.getSaveFileName(
+                self, "Save sweep results", "bluetooth_sweep.json", "JSON files (*.json)"
+            )
+            if not file_name:
+                return
+            import json as _json
+
+            with open(file_name, "w", encoding="utf-8") as handle:
+                _json.dump(results, handle, indent=2)
+            self.summary_label.setText(self.summary_label.text() + f"\nSaved to {file_name}.")
+            return
+        result = self._last_result
+        if result is None:
+            return
+        if kind == "json":
+            file_name, _filter = QFileDialog.getSaveFileName(
+                self, "Save benchmark result", "bluetooth_benchmark.json", "JSON files (*.json)"
+            )
+            if file_name:
+                result.save_json(file_name)
+        else:
+            file_name, _filter = QFileDialog.getSaveFileName(
+                self, "Save benchmark samples", "bluetooth_benchmark.csv", "CSV files (*.csv)"
+            )
+            if file_name:
+                result.save_csv(file_name)
+
+    def _apply_measured_budget(self) -> None:
+        rate = self._window._benchmark_sustainable_rate(self._last_result, self._sweep_results)
+        if rate <= 0:
+            QMessageBox.information(
+                self, "Benchmark", "There is no verified sustainable rate to adopt yet."
+            )
+            return
+        margin, ok = QInputDialog.getDouble(
+            self,
+            "Link budget",
+            f"Adopt {rate / 1024:.1f} KiB/s as the Bluetooth capacity.\n"
+            "Safety margin applied on top (%):",
+            20.0,
+            0.0,
+            90.0,
+            1,
+        )
+        if not ok:
+            return
+        self._window.set_bluetooth_budget(rate, margin)
+        effective = self._window.bluetooth_budget_bytes_per_second()
+        self.summary_label.setText(
+            self.summary_label.text()
+            + f"\nLink budget now {effective / 1024:.1f} KiB/s "
+            f"({rate / 1024:.1f} KiB/s measured, {margin:.0f} % margin)."
+        )
+        self._refresh_link_label()
+
+
+class PowerSerialLink(QThread):
+    """A second serial port for the power panel.
+
+    The board only stays in Bluetooth mode while a host is actually using the SPP
+    link, so measuring "Bluetooth running" current needs a program holding that port
+    open. The main window already owns the USB port, so the panel gets its own,
+    completely separate connection - a different COM port, so there is no conflict
+    with the cable.
+    """
+
+    lineReceived = pyqtSignal(str)
+    opened = pyqtSignal(str)
+    failed = pyqtSignal(str)
+    closed = pyqtSignal()
+
+    def __init__(self, port: str, baud: int = 115200, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.port = port
+        self.baud = baud
+        self._stop = threading.Event()
+        self._handle = None
+        self._sink = None
+
+    def set_byte_sink(self, sink) -> None:
+        """Take raw bytes before they are split into lines.
+
+        Called from this thread, so a high-rate consumer never has to cross a Qt
+        queued connection - which would cap any throughput measurement at the event
+        loop's rate. The callable returns the bytes that were not consumed; those
+        are still parsed into lines, so replies keep working during a test.
+        """
+
+        self._sink = sink
+
+    def stop(self) -> None:
+        self._stop.set()
+        handle = self._handle
+        self._handle = None
+        if handle is not None:
+            # Cancel any pending read first: a Windows Bluetooth COM port can sit in
+            # a read for a while, and close() will not take effect until it returns.
+            try:
+                handle.cancel_read()
+            except Exception:  # noqa: BLE001 - not all backends support it
+                pass
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001 - closing a dead port must not raise
+                pass
+        self.wait(2500)
+
+    def send(self, payload: bytes) -> bool:
+        handle = self._handle
+        if handle is None:
+            return False
+        try:
+            handle.write(payload)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"Bluetooth write failed: {exc}")
+            return False
+
+    def run(self) -> None:  # noqa: D401 - QThread entry point
+        if serial is None:
+            self.failed.emit("pyserial is not installed")
+            return
+        try:
+            # A Bluetooth COM port can take seconds to come up while the driver
+            # talks to the radio, which is why this is on its own thread.
+            open_kwargs = {"timeout": 0.05}
+            try:
+                handle = serial.Serial(self.port, self.baud, write_timeout=0.5, **open_kwargs)
+            except (ValueError, TypeError):
+                handle = serial.Serial(self.port, self.baud, **open_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"Could not open {self.port}: {exc}")
+            return
+        self._handle = handle
+        self.opened.emit(self.port)
+        buffer = b""
+        try:
+            while not self._stop.is_set():
+                try:
+                    chunk = handle.read(max(int(getattr(handle, "in_waiting", 0) or 0), 1))
+                except Exception as exc:  # noqa: BLE001
+                    if not self._stop.is_set():
+                        self.failed.emit(f"{self.port} read failed: {exc}")
+                    break
+                if not chunk:
+                    continue
+                sink = self._sink
+                if sink is not None:
+                    try:
+                        chunk = sink(chunk)
+                    except Exception:  # noqa: BLE001 - a bad sink must not kill the link
+                        chunk = b""
+                if not chunk:
+                    continue
+                buffer += chunk
+                # Bound the line buffer. Benchmark bytes are binary: they contain no
+                # newline, so without this the buffer grows without limit whenever
+                # data arrives while no sink is attached - which is exactly what
+                # happens between Stop and the firmware noticing. That was an
+                # out-of-memory crash waiting to happen.
+                if len(buffer) > 65536 and b"\n" not in buffer:
+                    buffer = b""
+                    continue
+                while b"\n" in buffer:
+                    raw, _, buffer = buffer.partition(b"\n")
+                    text = raw.decode("ascii", "replace").strip()
+                    if text:
+                        self.lineReceived.emit(text)
+        finally:
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._handle = None
+            self.closed.emit()
+
+
+class PowerControlDialog(QDialog):
+    """Switch board subsystems on and off to measure their current draw.
+
+    The panel only reports and switches; the bench supply does the measuring. It
+    therefore does two things very deliberately:
+
+    * **It never polls.** The state is read once when the window opens and again
+      only when *Refresh* is pressed. A periodic query would put a burst of card
+      and SPI traffic into every measurement - which is exactly the artefact this
+      window exists to avoid.
+    * **It states which pins are shared.** ``PWDN`` and ``RESET`` are wired to both
+      ADS1299s on this board, so those two controls say so instead of pretending to
+      be per-converter. Per-chip operating mode goes through the START/STOP/STANDBY
+      SPI opcodes, which really are per device.
+    """
+
+    #: SPS choices as (label, data-rate bits). Matches the ADS1299 DR field.
+    SPS_CHOICES = (
+        ("16000 SPS", 0),
+        ("8000 SPS", 1),
+        ("4000 SPS", 2),
+        ("2000 SPS", 3),
+        ("1000 SPS", 4),
+        ("500 SPS", 5),
+        ("250 SPS", 6),
+    )
+    GAIN_CHOICES = (("x1", 0), ("x2", 1), ("x4", 2), ("x6", 3), ("x8", 4), ("x12", 5), ("x24", 6))
+    MODE_CHOICES = (
+        ("Run (converting, streaming)", "run"),
+        ("Idle (clock on, no conversion)", "idle"),
+        ("Standby (lowest per-chip current)", "standby"),
+    )
+    #: The BR/EDR steps the controller actually has.
+    BT_POWER_CHOICES = tuple((f"{dbm:+d} dBm", dbm) for dbm in (-12, -9, -6, -3, 0, 3, 6, 9))
+
+    def __init__(
+        self,
+        send,
+        connected: bool = False,
+        parent: Optional[QWidget] = None,
+        bluetooth_ports: Optional[Sequence[tuple[str, str]]] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._send_command = send
+        self._bt_link: Optional[PowerSerialLink] = None
+        self._bt_ports = list(bluetooth_ports or [])
+        self.setWindowTitle("Power control")
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.resize(620, 720)
+        self._state: dict[str, str] = {}
+
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setSpacing(8)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+
+        layout.addWidget(self._build_converter_group())
+        layout.addWidget(self._build_link_group())
+        layout.addWidget(self._build_peripheral_group())
+        layout.addWidget(self._build_bluetooth_group())
+        layout.addWidget(self._build_sleep_group())
+        layout.addWidget(self._build_status_group())
+        layout.addStretch(1)
+
+        button_row = QHBoxLayout()
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setToolTip("Read the board's power state (nothing is polled automatically)")
+        self.refresh_button.clicked.connect(self.refresh)
+        button_row.addWidget(self.refresh_button)
+        button_row.addStretch(1)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        button_row.addWidget(close_button)
+        outer.addLayout(button_row)
+
+        # The board powers up with the converters, accelerometer, card and radio
+        # enabled, so those boxes start checked and a Refresh corrects them. PWDN and
+        # RESET are inverted (checked = held low = disabled), so they start clear.
+        for widget in (
+            self.lis3dh_check,
+            self.sd_check,
+            self.bt_check,
+            self.ads_clkout_check,
+        ):
+            widget.setChecked(True)
+        self._set_stream_button(False)
+        self.state_label.setText("Press Refresh to read the board's current state.")
+        self.set_connected(connected)
+
+    # -- construction ------------------------------------------------------
+
+    def _build_link_group(self) -> QWidget:
+        group = QGroupBox("Command link")
+        layout = QVBoxLayout(group)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Send over"))
+        self.transport_combo = QComboBox()
+        self.transport_combo.addItem("USB (main window link)", "usb")
+        self.transport_combo.addItem("Bluetooth SPP", "bt")
+        self.transport_combo.setToolTip(
+            "USB uses the cable port the main window already holds. Bluetooth opens its own "
+            "connection to the SPP COM port, which is what keeps the board in Bluetooth mode - "
+            "it leaves Bluetooth when nothing is using the link."
+        )
+        row.addWidget(self.transport_combo, 1)
+        layout.addLayout(row)
+
+        port_row = QHBoxLayout()
+        self.bt_port_combo = QComboBox()
+        self.bt_port_combo.setMinimumWidth(150)
+        for label, device in self._bt_ports:
+            self.bt_port_combo.addItem(label, device)
+        port_row.addWidget(self.bt_port_combo, 1)
+        self.bt_connect_button = QPushButton("Connect")
+        self.bt_connect_button.setCheckable(True)
+        self.bt_connect_button.toggled.connect(self._on_bt_connect_toggled)
+        port_row.addWidget(self.bt_connect_button)
+        layout.addLayout(port_row)
+
+        self.bt_link_label = QLabel(
+            "No Bluetooth port found. Pair SZD_EEG first; the port appears as "
+            "'Standard Serial over Bluetooth link'."
+            if not self._bt_ports
+            else "Not connected - press Connect to hold the SPP link open."
+        )
+        self.bt_link_label.setWordWrap(True)
+        self.bt_link_label.setStyleSheet("color: #475569; font-size: 11px;")
+        layout.addWidget(self.bt_link_label)
+        return group
+
+    def _on_bt_connect_toggled(self, checked: bool) -> None:
+        if not checked:
+            link = self._bt_link
+            self._bt_link = None
+            if link is not None:
+                link.stop()
+            self.bt_link_label.setText("Disconnected.")
+            self.bt_link_label.setStyleSheet("color: #475569; font-size: 11px;")
+            # Without the extra transport, the panel needs the main link again.
+            self.set_connected(bool(getattr(self.parent(), "connected", False)))
+            return
+        device = str(self.bt_port_combo.currentData() or "")
+        if not device:
+            self.bt_connect_button.blockSignals(True)
+            self.bt_connect_button.setChecked(False)
+            self.bt_connect_button.blockSignals(False)
+            self.bt_link_label.setText("No Bluetooth port selected.")
+            return
+        link = PowerSerialLink(device, parent=self)
+        link.lineReceived.connect(self._on_bt_line)
+        link.opened.connect(
+            lambda port: (
+                self.bt_link_label.setText(f"Connected to {port} - the board stays in Bluetooth mode."),
+                self.bt_link_label.setStyleSheet("color: #15803d; font-size: 11px;"),
+                # Reading the state over the new link proves it works end to end.
+                self.refresh(),
+            )
+        )
+        link.failed.connect(self._on_bt_failed)
+        link.closed.connect(
+            lambda: self.bt_link_label.setText("Bluetooth link closed.")
+        )
+        self._bt_link = link
+        self.bt_link_label.setText(f"Opening {device}...")
+        self.bt_link_label.setStyleSheet("color: #475569; font-size: 11px;")
+        link.start()
+        # Enable the controls immediately; the send path reports if the open fails.
+        self.set_connected(True)
+
+    def telemetry(self) -> dict[str, str]:
+        """The last ``[PWR]`` state, for anything that wants to log it."""
+
+        return dict(self._state)
+
+    def shutdown(self) -> None:
+        link = self._bt_link
+        self._bt_link = None
+        if link is not None:
+            link.stop()
+
+    def _on_bt_failed(self, message: str) -> None:
+        self.bt_link_label.setText(message)
+        self.bt_link_label.setStyleSheet("color: #b91c1c; font-size: 11px;")
+        self.bt_connect_button.blockSignals(True)
+        self.bt_connect_button.setChecked(False)
+        self.bt_connect_button.blockSignals(False)
+        link = self._bt_link
+        self._bt_link = None
+        if link is not None:
+            link.stop()
+
+    def _on_bt_line(self, text: str) -> None:
+        if text.startswith("[PWR]"):
+            self.apply_state_dict(
+                dict(token.split("=", 1) for token in text[len("[PWR]"):].split() if "=" in token)
+            )
+        elif text.startswith("Success:") or text.startswith("#OK"):
+            pass
+        else:
+            # Anything else is worth showing: it is the board talking back on the
+            # link the operator is trying to prove.
+            self.link_trace.append(text)
+            del self.link_trace[:-8]
+            self.link_trace_label.setText("\n".join(self.link_trace[-4:]))
+
+    def _dispatch(self, payload: bytes) -> bool:
+        if str(self.transport_combo.currentData()) == "bt":
+            link = self._bt_link
+            if link is None:
+                self.state_label.setText("Connect the Bluetooth link first, or send over USB.")
+                return False
+            return link.send(payload)
+        return bool(self._send_command(payload))
+
+    def _build_converter_group(self) -> QWidget:
+        group = QGroupBox("ADS1299 converters")
+        layout = QVBoxLayout(group)
+
+        for index in range(2):
+            row = QGridLayout()
+            row.setHorizontalSpacing(6)
+            row.addWidget(QLabel(f"ADS{index + 1}"), 0, 0)
+            mode = QComboBox()
+            for label, value in self.MODE_CHOICES:
+                mode.addItem(label, value)
+            row.addWidget(mode, 0, 1)
+            sps = QComboBox()
+            for label, value in self.SPS_CHOICES:
+                sps.addItem(label, value)
+            row.addWidget(sps, 0, 2)
+            gain = QComboBox()
+            for label, value in self.GAIN_CHOICES:
+                gain.addItem(label, value)
+            row.addWidget(gain, 0, 3)
+            apply_button = QPushButton("Apply")
+            apply_button.clicked.connect(
+                lambda _=False, i=index: self._apply_converter(i)
+            )
+            row.addWidget(apply_button, 0, 4)
+            row.setColumnStretch(1, 1)
+            layout.addLayout(row)
+            setattr(self, f"ads{index + 1}_mode", mode)
+            setattr(self, f"ads{index + 1}_sps", sps)
+            setattr(self, f"ads{index + 1}_gain", gain)
+
+        note = QLabel(
+            "PWDN and RESET are wired to both converters, so those two are board-wide; "
+            "the mode above is per converter (SPI opcodes)."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #64748b; font-size: 11px;")
+        layout.addWidget(note)
+
+        restore_row = QHBoxLayout()
+        self.restore_button = QPushButton("Restore converters to normal")
+        self.restore_button.setToolTip(
+            "Re-detect both converters and re-apply the full configuration this app holds "
+            "(reference, clock output, every channel, data rate). Use this after a power or "
+            "reset test: a converter that comes back from PWDN or RESET answers on SPI with its "
+            "register defaults, which means every channel is in power-down and nothing converts."
+        )
+        self.restore_button.clicked.connect(self.restore_converters)
+        restore_row.addWidget(self.restore_button)
+        restore_row.addStretch(1)
+        layout.addLayout(restore_row)
+
+        stream_row = QHBoxLayout()
+        self.stream_button = QPushButton("Start stream")
+        self.stream_button.setCheckable(True)
+        self.stream_button.setToolTip(
+            "Start and stop acquisition from here. 'Converters running with an idle link' and "
+            "'link running with idle converters' draw very different current, so being able to "
+            "switch the stream without leaving the panel is the difference between two runs."
+        )
+        self.stream_button.clicked.connect(self._apply_stream)
+        stream_row.addWidget(self.stream_button)
+        stream_row.addStretch(1)
+        layout.addLayout(stream_row)
+
+        shared = QGridLayout()
+        shared.setHorizontalSpacing(6)
+        self.ads_pwdn_check = QCheckBox("Hold PWDN low - both converters off")
+        self.ads_pwdn_check.setToolTip(
+            "Check this to drive PWDN low and shut both ADS1299s down. They are powered "
+            "normally when it is clear. Releasing it re-detects and re-configures them."
+        )
+        self.ads_pwdn_check.clicked.connect(self._apply_ads_pwdn)
+        shared.addWidget(self.ads_pwdn_check, 0, 0, 1, 2)
+        self.ads_reset_check = QCheckBox("Hold RESET low - both converters in reset")
+        self.ads_reset_check.setToolTip(
+            "Check this to hold RESET low: no SPI access at all until it is released, which "
+            "re-detects and re-configures both converters. They run normally when it is clear."
+        )
+        self.ads_reset_check.clicked.connect(self._apply_ads_reset)
+        shared.addWidget(self.ads_reset_check, 1, 0, 1, 2)
+        self.ads_clkout_check = QCheckBox("Internal oscillator CLK output enabled (ADS1)")
+        self.ads_clkout_check.setToolTip(
+            "CONFIG1 CLK_EN. This is the clock *output driver* on the CLK pin, which is what "
+            "feeds the second converter - the oscillator itself always runs and cannot be "
+            "switched off. Turning it off saves the output driver only, and stops ADS2."
+        )
+        self.ads_clkout_check.clicked.connect(self._apply_ads_clkout)
+        shared.addWidget(self.ads_clkout_check, 2, 0, 1, 2)
+        layout.addLayout(shared)
+        return group
+
+    def _build_peripheral_group(self) -> QWidget:
+        group = QGroupBox("Peripherals")
+        layout = QVBoxLayout(group)
+        self.lis3dh_check = QCheckBox("Accelerometer (LIS3DH) active")
+        self.lis3dh_check.setToolTip(
+            "Unchecking writes CTRL_REG1 = 0, which stops the accelerometer's oscillator and "
+            "takes it from ~11 uA at 100 Hz to ~0.5 uA."
+        )
+        self.lis3dh_check.clicked.connect(
+            lambda: self._send_key("lis3dh", 1 if self.lis3dh_check.isChecked() else 0)
+        )
+        layout.addWidget(self.lis3dh_check)
+
+        self.sd_check = QCheckBox("SD card mounted")
+        self.sd_check.setToolTip(
+            "Unchecking releases the card (SD.end(), CS high, bus parked) so the card drops to "
+            "its own standby current. It is re-initialised when checked again."
+        )
+        self.sd_check.clicked.connect(
+            lambda: self._send_key("sd", 1 if self.sd_check.isChecked() else 0)
+        )
+        layout.addWidget(self.sd_check)
+
+        self.test_check = QCheckBox("Synthetic test stream (no converter traffic)")
+        self.test_check.setToolTip(
+            "Stream a generated signal instead of reading the converters. This isolates the "
+            "link and the CPU from the analog front end, so the current draw of the radio and "
+            "the ESP32 can be measured on their own."
+        )
+        self.test_check.clicked.connect(
+            lambda: self._send_key("test", 1 if self.test_check.isChecked() else 0)
+        )
+        layout.addWidget(self.test_check)
+        return group
+
+    def _build_bluetooth_group(self) -> QWidget:
+        group = QGroupBox("Bluetooth")
+        layout = QVBoxLayout(group)
+        self.bt_check = QCheckBox("Radio stack running")
+        self.bt_check.setToolTip(
+            "Unchecking stops the SPP stack. USB streaming is unaffected, so the board stays "
+            "controllable over the cable while the radio is off."
+        )
+        self.bt_check.clicked.connect(
+            lambda: self._send_key("bt", 1 if self.bt_check.isChecked() else 0)
+        )
+        layout.addWidget(self.bt_check)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("TX power"))
+        self.bt_power_combo = QComboBox()
+        for label, value in self.BT_POWER_CHOICES:
+            self.bt_power_combo.addItem(label, value)
+        self.bt_power_combo.setToolTip(
+            "BR/EDR transmit power as a runtime request. The controller snaps it to its own "
+            "steps, the level it actually holds is read back and reported, and the reply shows "
+            "both. Lower power draws less current and also couples less RF into the front end."
+        )
+        row.addWidget(self.bt_power_combo, 1)
+        apply_button = QPushButton("Apply")
+        apply_button.setToolTip("Send the level and read back what the controller actually holds.")
+        apply_button.clicked.connect(self._apply_bt_power)
+        row.addWidget(apply_button)
+        layout.addLayout(row)
+
+        readback_row = QHBoxLayout()
+        readback_row.addWidget(QLabel("Controller holds"))
+        self.bt_readback_label = QLabel("unknown - press Refresh")
+        self.bt_readback_label.setStyleSheet("font-weight: 600;")
+        self.bt_readback_label.setToolTip(
+            "esp_bredr_tx_power_get() read from the controller after the last set. This is the "
+            "authority: the request is only what was asked for."
+        )
+        readback_row.addWidget(self.bt_readback_label, 1)
+        layout.addLayout(readback_row)
+
+        tx_note = QLabel(
+            "TX power only changes the reading while the radio is actually transmitting. With "
+            "no Bluetooth host connected the radio idles and the current will not move; to "
+            "measure a difference, hold the SPP link open and let data flow over it."
+        )
+        tx_note.setWordWrap(True)
+        tx_note.setStyleSheet("color: #64748b; font-size: 11px;")
+        layout.addWidget(tx_note)
+
+        self.bt_sleep_check = QCheckBox("Controller modem sleep")
+        self.bt_sleep_check.setToolTip(
+            "esp_bt_sleep_enable(). Experimental: some controller/host combinations reject it, "
+            "and the reply says so rather than pretending it worked."
+        )
+        self.bt_sleep_check.clicked.connect(
+            lambda: self._send_key("btsleep", 1 if self.bt_sleep_check.isChecked() else 0)
+        )
+        layout.addWidget(self.bt_sleep_check)
+        return group
+
+    def _build_sleep_group(self) -> QWidget:
+        group = QGroupBox("ESP32 sleep")
+        layout = QVBoxLayout(group)
+
+        light_row = QHBoxLayout()
+        light_row.addWidget(QLabel("Light sleep"))
+        self.light_ms_spin = QSpinBox()
+        self.light_spin = self.light_ms_spin
+        self.light_ms_spin.setRange(50, 600_000)
+        self.light_ms_spin.setSingleStep(500)
+        self.light_ms_spin.setValue(3000)
+        self.light_ms_spin.setSuffix(" ms")
+        light_row.addWidget(self.light_ms_spin)
+        light_button = QPushButton("Sleep")
+        light_button.clicked.connect(lambda: self._sleep("light"))
+        light_row.addWidget(light_button)
+        light_row.addStretch(1)
+        layout.addLayout(light_row)
+
+        deep_row = QHBoxLayout()
+        deep_row.addWidget(QLabel("Deep sleep"))
+        self.deep_ms_spin = QSpinBox()
+        self.deep_ms_spin.setRange(1000, 3_600_000)
+        self.deep_ms_spin.setSingleStep(1000)
+        self.deep_ms_spin.setValue(10_000)
+        self.deep_ms_spin.setSuffix(" ms")
+        deep_row.addWidget(self.deep_ms_spin)
+        deep_button = QPushButton("Sleep (restarts)")
+        deep_button.clicked.connect(lambda: self._sleep("deep"))
+        deep_row.addWidget(deep_button)
+        deep_row.addStretch(1)
+        layout.addLayout(deep_row)
+
+        note = QLabel(
+            "Light sleep keeps RAM and the program counter, so the board continues on wake "
+            "with no reset - but the radio must be off and the link is silent for the whole "
+            "interval. Deep sleep has no way around a restart: the board reboots when the "
+            "timer expires. Both stop streaming first."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #64748b; font-size: 11px;")
+        layout.addWidget(note)
+        return group
+
+    def _build_status_group(self) -> QWidget:
+        group = QGroupBox("Board reports")
+        layout = QVBoxLayout(group)
+        self.state_label = QLabel("Not read yet - press Refresh.")
+        self.state_label.setWordWrap(True)
+        self.state_label.setStyleSheet("font-family: Consolas; font-size: 11px; color: #1e293b;")
+        self.state_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.state_label)
+
+        self.link_trace: list[str] = []
+        self.link_trace_label = QLabel("")
+        self.link_trace_label.setWordWrap(True)
+        self.link_trace_label.setStyleSheet("font-family: Consolas; font-size: 10px; color: #475569;")
+        layout.addWidget(self.link_trace_label)
+        return group
+
+    # -- behaviour ---------------------------------------------------------
+
+    def set_connected(self, connected: bool, message: str = "") -> None:
+        """Enable the controls that need the main (USB) link.
+
+        The Bluetooth transport is deliberately *not* gated on this: its whole
+        purpose is to be usable when the panel is talking over the SPP port instead,
+        including before or without the main window's own connection.
+        """
+
+        for widget in (
+            self.refresh_button,
+            self.stream_button,
+            self.lis3dh_check,
+            self.sd_check,
+            self.test_check,
+            self.bt_check,
+            self.bt_sleep_check,
+            self.ads_pwdn_check,
+            self.ads_reset_check,
+            self.ads_clkout_check,
+        ):
+            widget.setEnabled(connected or self._bt_link is not None)
+        for index in range(2):
+            getattr(self, f"ads{index + 1}_mode").setEnabled(connected or self._bt_link is not None)
+            getattr(self, f"ads{index + 1}_sps").setEnabled(connected or self._bt_link is not None)
+            getattr(self, f"ads{index + 1}_gain").setEnabled(connected or self._bt_link is not None)
+        if not connected and self._bt_link is None:
+            self.state_label.setText(message or "Connect the board to control its power state.")
+
+    def refresh(self) -> None:
+        if not self._dispatch(b"|status;"):
+            self.state_label.setText("Connect the board to read its power state.")
+
+    def _send_key(self, key: str, value: object) -> bool:
+        command = f"|{key}={value};".encode("ascii")
+        if not self._dispatch(command):
+            self.state_label.setText("Connect the board first.")
+            return False
+        return True
+
+    def _apply_converter(self, index: int) -> None:
+        mode = str(getattr(self, f"ads{index + 1}_mode").currentData())
+        sps = int(getattr(self, f"ads{index + 1}_sps").currentData() or 0)
+        gain = int(getattr(self, f"ads{index + 1}_gain").currentData() or 0)
+        # Rate and gain first: the mode decides whether the chip is converting, and
+        # setting it last means the new rate is in force when conversion starts.
+        self._send_key(f"ads{index + 1}rate", sps)
+        self._send_key(f"ads{index + 1}gain", gain)
+        self._send_key(f"ads{index + 1}", mode)
+
+    def restore_converters(self) -> bool:
+        """Put both converters back to their normal, fully programmed state."""
+
+        return self._send_key("restore", 1)
+
+    def _apply_ads_pwdn(self) -> None:
+        # Checked means "hold the pin low", i.e. shut both converters down.
+        self._send_key("adspwdn", 0 if self.ads_pwdn_check.isChecked() else 1)
+
+    def _apply_ads_reset(self) -> None:
+        self._send_key("adsreset", 0 if self.ads_reset_check.isChecked() else 1)
+
+    def _apply_ads_clkout(self) -> None:
+        self._send_key("adsclkout", 1 if self.ads_clkout_check.isChecked() else 0)
+
+    def _apply_bt_power(self) -> bool:
+        """Request a TX power; the firmware replies with the level it really holds."""
+
+        requested = int(self.bt_power_combo.currentData() or 0)
+        self._bt_power_requested = requested
+        if not self._send_key("btdbm", requested):
+            self._bt_power_requested = None
+            return False
+        # Belt and braces: the firmware emits a status by itself, but ask again so
+        # the read-back is refreshed even if that line is lost in a busy stream.
+        self.refresh()
+        return True
+
+    def _apply_stream(self) -> None:
+        self._send_key("stream", 1 if self.stream_button.isChecked() else 0)
+        self._set_stream_button(None)
+        self.refresh()
+
+    def _set_stream_button(self, streaming: Optional[bool]) -> None:
+        """Point the button at the next action, not the current state."""
+
+        if streaming is not None:
+            self.stream_button.blockSignals(True)
+            self.stream_button.setChecked(streaming)
+            self.stream_button.blockSignals(False)
+        running = self.stream_button.isChecked()
+        self.stream_button.setText("Stop stream" if running else "Start stream")
+
+    def _sleep(self, mode: str) -> None:
+        milliseconds = int(self.light_ms_spin.value()) if mode == "light" else int(self.deep_ms_spin.value())
+        if self._send_key(mode, milliseconds):
+            if mode == "deep":
+                self.state_label.setText(
+                    f"Deep sleep for {milliseconds} ms requested. The board powers down and "
+                    "restarts when the timer expires - the link will drop and come back."
+                )
+            else:
+                self.state_label.setText(
+                    f"Light sleep for {milliseconds} ms requested. The link is silent until the "
+                    "board wakes; it will report the wake cause then."
+                )
+
+    def _pin_level(self, fields: dict[str, str], key: str) -> Optional[bool]:
+        """The physical level of a shared converter pin, as a bool (high = True).
+
+        Firmware protocol 2 reports the level directly. Anything older reported the
+        *flag* "this pin is being held low", so the value has to be inverted to mean
+        the same thing. Getting this wrong is what made the panel show a healthy
+        board as powered down, so the conversion lives in one place.
+        """
+
+        value = fields.get(key)
+        if value is None:
+            return None
+        try:
+            reported = int(value)
+        except ValueError:
+            return None
+        legacy = self._legacy_firmware(fields)
+        return (reported == 0) if legacy else (reported != 0)
+
+    def _legacy_firmware(self, fields: dict[str, str]) -> bool:
+        try:
+            return int(fields.get("FW", "1")) < 2
+        except ValueError:
+            return True
+
+    def apply_state(self, fields: dict[str, str]) -> None:
+        """Reflect one ``[PWR]`` line into the widgets without signalling."""
+
+        self.apply_state_dict(fields)
+
+    def apply_state_dict(self, fields: dict[str, str]) -> None:
+        self._state = dict(fields)
+        if not hasattr(self, "link_trace"):
+            self.link_trace: list[str] = []
+
+        def flag(key: str) -> Optional[bool]:
+            value = fields.get(key)
+            if value is None:
+                return None
+            try:
+                return int(value) > 0
+            except ValueError:
+                return None
+
+        def set_check(widget: QCheckBox, value: Optional[bool]) -> None:
+            if value is None:
+                return
+            widget.blockSignals(True)
+            widget.setChecked(value)
+            widget.blockSignals(False)
+
+        for index in (0, 1):
+            token = fields.get(f"ADS{index + 1}", "")
+            combo = getattr(self, f"ads{index + 1}_mode")
+            position = combo.findData(token)
+            if position >= 0:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(position)
+                combo.blockSignals(False)
+
+        set_check(self.lis3dh_check, flag("LIS3DH"))
+        set_check(self.sd_check, flag("SD"))
+        set_check(self.bt_check, flag("BT"))
+        set_check(self.bt_sleep_check, flag("BTSLEEP"))
+        set_check(self.test_check, flag("TEST"))
+        # These two boxes are inverted: checked means the pin is driven low, so a 1
+        # in the report ("pin is high") means the box is clear.
+        pwdn_level = self._pin_level(fields, "PWDN")
+        reset_level = self._pin_level(fields, "RESET")
+        set_check(self.ads_pwdn_check, None if pwdn_level is None else not pwdn_level)
+        set_check(self.ads_reset_check, None if reset_level is None else not reset_level)
+        set_check(self.ads_clkout_check, flag("CLKOUT"))
+        if hasattr(self, "stream_button"):
+            self._set_stream_button(flag("STREAM"))
+
+        dbm = fields.get("BTDBM")
+        if dbm is not None:
+            position = self.bt_power_combo.findData(int(dbm) if dbm.lstrip("-").isdigit() else 0)
+            if position >= 0:
+                self.bt_power_combo.blockSignals(True)
+                self.bt_power_combo.setCurrentIndex(position)
+                self.bt_power_combo.blockSignals(False)
+            readback = getattr(self, "bt_readback_label", None)
+            if readback is not None:
+                try:
+                    held = int(dbm)
+                except ValueError:
+                    held = 0
+                # Compare against what was *requested*, which the combo no longer
+                # holds: it has just been moved to the value read back.
+                asked = getattr(self, "_bt_power_requested", None)
+                if not flag("BT"):
+                    readback.setText("n/a - the radio stack is stopped")
+                    readback.setStyleSheet("font-weight: 600; color: #b91c1c;")
+                elif asked is None:
+                    readback.setText(f"{held:+d} dBm (read from the controller)")
+                    readback.setStyleSheet("font-weight: 600; color: #166534;")
+                elif held == asked:
+                    readback.setText(f"{held:+d} dBm (confirmed by the controller)")
+                    readback.setStyleSheet("font-weight: 600; color: #166534;")
+                else:
+                    readback.setText(f"{held:+d} dBm - the controller did not take {asked:+d} dBm")
+                    readback.setStyleSheet("font-weight: 600; color: #b45309;")
+                self._bt_power_requested = None
+
+        def describe(key: str, suffix: str = "") -> str:
+            return f"{fields.get(key, '?')}{suffix}"
+
+        def raw(key: str) -> Optional[int]:
+            value = fields.get(key)
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except ValueError:
+                return None
+
+        def chip_line(index: int) -> str:
+            """One converter, including the proof that it is really converting."""
+
+            name = f"ADS{index + 1}"
+            link = raw(f"{name}_LINK")
+            problems = raw(f"{name}_PROB")
+            drdy = raw(f"{name}_DRDY")
+            rate = raw("SPS")
+            if not link:
+                return f"{name} {describe(name):>9s}  not answering on SPI"
+            # What DRDY *should* look like in the 60 ms window the firmware samples.
+            expected = round((rate or 0) * 0.060)
+            verdict = ""
+            if drdy is not None and expected:
+                if drdy == 0:
+                    verdict = "  NO DATA"
+                elif drdy >= expected * 0.5:
+                    verdict = "  converting"
+                else:
+                    verdict = "  slow"
+            problems_text = (
+                "not checked while streaming"
+                if problems is None or problems < 0
+                else str(problems)
+            )
+            return (
+                f"{name} {describe(name):>9s}  ID {describe(f'{name}_ID')}  "
+                f"reg problems {problems_text}  "
+                f"DRDY {drdy if drdy is not None else '?'}/{expected} in 60 ms{verdict}"
+            )
+
+        pwdn = self._pin_level(fields, "PWDN")
+        reset = self._pin_level(fields, "RESET")
+        lis_raw = raw("LIS3DH")
+        fw = raw("FW")
+        lines = [
+            chip_line(0),
+            chip_line(1),
+            f"data rate {describe('SPS', ' SPS')}   "
+            f"PWDN {('HIGH (converter on)' if pwdn else 'LOW (converter off)') if pwdn is not None else '?'}   "
+            f"RESET {('released' if reset else 'held LOW') if reset is not None else '?'}   "
+            f"CLKOUT {'on' if flag('CLKOUT') else 'off'}",
+            f"LIS3DH {'not present' if lis_raw == -1 else ('on' if lis_raw else 'powered down')}   "
+            f"SD {'mounted' if flag('SD') else 'released'}   "
+            f"test stream {'on' if flag('TEST') else 'off'}",
+            f"Bluetooth {'running' if flag('BT') else 'off'}   TX {describe('BTDBM', ' dBm')}"
+            f"   modem sleep {'on' if flag('BTSLEEP') else 'off'}",
+            f"streaming {'yes' if flag('STREAM') else 'no'}   packets sent {describe('TX')}"
+            f"   free heap {describe('HEAP', ' B')}",
+        ]
+        if fw is None or fw < 2:
+            # The conversion above already accounts for the older reporting
+            # convention, so the state is right - but the board cannot report the
+            # pin level itself, and the rest of this panel assumes a matching image.
+            lines.append(
+                "Board firmware is older than this panel (no FW tag). PWDN/RESET above are "
+                "converted from the older convention; reflash to get pin-level reporting."
+            )
+        elif not flag("STREAM") and (pwdn is False or reset is False):
+            lines.append("A converter pin is held low: clear its box again to bring the converters back.")
+        elif not flag("STREAM"):
+            for index in (0, 1):
+                if raw(f"ADS{index + 1}_LINK") and raw(f"ADS{index + 1}_DRDY") == 0:
+                    lines.append("Press Restore converters to normal to re-programme them.")
+                    break
+        self.state_label.setText("\n".join(lines))
 
 
 class AnnotationDialog(QDialog):

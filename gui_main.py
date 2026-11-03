@@ -70,6 +70,23 @@ from data_loader import (
     read_openbci_metadata,
     sniff_csv_layout,
 )
+from bias_reference import (
+    DEFAULT_BUCKET_PERCENT,
+    DEFAULT_FIT_KIND,
+    DEFAULT_MIN_RECORDINGS,
+    DEFAULT_POLY_ORDER,
+    DEFAULT_WINDOW_S,
+    FIT_KINDS,
+    FIT_LABELS,
+    MIN_REFERENCE_VRMS,
+    POINT_COLUMNS,
+    RecordingSummary,
+    ReferenceCurve,
+    ReferenceReading,
+    available_channels,
+    build_curve,
+    load_reference_recording,
+)
 from fft_analysis import (
     CHANNEL_AVERAGE_LABEL,
     VREF_VOLTS,
@@ -77,6 +94,7 @@ from fft_analysis import (
     FFTSettings,
     SpectrumResult,
     WINDOW_MAP,
+    ads1299_sinc3_gain_db,
     analyze_multichannel,
     compute_cmrr_sweep,
     compute_crosstalk_sweep,
@@ -100,6 +118,20 @@ SWEEP_FIT_COLOR = (70, 82, 100)
 # Entry in the CMRR monitor combo that means "work the frequency out from the
 # channel under test".
 NO_MONITOR_CHANNEL = "(none)"
+
+# How the common-mode voltage for a CMRR calculation is established. Each one is a
+# different answer to "what voltage was really at the input", and they differ by tens
+# of dB, so the choice is explicit rather than inferred.
+VCM_FLAT = "flat"
+VCM_SINC3 = "sinc3"
+VCM_MONITOR = "monitor"
+VCM_MONITOR_CURVE = "monitor_curve"
+VCM_MODE_LABELS = {
+    VCM_FLAT: "flat amplitude",
+    VCM_SINC3: "sinc3-corrected amplitude",
+    VCM_MONITOR: "CM monitor measured",
+    VCM_MONITOR_CURVE: "CM monitor frequencies + bias curve voltage",
+}
 
 
 def resolve_channel_name(reference: str, channel_names: Sequence[str]) -> str:
@@ -519,6 +551,519 @@ the selected frequency.</p>
 """
 
 
+class BiasReferenceDialog(QDialog):
+    """Build the bias reference curve from several unbuffered-channel recordings.
+
+    Each input CSV is a run with the generator wired straight into channel 0 - no
+    bias amplifier in the path - so that channel measures the voltage the
+    generator really delivered at each frequency. Averaging the runs suppresses
+    the noise of any one of them, and the fit turns the average into a continuous
+    ``Vcm(f)`` that CMRR analysis can look a frequency up in.
+
+    This is calibration, not measurement: the curve is reused across recordings,
+    so it is saved to a JSON file rather than recomputed per analysis.
+    """
+
+    curveChanged = pyqtSignal(object)
+    useCurveChanged = pyqtSignal(bool)
+
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        *,
+        curve: Optional[ReferenceCurve] = None,
+        use_curve: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Bias reference curve")
+        self.resize(1080, 760)
+        self.setWindowFlag(Qt.WindowType.Window, True)
+
+        self._files: list[str] = []
+        self._summaries: list[RecordingSummary] = []
+        self._readings: list[ReferenceReading] = []
+        self._curve: Optional[ReferenceCurve] = None
+        self._reloading = False
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        hint = QLabel(
+            "Add two or more recordings of the same sweep. Channel 0 of each must be wired straight "
+            "across the generator output, with no bias amplifier in the path. The averaged, fitted "
+            "curve supplies the common-mode voltage for CMRR analysis; the frequency of a CMRR sweep "
+            "still comes from that recording's own monitor channel."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #475569;")
+        layout.addWidget(hint)
+
+        layout.addWidget(self._build_files_group(), 0)
+        layout.addWidget(self._build_settings_group(), 0)
+        layout.addWidget(self._build_plots(), 1)
+
+        self.summary_label = QLabel("No curve yet.")
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        buttons = QHBoxLayout()
+        self.save_button = QPushButton("Save curve...")
+        self.save_button.clicked.connect(self.save_curve)
+        buttons.addWidget(self.save_button)
+        self.load_button = QPushButton("Load curve...")
+        self.load_button.clicked.connect(self.load_curve)
+        buttons.addWidget(self.load_button)
+        self.export_button = QPushButton("Export points CSV")
+        self.export_button.clicked.connect(self.export_points)
+        buttons.addWidget(self.export_button)
+        buttons.addStretch(1)
+        self.use_check = QCheckBox("Use this curve for CMRR")
+        self.use_check.setChecked(bool(use_curve))
+        self.use_check.setToolTip(
+            "When ticked, the CMRR sweep reads the common-mode voltage from this curve at each "
+            "measured frequency instead of using the single amplitude in the analysis panel."
+        )
+        self.use_check.toggled.connect(self.useCurveChanged.emit)
+        buttons.addWidget(self.use_check)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+        if curve is not None:
+            self.set_curve(curve)
+
+    # -- construction ------------------------------------------------------
+
+    def _build_files_group(self) -> QWidget:
+        group = QGroupBox("Recordings")
+        layout = QVBoxLayout(group)
+        self.file_table = QTableWidget(0, 3)
+        self.file_table.setHorizontalHeaderLabels(["File", "Sample rate", "Points"])
+        self.file_table.verticalHeader().setVisible(False)
+        self.file_table.setMaximumHeight(140)
+        self.file_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.file_table.horizontalHeader().setStretchLastSection(False)
+        self.file_table.setColumnWidth(0, 620)
+        self.file_table.setColumnWidth(1, 110)
+        layout.addWidget(self.file_table)
+
+        row = QHBoxLayout()
+        add_button = QPushButton("Add recordings...")
+        add_button.clicked.connect(self.add_recordings)
+        row.addWidget(add_button)
+        remove_button = QPushButton("Remove selected")
+        remove_button.clicked.connect(self.remove_selected)
+        row.addWidget(remove_button)
+        clear_button = QPushButton("Clear")
+        clear_button.clicked.connect(self.clear_recordings)
+        row.addWidget(clear_button)
+        row.addStretch(1)
+        layout.addLayout(row)
+        return group
+
+    def _build_settings_group(self) -> QWidget:
+        group = QGroupBox("Averaging and fit")
+        layout = QHBoxLayout(group)
+
+        layout.addWidget(QLabel("Reference channel"))
+        self.channel_combo = QComboBox()
+        self.channel_combo.setMinimumWidth(150)
+        self.channel_combo.setToolTip(
+            "Column read from every file. These recordings put the unbuffered tap on channel 0, so "
+            "the first channel is the default."
+        )
+        self.channel_combo.currentIndexChanged.connect(self._on_channel_changed)
+        layout.addWidget(self.channel_combo)
+
+        layout.addWidget(QLabel("Window"))
+        self.window_spin = QDoubleSpinBox()
+        self.window_spin.setRange(0.05, 10.0)
+        self.window_spin.setDecimals(2)
+        self.window_spin.setSingleStep(0.05)
+        self.window_spin.setValue(DEFAULT_WINDOW_S)
+        self.window_spin.setSuffix(" s")
+        self.window_spin.setToolTip(
+            "Length of the piece each frequency is read from when a recording has no generator plan. "
+            "Longer is quieter but blurs a fast sweep."
+        )
+        layout.addWidget(self.window_spin)
+
+        layout.addWidget(QLabel("Bucket"))
+        self.bucket_spin = QDoubleSpinBox()
+        self.bucket_spin.setRange(0.0, 50.0)
+        self.bucket_spin.setDecimals(1)
+        self.bucket_spin.setSingleStep(0.5)
+        self.bucket_spin.setValue(DEFAULT_BUCKET_PERCENT)
+        self.bucket_spin.setSuffix(" %")
+        self.bucket_spin.setToolTip(
+            "How close two readings must be, relative to their frequency, to be averaged together. "
+            "2 % is 0.1 Hz at 5 Hz and 4 Hz at 200 Hz."
+        )
+        layout.addWidget(self.bucket_spin)
+
+        layout.addWidget(QLabel("Min recordings"))
+        self.min_recordings_spin = QSpinBox()
+        self.min_recordings_spin.setRange(1, 50)
+        self.min_recordings_spin.setValue(DEFAULT_MIN_RECORDINGS)
+        self.min_recordings_spin.setToolTip(
+            "Drop a frequency that fewer than this many recordings contributed to, so a single noisy "
+            "file cannot masquerade as a well-averaged point."
+        )
+        layout.addWidget(self.min_recordings_spin)
+
+        layout.addWidget(QLabel("Fit"))
+        self.fit_combo = QComboBox()
+        for label, kind in FIT_KINDS:
+            self.fit_combo.addItem(label, kind)
+        self.fit_combo.setCurrentIndex(max(self.fit_combo.findData(DEFAULT_FIT_KIND), 0))
+        self.fit_combo.setToolTip(
+            "Polynomial fits the trend without chasing noise. The exact options pass through every "
+            "averaged point, which is what to use when the points already are the measurement."
+        )
+        layout.addWidget(self.fit_combo)
+
+        layout.addWidget(QLabel("Order"))
+        self.order_spin = QSpinBox()
+        self.order_spin.setRange(1, 20)
+        self.order_spin.setValue(DEFAULT_POLY_ORDER)
+        self.order_spin.setToolTip("Only used by the polynomial fit.")
+        layout.addWidget(self.order_spin)
+
+        build_button = QPushButton("Build curve")
+        build_button.clicked.connect(self.build)
+        layout.addWidget(build_button)
+        layout.addStretch(1)
+
+        self.fit_combo.currentIndexChanged.connect(self._on_fit_changed)
+        self.order_spin.valueChanged.connect(self._on_fit_changed)
+        self.bucket_spin.valueChanged.connect(self._mark_stale)
+        self.min_recordings_spin.valueChanged.connect(self._mark_stale)
+        return group
+
+    def _build_plots(self) -> QWidget:
+        holder = QWidget()
+        layout = QVBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.log_check = QCheckBox("Log frequency axis")
+        self.log_check.setChecked(True)
+        self.log_check.toggled.connect(self._apply_log_mode)
+        layout.addWidget(self.log_check)
+
+        heading = QLabel("Reference voltage actually measured, averaged over the recordings")
+        heading.setStyleSheet("font-weight: 600; color: #1e293b;")
+        layout.addWidget(heading)
+        self.points_plot = pg.PlotWidget()
+        self.points_plot.setMinimumHeight(230)
+        self.points_plot.setLabel("bottom", "Frequency", units="Hz")
+        self.points_plot.setLabel("left", "Reference", units="Vrms")
+        self.points_plot.showGrid(x=True, y=True, alpha=0.28)
+        self.points_plot.addLegend(offset=(-10, 10))
+        layout.addWidget(self.points_plot)
+
+        heading = QLabel("Transfer from the generator setpoint to the measured reference")
+        heading.setStyleSheet("font-weight: 600; color: #1e293b;")
+        layout.addWidget(heading)
+        self.gain_plot = pg.PlotWidget()
+        self.gain_plot.setMinimumHeight(230)
+        self.gain_plot.setLabel("bottom", "Frequency", units="Hz")
+        self.gain_plot.setLabel("left", "Gain", units="dB")
+        self.gain_plot.showGrid(x=True, y=True, alpha=0.28)
+        self.gain_plot.addLegend(offset=(-10, 10))
+        layout.addWidget(self.gain_plot)
+
+        self._apply_log_mode(True)
+        return holder
+
+    # -- file handling -----------------------------------------------------
+
+    def add_recordings(self) -> None:
+        paths, _filter = QFileDialog.getOpenFileNames(
+            self, "Add reference recordings", "", "CSV files (*.csv);;All files (*)"
+        )
+        if not paths:
+            return
+        for path in paths:
+            if path not in self._files:
+                self._files.append(path)
+        self._reload()
+
+    def remove_selected(self) -> None:
+        rows = sorted({index.row() for index in self.file_table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            if 0 <= row < len(self._files):
+                del self._files[row]
+        self._reload()
+
+    def clear_recordings(self) -> None:
+        self._files.clear()
+        self._reload()
+
+    def _on_channel_changed(self, *_args) -> None:
+        if not self._reloading:
+            self._reload()
+
+    def _populate_channels(self) -> None:
+        """Offer the columns of the first file, keeping any existing choice."""
+
+        previous = self.channel_combo.currentText()
+        names: list[str] = []
+        if self._files:
+            names = available_channels(self._files[0])
+        self._reloading = True
+        self.channel_combo.clear()
+        self.channel_combo.addItem("(first channel)", "")
+        for name in names:
+            self.channel_combo.addItem(name, name)
+        position = self.channel_combo.findData(previous)
+        self.channel_combo.setCurrentIndex(max(position, 0))
+        self._reloading = False
+
+    def _reload(self) -> None:
+        """Re-read every file at the selected channel."""
+
+        self._populate_channels()
+        column = str(self.channel_combo.currentData() or "") or None
+        self._summaries = []
+        self._readings = []
+        for path in self._files:
+            summary, readings = load_reference_recording(
+                path,
+                channel_name=column,
+                window_duration_s=float(self.window_spin.value()),
+                fft_length=int(4096),
+                window_name="Hann",
+            )
+            self._summaries.append(summary)
+            self._readings.extend(readings)
+
+        self.file_table.setRowCount(len(self._summaries))
+        for row, summary in enumerate(self._summaries):
+            name_item = QTableWidgetItem(Path(summary.path).name)
+            name_item.setToolTip(summary.describe())
+            self.file_table.setItem(row, 0, name_item)
+            rate_item = QTableWidgetItem(f"{summary.sample_rate_hz:g} SPS" if summary.sample_rate_hz else "-")
+            self.file_table.setItem(row, 1, rate_item)
+            points_item = QTableWidgetItem(summary.error if summary.error else str(summary.readings))
+            if summary.error:
+                points_item.setToolTip(summary.error)
+            self.file_table.setItem(row, 2, points_item)
+
+        self.build()
+
+    # -- building ----------------------------------------------------------
+
+    def parameters(self) -> dict[str, object]:
+        return {
+            "fit_kind": str(self.fit_combo.currentData() or DEFAULT_FIT_KIND),
+            "poly_order": int(self.order_spin.value()),
+            "bucket_percent": float(self.bucket_spin.value()),
+            "min_recordings": int(self.min_recordings_spin.value()),
+        }
+
+    def build(self) -> None:
+        """Average the loaded readings and fit the curve."""
+
+        setpoints = [s.setpoint_v for s in self._summaries if s.setpoint_v > 0]
+        rates = [s.sample_rate_hz for s in self._summaries if s.sample_rate_hz > 0]
+        parameters = self.parameters()
+        self._curve = build_curve(
+            self._readings,
+            sources=self._files,
+            fit_kind=str(parameters["fit_kind"]),
+            poly_order=int(parameters["poly_order"]),
+            # Median, not mean: the curve's setpoint is what a later run is scaled
+            # *from*, so one recording with a missing or mistyped amplitude must not
+            # drag the whole calibration off by a few percent.
+            setpoint_v=float(np.median(setpoints)) if setpoints else 0.0,
+            sample_rate_hz=float(np.median(rates)) if rates else 0.0,
+            bucket_percent=float(parameters["bucket_percent"]),
+            min_recordings=int(parameters["min_recordings"]),
+        )
+        self._draw()
+        self.curveChanged.emit(self._curve)
+
+    def _mark_stale(self, *_args) -> None:
+        if not self._reloading and self._readings:
+            self.build()
+
+    def _on_fit_changed(self, *_args) -> None:
+        # Re-fitting does not need the files re-read; only the curve changes.
+        if self._curve is not None and len(self._curve.points) > 1:
+            parameters = self.parameters()
+            self._curve.fit_kind = str(parameters["fit_kind"])
+            self._curve.poly_order = int(parameters["poly_order"])
+            self._draw()
+            self.curveChanged.emit(self._curve)
+
+    def _apply_log_mode(self, enabled: bool) -> None:
+        for plot in (self.points_plot, self.gain_plot):
+            plot.setLogMode(x=bool(enabled), y=False)
+
+    # -- drawing -----------------------------------------------------------
+
+    def _draw(self) -> None:
+        self.points_plot.clear()
+        self.gain_plot.clear()
+        curve = self._curve
+        if curve is None or not len(curve):
+            self.summary_label.setText(
+                "Add recordings with a usable tone. No curve was built."
+                if self._files
+                else "No curve yet. Add the reference recordings first."
+            )
+            return
+
+        frequencies = curve.frequencies()
+        voltages = curve.voltages()
+        spread = curve.spread()
+        self.points_plot.plot(
+            frequencies,
+            voltages,
+            pen=None,
+            symbol="o",
+            symbolSize=5,
+            symbolBrush=(16, 120, 90),
+            name="averaged points",
+        )
+        # The spread is the disagreement between runs, which is the only honest
+        # error bar this data has: it is drawn, not fitted.
+        if np.any(spread > 0):
+            upper = voltages + spread
+            lower = np.clip(voltages - spread, np.finfo(np.float64).tiny, None)
+            self.points_plot.plot(frequencies, upper, pen=pg.mkPen((16, 120, 90), width=1, style=Qt.PenStyle.DotLine))
+            self.points_plot.plot(
+                frequencies,
+                lower,
+                pen=pg.mkPen((16, 120, 90), width=1, style=Qt.PenStyle.DotLine),
+                name="+/- 1 SD",
+            )
+        if curve.setpoint_v > 0:
+            self.points_plot.plot(
+                frequencies,
+                np.full(frequencies.shape, curve.setpoint_v),
+                pen=pg.mkPen((190, 90, 60), width=1.4, style=Qt.PenStyle.DashLine),
+                name="generator setpoint",
+            )
+
+        grid, fitted = curve.fitted()
+        if grid.size and np.any(np.isfinite(fitted)):
+            self.points_plot.plot(
+                grid,
+                fitted,
+                pen=pg.mkPen((16, 120, 90), width=2.0, style=Qt.PenStyle.DashLine),
+                name=FIT_LABELS.get(curve.fit_kind, curve.fit_kind),
+            )
+            if curve.setpoint_v > 0:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    gain_db = 20.0 * np.log10(np.where(fitted > 0, fitted / curve.setpoint_v, np.nan))
+                self.gain_plot.plot(grid, gain_db, pen=pg.mkPen((37, 99, 235), width=2.0))
+            self.gain_plot.plot([], [], pen=None, name=FIT_LABELS.get(curve.fit_kind, curve.fit_kind))
+        gains = curve.gains()
+        finite = np.isfinite(gains) & (gains > 0)
+        if np.any(finite):
+            with np.errstate(divide="ignore", invalid="ignore"):
+                point_db = 20.0 * np.log10(gains[finite])
+            self.gain_plot.plot(
+                frequencies[finite],
+                point_db,
+                pen=None,
+                symbol="o",
+                symbolSize=5,
+                symbolBrush=(37, 99, 235),
+                name="per point",
+            )
+        if curve.fit_kind == "poly" and curve.setpoint_v > 0 and len(curve.points) > 1:
+            self.gain_plot.plot([], [], pen=None, name="")
+
+        self.summary_label.setText(curve.summary())
+
+    def set_curve(self, curve: Optional[ReferenceCurve]) -> None:
+        """Adopt a curve that was built or loaded elsewhere."""
+
+        self._curve = curve
+        if curve is not None:
+            self.fit_combo.blockSignals(True)
+            position = self.fit_combo.findData(curve.fit_kind)
+            self.fit_combo.setCurrentIndex(max(position, 0))
+            self.fit_combo.blockSignals(False)
+            self.order_spin.blockSignals(True)
+            self.order_spin.setValue(int(curve.poly_order))
+            self.order_spin.blockSignals(False)
+            self._files = list(curve.sources)
+            self._summaries = []
+            self._readings = []
+            self.file_table.setRowCount(len(curve.sources))
+            for row, source in enumerate(curve.sources):
+                self.file_table.setItem(row, 0, QTableWidgetItem(Path(source).name))
+                self.file_table.setItem(row, 1, QTableWidgetItem("-"))
+                self.file_table.setItem(row, 2, QTableWidgetItem("(from file)"))
+        self._draw()
+
+    @property
+    def curve(self) -> Optional[ReferenceCurve]:
+        return self._curve
+
+    def use_curve(self) -> bool:
+        return bool(self.use_check.isChecked())
+
+    def set_use_curve(self, enabled: bool) -> None:
+        self.use_check.blockSignals(True)
+        self.use_check.setChecked(bool(enabled))
+        self.use_check.blockSignals(False)
+
+    # -- persistence -------------------------------------------------------
+
+    def save_curve(self) -> None:
+        if self._curve is None or not len(self._curve):
+            QMessageBox.information(self, "Bias reference curve", "Build a curve before saving it.")
+            return
+        file_name, _filter = QFileDialog.getSaveFileName(
+            self, "Save bias reference curve", "bias_reference_curve.json", "Curve files (*.json)"
+        )
+        if not file_name:
+            return
+        try:
+            self._curve.save(file_name)
+        except OSError as error:
+            QMessageBox.warning(self, "Bias reference curve", f"Could not write the file:\n{error}")
+            return
+        self.summary_label.setText(f"Saved to {file_name}. " + self._curve.summary())
+
+    def load_curve(self) -> None:
+        file_name, _filter = QFileDialog.getOpenFileName(
+            self, "Load bias reference curve", "", "Curve files (*.json);;All files (*)"
+        )
+        if not file_name:
+            return
+        try:
+            curve = ReferenceCurve.load(file_name)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Bias reference curve", f"Could not read the file:\n{error}")
+            return
+        if not len(curve):
+            QMessageBox.warning(self, "Bias reference curve", "That file contains no points.")
+            return
+        self.set_curve(curve)
+        self.use_check.setChecked(True)
+        self.curveChanged.emit(curve)
+
+    def export_points(self) -> None:
+        if self._curve is None or not len(self._curve):
+            QMessageBox.information(self, "Bias reference curve", "There are no points to export.")
+            return
+        file_name, _filter = QFileDialog.getSaveFileName(
+            self, "Export reference points", "bias_reference_points.csv", "CSV files (*.csv)"
+        )
+        if not file_name:
+            return
+        try:
+            self._curve.to_frame().to_csv(file_name, index=False)
+        except OSError as error:
+            QMessageBox.warning(self, "Bias reference curve", f"Could not write the file:\n{error}")
+
+
 class ScientificSignalAnalyzerWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -541,6 +1086,14 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.cmrr_mean_fit_df = pd.DataFrame()
         self.cmrr_mean_fit_hz = float("nan")
         self.cmrr_reference_fit_hz = float("nan")
+        # The Vcm a bias reference curve supplied, and the amplitude it was scaled
+        # to. Kept on the window so the reference figure and the results table are
+        # always drawn from the same numbers.
+        self.cmrr_bias_overlay: Optional[pd.DataFrame] = None
+        self.cmrr_vcm_scale = 1.0
+        self.cmrr_vcm_note = ""
+        self.cmrr_monitor_table: Optional[pd.DataFrame] = None
+        self.cmrr_reference_note = ""
         self.spectra: list[SpectrumResult] = []
         self.channel_checks: dict[str, QCheckBox] = {}
         self.channel_fft_checks: dict[str, QCheckBox] = {}
@@ -561,9 +1114,16 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.export_store = ReportSettingsStore()
         self.export_options = self.export_store.load()
         self.measurement = MeasurementInfo()
+        # The bias reference curve is bench calibration, not per-recording data, so
+        # it lives on the window and survives loading a different CSV.
+        self.bias_reference_curve: Optional[ReferenceCurve] = None
+        self._bias_dialog: Optional[BiasReferenceDialog] = None
 
         self._build_ui()
         self._build_menu()
+        # Establish the initial state of the four-mode selector: mode 4 is only
+        # offered once there is a curve, and the explanatory line is filled in.
+        self._refresh_bias_curve_controls()
 
     @staticmethod
     def _default_window_size() -> "QSize":
@@ -630,6 +1190,87 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         )
         compare_action.triggered.connect(self.open_recording_comparison)
         tools_menu.addAction(compare_action)
+
+        # Calibration for the CMRR work, not a daily tool: it turns several
+        # reference recordings into the Vcm(f) curve the sweep needs.
+        bias_action = QAction("Bias reference curve...", self)
+        bias_action.setToolTip(
+            "Average the unbuffered channel of several recordings and fit the result, so CMRR "
+            "analysis knows the voltage the generator really delivered at each frequency."
+        )
+        bias_action.triggered.connect(self.open_bias_reference)
+        tools_menu.addAction(bias_action)
+
+    def open_bias_reference(self) -> None:
+        """Open the bias reference curve builder (own top-level window)."""
+
+        if self._bias_dialog is None:
+            self._bias_dialog = BiasReferenceDialog(
+                self,
+                curve=self.bias_reference_curve,
+                use_curve=self.cmrr_vcm_mode() == VCM_MONITOR_CURVE,
+            )
+            self._bias_dialog.curveChanged.connect(self._on_bias_curve_changed)
+            self._bias_dialog.useCurveChanged.connect(self._on_bias_curve_use_changed)
+            self._bias_dialog.finished.connect(self._on_bias_dialog_closed)
+        self._bias_dialog.show()
+        self._bias_dialog.raise_()
+        self._bias_dialog.activateWindow()
+
+    def _on_bias_dialog_closed(self, *_args) -> None:
+        self._bias_dialog = None
+
+    def _on_bias_curve_changed(self, curve: object) -> None:
+        if isinstance(curve, ReferenceCurve) and len(curve):
+            self.bias_reference_curve = curve
+        self._refresh_bias_curve_controls()
+
+    def _on_bias_curve_use_changed(self, enabled: bool) -> None:
+        """The dialog's tick is a shortcut for the fourth CM voltage mode."""
+
+        if enabled:
+            self._set_cmrr_vcm_mode(VCM_MONITOR_CURVE)
+            self._mark_sweep_stale_for("cmrr")
+            return
+        # Unticking means "stop using the curve". Fall back to the monitor mode when
+        # a monitor channel is selected, because that is the mode that needs no curve.
+        monitor = self.cmrr_monitor_combo.currentText()
+        fallback = VCM_MONITOR if monitor and monitor != NO_MONITOR_CHANNEL else VCM_FLAT
+        self._set_cmrr_vcm_mode(fallback)
+        self._mark_sweep_stale_for("cmrr")
+
+    def _refresh_bias_curve_controls(self) -> None:
+        """State which of the four CM voltage definitions is in force."""
+
+        combo = getattr(self, "cmrr_vcm_mode_combo", None)
+        label = getattr(self, "cmrr_vcm_label", None)
+        if combo is None or label is None:
+            return
+        curve = self.bias_reference_curve
+        usable = curve is not None and len(curve)
+        # The curve mode is only offered once there is a curve to use; the others are
+        # always available because they need nothing but the recording.
+        model = combo.model()
+        item = model.item(3) if model is not None and model.rowCount() > 3 else None
+        if item is not None:
+            item.setEnabled(bool(usable))
+        if not usable and self.cmrr_vcm_mode() == VCM_MONITOR_CURVE:
+            monitor = self.cmrr_monitor_combo.currentText()
+            self._set_cmrr_vcm_mode(
+                VCM_MONITOR if monitor and monitor != NO_MONITOR_CHANNEL else VCM_FLAT
+            )
+        mode = self.cmrr_vcm_mode()
+        if mode == VCM_MONITOR_CURVE:
+            coverage = curve.coverage_hz() or (0.0, 0.0)
+            label.setText(
+                f"Bias curve ready: {curve.summary()}. Vcm is read from it at this recording's own "
+                f"frequencies ({coverage[0]:g}-{coverage[1]:g} Hz); outside that band points are "
+                "dropped rather than extrapolated."
+            )
+        elif mode in (VCM_MONITOR, VCM_SINC3):
+            label.setText(VCM_MODE_LABELS[mode] + " - the exact values appear after computing.")
+        else:
+            label.setText("Flat: one amplitude for the whole sweep.")
 
     def open_recording_comparison(self) -> None:
         """Open the live-versus-SD comparison window (own top-level dialog)."""
@@ -1254,9 +1895,119 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
                 np.asarray(fit["frequencies"]),
                 np.asarray(fit["values"]),
             )
+
+        self._overlay_bias_curve_vcm(common_mode_vrms)
         self.cmrr_reference_plot.setXRange(0.0, SWEEP_X_MAX_HZ, padding=0.0)
         legend = self.cmrr_reference_plot.addLegend(offset=(-10, 10))
         legend.setBrush(pg.mkBrush(255, 255, 255, 190))
+
+    def _overlay_bias_curve_vcm(self, common_mode_vrms: float) -> None:
+        """Draw the Vcm the chosen mode supplied, at the frequencies measured.
+
+        This is the figure that answers "what did the correction do". The monitor
+        channel shows what reached the input - small, when a bias network is in the
+        way - while the blue trace is the voltage CMRR was actually divided by. The
+        gap between them *is* the bias network's attenuation.
+        """
+
+        plot = self.cmrr_reference_plot
+        curve = self.bias_reference_curve
+        mode = self.cmrr_vcm_mode()
+        self.cmrr_bias_overlay = None
+        if mode not in (VCM_MONITOR_CURVE, VCM_MONITOR, VCM_SINC3):
+            plot.setLogMode(x=False, y=False)
+            return
+        if mode == VCM_MONITOR_CURVE and (curve is None or not len(curve)):
+            plot.setLogMode(x=False, y=False)
+            return
+
+        # The same factor the analysis used, so this figure cannot disagree with the
+        # results table. Stored rather than recomputed: the two must not drift apart.
+        scale = float(getattr(self, "cmrr_vcm_scale", 1.0) or 1.0)
+
+        if mode == VCM_MONITOR_CURVE:
+            # Dense curve across the measured band, so the underlying fit is visible.
+            grid, values = curve.fitted()
+            if grid.size:
+                plot.plot(
+                    grid,
+                    np.asarray(values, dtype=float) * scale,
+                    pen=pg.mkPen((37, 99, 235), width=SWEEP_FIT_WIDTH, style=Qt.PenStyle.DashLine),
+                    name="bias curve",
+                )
+
+        # The exact value used at each swept frequency: the same numbers the CMRR
+        # arithmetic used, so this figure cannot disagree with the results table.
+        frame = self.cmrr_sweep_df
+        overlay = pd.DataFrame()
+        if not frame.empty and "Vcm Used (Vrms)" in frame.columns:
+            overlay = (
+                frame.groupby("Frequency (Hz)", as_index=False)["Vcm Used (Vrms)"]
+                .mean()
+                .sort_values("Frequency (Hz)")
+                .reset_index(drop=True)
+            )
+        if overlay.empty:
+            coverage = curve.coverage_hz()
+            if coverage is not None:
+                frequencies = np.linspace(coverage[0], coverage[1], 60)
+                overlay = pd.DataFrame(
+                    {
+                        "Frequency (Hz)": frequencies,
+                        "Vcm Used (Vrms)": curve.evaluate(frequencies) * scale,
+                    }
+                )
+        if not overlay.empty:
+            plot.plot(
+                overlay["Frequency (Hz)"],
+                overlay["Vcm Used (Vrms)"],
+                pen=pg.mkPen((37, 99, 235), width=SWEEP_TRACE_WIDTH),
+                symbol="s",
+                symbolSize=6,
+                name="Vcm used for CMRR",
+            )
+            self.cmrr_bias_overlay = overlay
+            # Carry it in the reference table too, so the export and the report
+            # show what each measured point was divided by.
+            if not self.cmrr_reference_df.empty:
+                self.cmrr_reference_df["Vcm from curve (Vrms)"] = np.interp(
+                    self.cmrr_reference_df["Frequency (Hz)"].to_numpy(dtype=float),
+                    overlay["Frequency (Hz)"].to_numpy(dtype=float),
+                    overlay["Vcm Used (Vrms)"].to_numpy(dtype=float),
+                )
+
+        # Log y when the bias network attenuates hard: 0.03 V and 0.95 V cannot be
+        # read on one linear axis, and hiding one of them is what made the curve
+        # look like it did nothing.
+        measured = self.cmrr_reference_df.get("Reference (Vrms)")
+        ratio_db = 0.0
+        if measured is not None and len(measured) and not overlay.empty:
+            measured_values = np.asarray(measured, dtype=float)
+            curve_values = np.asarray(overlay["Vcm Used (Vrms)"], dtype=float)
+            count = min(measured_values.size, curve_values.size)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio = measured_values[:count] / curve_values[:count]
+            finite = ratio[np.isfinite(ratio) & (ratio > 0)]
+            if finite.size:
+                ratio_db = float(np.median(20.0 * np.log10(finite)))
+        plot.setLogMode(x=False, y=bool(ratio_db < -6.0))
+
+        if abs(ratio_db) >= 0.5:
+            axis = plot.getAxis("left")
+            axis.setLabel("Reference", units="Vrms" + (" (log)" if ratio_db < -6.0 else ""))
+            self.cmrr_reference_note = (
+                f"Blue trace is the voltage CMRR was divided by, {abs(ratio_db):.1f} dB above what "
+                f"reached the input ({10 ** (ratio_db / 20.0):.4g}x): that gap is the bias "
+                "network's attenuation."
+            )
+        else:
+            self.cmrr_reference_note = (
+                "The measured reference and the blue trace agree to within "
+                f"{abs(ratio_db):.1f} dB, so nothing is attenuating the common-mode voltage here."
+            )
+        label = getattr(self, "cmrr_reference_note_label", None)
+        if label is not None:
+            label.setText(self.cmrr_reference_note)
 
     def _redraw_cmrr_sweep_fit(self, prefix: str = "cmrr") -> None:
         # Fits go to their own figure, never on top of the measured points.
@@ -1422,6 +2173,49 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         control_row.addWidget(self.cmrr_reset_zoom_button)
         layout.addWidget(self._scroll_row(control_row))
 
+        # How the common-mode voltage is established. Four distinct definitions,
+        # because they answer four different questions and the difference between
+        # them is tens of dB - not a setting to be guessed at.
+        vcm_row = QHBoxLayout()
+        vcm_row.addWidget(QLabel("CM voltage"))
+        self.cmrr_vcm_mode_combo = QComboBox()
+        self.cmrr_vcm_mode_combo.setMinimumWidth(330)
+        self.cmrr_vcm_mode_combo.addItem("Flat: the constant amplitude above", VCM_FLAT)
+        self.cmrr_vcm_mode_combo.addItem(
+            "Generator amplitude with the ADS1299 sinc3 roll-off", VCM_SINC3
+        )
+        self.cmrr_vcm_mode_combo.addItem("Measured on the CM monitor channel", VCM_MONITOR)
+        self.cmrr_vcm_mode_combo.addItem(
+            "CM monitor frequencies, voltage from the bias curve", VCM_MONITOR_CURVE
+        )
+        self.cmrr_vcm_mode_combo.setToolTip(
+            "Flat: one number for the whole sweep.\n"
+            "Sinc3: that number reduced with frequency by the ADS1299 digital filter at the "
+            "recording's data rate.\n"
+            "Monitor: the voltage actually measured on the monitor channel, per frequency - the "
+            "converter already measured it, so no sinc3 correction is applied.\n"
+            "Monitor + bias curve: frequency and timing from the monitor channel, but the "
+            "voltage taken from the fitted bias reference curve. This is the one to use when a "
+            "bias network attenuates the stimulus: the sweep still knows where it is, and the "
+            "voltage is the value the generator really delivered."
+        )
+        self.cmrr_vcm_mode_combo.currentIndexChanged.connect(self._on_vcm_mode_changed)
+        vcm_row.addWidget(self.cmrr_vcm_mode_combo, 1)
+        bias_button = QPushButton("Bias curve...")
+        bias_button.setToolTip(
+            "Average several unbuffered-channel recordings into the Vcm(f) curve used by the "
+            "last mode."
+        )
+        bias_button.clicked.connect(self.open_bias_reference)
+        vcm_row.addWidget(bias_button)
+        layout.addWidget(self._scroll_row(vcm_row))
+
+        self.cmrr_vcm_label = QLabel("")
+        self.cmrr_vcm_label.setWordWrap(True)
+        self.cmrr_vcm_label.setStyleSheet("color: #475569; font-size: 11px;")
+        self.cmrr_vcm_label.setMinimumHeight(30)
+        layout.addWidget(self.cmrr_vcm_label)
+
         # The four figures are stacked in a scroll area: four plots do not fit on a
         # screen at a readable size, and a scroll area keeps their height honest
         # instead of squeezing them into slivers.
@@ -1462,6 +2256,10 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             "Reference input",
             "Vrms",
         )
+        self.cmrr_reference_note_label = QLabel("")
+        self.cmrr_reference_note_label.setWordWrap(True)
+        self.cmrr_reference_note_label.setStyleSheet("color: #475569; font-size: 11px;")
+        figures.addWidget(self.cmrr_reference_note_label)
         figures.addStretch(1)
 
         self.cmrr_figure_scroll = PlotScrollArea()
@@ -2789,6 +3587,198 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         )
         self._redraw_gain_sweep_fit()
 
+    def _on_vcm_mode_changed(self, *_args) -> None:
+        mode = self.cmrr_vcm_mode()
+        if self._bias_dialog is not None:
+            self._bias_dialog.set_use_curve(mode == VCM_MONITOR_CURVE)
+        self._refresh_bias_curve_controls()
+        self._mark_sweep_stale_for("cmrr")
+
+    def cmrr_vcm_mode(self) -> str:
+        combo = getattr(self, "cmrr_vcm_mode_combo", None)
+        return str(combo.currentData() or VCM_FLAT) if combo is not None else VCM_FLAT
+
+    def _set_cmrr_vcm_mode(self, mode: str) -> None:
+        combo = getattr(self, "cmrr_vcm_mode_combo", None)
+        if combo is None:
+            return
+        position = combo.findData(mode)
+        if position >= 0:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(position)
+            combo.blockSignals(False)
+        self._refresh_bias_curve_controls()
+
+    def _monitor_voltage_table(
+        self,
+        monitor_values: np.ndarray,
+        steps,
+        sample_rate: float,
+    ) -> pd.DataFrame:
+        """The voltage actually measured on the monitor channel, per frequency.
+
+        This is the converter measuring the common-mode voltage itself, so it needs
+        no sinc3 correction: the digital filter has already been applied to the number
+        that comes out. It is returned as a frequency-keyed table so the analysis can
+        look it up at whatever frequency it detected.
+        """
+
+        rows: list[dict[str, float]] = []
+        values = np.asarray(monitor_values, dtype=np.float64)
+        if steps:
+            for step in steps:
+                start = int(round(step.usable_start_s * sample_rate))
+                end = int(round(step.end_s * sample_rate))
+                start, end = max(start, 0), min(end, values.size)
+                if end - start < 16:
+                    continue
+                rms_uv = fit_tone_rms(values[start:end], sample_rate, step.frequency_hz)
+                if rms_uv > 0:
+                    rows.append({"Frequency (Hz)": float(step.frequency_hz), "Reference (Vrms)": rms_uv * 1e-6})
+        else:
+            window = max(int(round(max(float(self.cmrr_sweep_window_spin.value()), 0.05) * sample_rate)), 16)
+            if values.size >= window:
+                hop = max(window // 2, 1)
+                for start in range(0, values.size - window + 1, hop):
+                    segment = values[start : start + window]
+                    frequency = detect_tone_frequency(
+                        segment,
+                        sample_rate,
+                        fft_length=max(int(self.fft_length_spin.value()), 4096),
+                        window_name=self.window_combo.currentText(),
+                    )
+                    if frequency is None or frequency <= 0:
+                        continue
+                    rms_uv = fit_tone_rms(segment, sample_rate, frequency)
+                    if rms_uv > 0:
+                        rows.append({"Frequency (Hz)": float(frequency), "Reference (Vrms)": rms_uv * 1e-6})
+        if not rows:
+            return pd.DataFrame(columns=["Frequency (Hz)", "Reference (Vrms)"])
+
+        frame = pd.DataFrame(rows)
+        # Group readings that land on the same step: relative tolerance, because 2 %
+        # of 5 Hz and 2 % of 200 Hz are very different absolute widths.
+        frame["Bucket"] = np.round(np.log10(frame["Frequency (Hz)"].clip(lower=1e-9)) / 0.01)
+        grouped = (
+            frame.groupby("Bucket", as_index=False)
+            .agg({"Frequency (Hz)": "mean", "Reference (Vrms)": "mean"})
+            .sort_values("Frequency (Hz)")
+            .reset_index(drop=True)
+        )
+        return grouped[["Frequency (Hz)", "Reference (Vrms)"]]
+
+    def _cmrr_vcm_source(
+        self,
+        monitor_values: Optional[np.ndarray],
+        steps,
+        monitor_name: str,
+        metadata_vrms: float,
+    ) -> tuple[Optional[object], float, str]:
+        """Resolve the four modes into (lookup, flat scalar, explanation).
+
+        ``lookup`` wins when present: it maps frequency -> Vrms for this recording.
+        ``flat`` is used only when there is no lookup. ``explanation`` goes on screen,
+        because which of these is in force changes CMRR by tens of dB and that must
+        never be implicit.
+        """
+
+        mode = self.cmrr_vcm_mode()
+        sample_rate = self.dataset.sample_rate if self.dataset else 1.0
+        amplitude = float(self.common_mode_spin.value())
+        if amplitude <= 0 < metadata_vrms:
+            amplitude = metadata_vrms
+
+        if mode == VCM_FLAT:
+            # One number for the whole sweep: no frequency dependence at all.
+            return None, amplitude, (
+                f"Flat {amplitude:g} Vrms across the whole sweep - no frequency dependence."
+            )
+
+        if mode == VCM_SINC3:
+            if amplitude <= 0:
+                return None, 0.0, "sinc3 roll-off needs an amplitude - set the CM voltage above."
+            # The converter's output data rate is the rate the samples were recorded
+            # at; the sinc3 response is defined against exactly that.
+            data_rate = float(sample_rate) if sample_rate > 0 else 0.0
+            if data_rate <= 0:
+                return None, amplitude, "sinc3 roll-off needs a sample rate."
+
+            def sinc3_lookup(frequencies):
+                values = np.atleast_1d(np.asarray(frequencies, dtype=np.float64))
+                gain_db = ads1299_sinc3_gain_db(values, data_rate)
+                return amplitude * np.power(10.0, gain_db / 20.0)
+
+            return (
+                sinc3_lookup,
+                amplitude,
+                f"Sinc3 roll-off applied to {amplitude:g} Vrms at {data_rate:g} SPS: the applied "
+                "voltage falls with frequency by the converter's own digital filter.",
+            )
+
+        if mode in (VCM_MONITOR, VCM_MONITOR_CURVE) and monitor_values is None:
+            return (
+                None,
+                amplitude,
+                "No CM monitor channel is selected, so the monitor-based mode cannot run - falling "
+                "back to the flat amplitude above. Pick the channel wired across the common-mode "
+                "voltage in the CM monitor box.",
+            )
+
+        if mode == VCM_MONITOR:
+            table = self._monitor_voltage_table(monitor_values, steps, sample_rate)
+            self.cmrr_monitor_table = table
+            if table.empty:
+                return (
+                    None,
+                    amplitude,
+                    "No tone could be measured on the monitor channel - falling back to the flat "
+                    "amplitude above.",
+                )
+            frequencies = table["Frequency (Hz)"].to_numpy(dtype=float)
+            voltages = table["Reference (Vrms)"].to_numpy(dtype=float)
+
+            def monitor_lookup(query):
+                return np.interp(
+                    np.atleast_1d(np.asarray(query, dtype=np.float64)), frequencies, voltages
+                )
+
+            return (
+                monitor_lookup,
+                amplitude,
+                f"Vcm measured on {monitor_name}: "
+                f"{voltages.min():.4g}-{voltages.max():.4g} Vrms across "
+                f"{frequencies.min():g}-{frequencies.max():g} Hz, taken as-is (the converter "
+                "already measured it, so no sinc3 correction is applied).",
+            )
+
+        # VCM_MONITOR_CURVE
+        curve = self.bias_reference_curve
+        if curve is None or not len(curve):
+            return (
+                None,
+                amplitude,
+                "No bias reference curve is loaded - falling back to the flat amplitude above. "
+                "Build or load one with the Bias curve button.",
+            )
+        # Frequency and timing come from this recording; only the voltage comes from
+        # the curve. Rescaled only if this run genuinely drove the generator at a
+        # different setpoint than the curve was calibrated at - never by a measured
+        # voltage, which would divide out the attenuation the curve exists to supply.
+        scale = 1.0
+        if metadata_vrms > 0 and curve.setpoint_v > 0:
+            scale = float(metadata_vrms) / float(curve.setpoint_v)
+        self.cmrr_vcm_scale = scale
+        coverage = curve.coverage_hz() or (0.0, 0.0)
+        note = (
+            f"Vcm from the bias curve ({coverage[0]:g}-{coverage[1]:g} Hz), at this recording's "
+            f"own frequencies: {curve.voltage_lookup(scale=scale)([coverage[0]])[0]:.4g}-"
+            f"{curve.voltage_lookup(scale=scale)([coverage[1]])[0]:.4g} Vrms"
+        )
+        if abs(scale - 1.0) > 1e-9:
+            note += f" (curve {curve.setpoint_v:g} Vrms scaled x{scale:.4g} to this run's {metadata_vrms:g} Vrms)"
+        note += ". Points outside that range are dropped, not extrapolated."
+        return curve.voltage_lookup(scale=scale), amplitude, note
+
     def compute_cmrr_sweep_view(self) -> None:
         if self._last_selection_matrix is None or not self._last_enabled_names:
             QMessageBox.information(self, "CMRR Sweep", "Select a valid time region first.")
@@ -2806,14 +3796,33 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
 
         # Everything is Vrms: the spin box, the recording metadata and the CMRR
         # definition all use the same unit, so nothing is converted by hand.
-        common_mode_voltage = float(self.common_mode_spin.value())
-        if steps and metadata_vrms > 0:
-            common_mode_voltage = metadata_vrms
-        if common_mode_voltage <= 0:
-            QMessageBox.information(self, "CMRR Sweep", "Enter a positive common-mode voltage in Vrms first.")
+        #
+        # The spin box is the amplitude of the stimulus. It is used as-is by the flat
+        # mode, shaped by the sinc3 filter in the sinc3 mode, and ignored by the two
+        # monitor modes, which take the voltage from the recording itself.
+        spin_vrms = float(self.common_mode_spin.value())
+        base_vrms = spin_vrms if spin_vrms > 0 else (metadata_vrms if steps else 0.0)
+        self.cmrr_vcm_scale = 1.0
+        common_mode_lookup, common_mode_voltage, vcm_note = self._cmrr_vcm_source(
+            monitor_values, steps, monitor_name, metadata_vrms
+        )
+        self.cmrr_vcm_note = vcm_note
+        label = getattr(self, "cmrr_vcm_label", None)
+        if label is not None:
+            label.setText(vcm_note)
+        if common_mode_voltage <= 0 and common_mode_lookup is None:
+            QMessageBox.information(
+                self,
+                "CMRR Sweep",
+                "Enter a positive common-mode voltage in Vrms, or choose a CM voltage mode that "
+                "reads it from the recording.",
+            )
             return
 
         self._clear_cmrr_sweep_plot()
+        self.cmrr_bias_overlay = None
+        if getattr(self, "cmrr_reference_note_label", None) is not None:
+            self.cmrr_reference_note_label.setText("")
         combined_frames: list[pd.DataFrame] = []
         accepted_total = 0
         rejected_total = 0
@@ -2833,6 +3842,7 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
                     signal_scale_to_volts=1e-6,
                     correction_enabled=self.cmrr_correction_check.isChecked(),
                     correction_fs_hz=float(self.cmrr_correction_fs_spin.value()),
+                    common_mode_lookup=common_mode_lookup,
                 )
             elif monitor_values is not None:
                 result = compute_reference_cmrr_sweep(
@@ -2847,6 +3857,7 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
                     correction_enabled=self.cmrr_correction_check.isChecked(),
                     correction_fs_hz=float(self.cmrr_correction_fs_spin.value()),
                     stability_tolerance_hz=max(float(self.cmrr_sweep_tolerance_spin.value()), 0.1),
+                    common_mode_lookup=common_mode_lookup,
                 )
             else:
                 result = compute_cmrr_sweep(
@@ -2863,6 +3874,7 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
                     min_hold_s=self._sweep_hold_seconds("cmrr"),
                     exclude_mains=self._sweep_exclude_mains("cmrr"),
                     **self._sweep_tracking_options("cmrr"),
+                    common_mode_lookup=common_mode_lookup,
                 )
             accepted_total += result.accepted_windows
             rejected_total += result.rejected_windows
@@ -2899,6 +3911,10 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             source_tag = f"from {monitor_name}"
         else:
             source_tag = "auto"
+        if common_mode_lookup is not None:
+            source_tag += f" | Vcm {self._vcm_used_summary()}"
+        else:
+            source_tag += f" | Vcm {VCM_MODE_LABELS.get(self.cmrr_vcm_mode(), '?')} {common_mode_voltage:.4g} Vrms"
         self.cmrr_sweep_info_label.setText(
             self._sweep_info_text(
                 "cmrr",
@@ -2909,6 +3925,18 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         )
         self._refresh_cmrr_reference_figure(monitor_name, common_mode_voltage)
         self._redraw_cmrr_sweep_fit()
+
+    def _vcm_used_summary(self) -> str:
+        """Short description of the Vcm the curve actually supplied."""
+
+        frame = self.cmrr_sweep_df
+        if frame.empty or "Vcm Used (Vrms)" not in frame.columns:
+            return "none"
+        values = np.asarray(frame["Vcm Used (Vrms)"], dtype=float)
+        values = values[np.isfinite(values) & (values > 0)]
+        if values.size == 0:
+            return "none"
+        return f"{values.min():.4g}-{values.max():.4g} Vrms"
 
     def _clear_sweep_plot(self, prefix: str, plot: pg.PlotWidget) -> None:
         """Remove the curves, the fit lines and the stale legend entries."""

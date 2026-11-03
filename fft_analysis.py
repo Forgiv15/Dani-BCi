@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, replace
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -838,6 +838,7 @@ class SweepFundamentalTracker:
 
 CMRR_SWEEP_COLUMNS = [
     "Frequency (Hz)",
+    "Vcm Used (Vrms)",
     "CMRR Measured (dB)",
     "ADC Gain Corr (dB)",
     "CMRR (dB)",
@@ -933,6 +934,39 @@ def _aggregate_sweep_windows(
     return aggregated, int(len(stable.index)), rejected
 
 
+# Maps a frequency in Hz to the common-mode voltage actually applied there, in
+# Vrms. A bias reference curve supplies one of these; ``None`` means "use the
+# single amplitude the user entered".
+CommonModeLookup = Callable[[Sequence[float]], np.ndarray]
+
+
+def resolve_common_mode_v(
+    frequency_hz: float,
+    scalar_v: float,
+    lookup: Optional[CommonModeLookup] = None,
+) -> float:
+    """The common-mode voltage to use at one frequency.
+
+    Without a lookup this is the plain scalar the user typed. With one - the bias
+    reference curve - the voltage is read off the fitted ``Vcm(f)`` instead, which
+    is the whole point of that curve: the applied amplitude is not flat with
+    frequency, so a single number puts the front end's own roll-off into the CMRR.
+
+    ``nan`` means "the curve does not cover this frequency", and the caller drops
+    the point rather than silently substituting the nominal amplitude.
+    """
+
+    if lookup is None:
+        return float(scalar_v)
+    try:
+        resolved = np.asarray(lookup([float(frequency_hz)]), dtype=np.float64).ravel()
+    except (TypeError, ValueError):
+        return float("nan")
+    if resolved.size == 0:
+        return float("nan")
+    return float(resolved[0])
+
+
 def compute_cmrr_sweep(
     values: np.ndarray,
     sample_rate: float,
@@ -955,6 +989,7 @@ def compute_cmrr_sweep(
     downward_only: bool = True,
     lock_tolerance_hz: float = 0.5,
     lock_release_db: float = 6.0,
+    common_mode_lookup: Optional[CommonModeLookup] = None,
 ) -> CMRRSweepResult:
     """Estimate CMRR across frequency for a swept-tone selection.
 
@@ -987,7 +1022,7 @@ def compute_cmrr_sweep(
     if signal_values.size < window_size:
         empty = pd.DataFrame(columns=CMRR_SWEEP_COLUMNS)
         return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
-    if common_mode_voltage <= 0:
+    if common_mode_voltage <= 0 and common_mode_lookup is None:
         empty = pd.DataFrame(columns=CMRR_SWEEP_COLUMNS)
         return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
 
@@ -1042,7 +1077,13 @@ def compute_cmrr_sweep(
             rejected_windows += 1
             continue
         output_volts = output_rms * signal_scale_to_volts
-        cmrr_measured_db = 20.0 * np.log10(common_mode_voltage / output_volts) if output_volts > 0 else float("inf")
+        common_mode_here = resolve_common_mode_v(frequency_hz, common_mode_voltage, common_mode_lookup)
+        if not np.isfinite(common_mode_here) or common_mode_here <= 0:
+            # The reference curve does not reach this frequency, so the applied
+            # amplitude is unknown here. Guessing it would fabricate the CMRR.
+            rejected_windows += 1
+            continue
+        cmrr_measured_db = 20.0 * np.log10(common_mode_here / output_volts) if output_volts > 0 else float("inf")
         correction_gain_db = float(
             compute_cmrr_correction_gain_db(
                 [frequency_hz],
@@ -1057,6 +1098,7 @@ def compute_cmrr_sweep(
             {
                 "Time (s)": center_time_s,
                 "Frequency (Hz)": frequency_hz,
+                "Vcm Used (Vrms)": common_mode_here,
                 "Output RMS (uVrms)": output_rms,
                 "CMRR Measured (dB)": cmrr_measured_db,
                 "ADC Gain Corr (dB)": correction_gain_db,
@@ -1073,7 +1115,14 @@ def compute_cmrr_sweep(
     aggregated, accepted, unstable = _aggregate_sweep_windows(
         raw_dataframe,
         columns=CMRR_SWEEP_COLUMNS,
-        mean_columns=("Frequency (Hz)", "CMRR Measured (dB)", "ADC Gain Corr (dB)", "CMRR (dB)", "Output RMS (uVrms)"),
+        mean_columns=(
+            "Frequency (Hz)",
+            "Vcm Used (Vrms)",
+            "CMRR Measured (dB)",
+            "ADC Gain Corr (dB)",
+            "CMRR (dB)",
+            "Output RMS (uVrms)",
+        ),
         value_column="CMRR (dB)",
         std_column="CMRR Std (dB)",
         stability_tolerance_hz=stability_tolerance_hz,
@@ -1419,6 +1468,7 @@ def compute_planned_cmrr_sweep(
     guard_fraction: float = 0.15,
     max_windows_per_step: int = 8,
     min_output_rms_uv: float = 0.02,
+    common_mode_lookup: Optional[CommonModeLookup] = None,
 ) -> CMRRSweepResult:
     """CMRR per generator step, using the frequency the generator was set to.
 
@@ -1429,7 +1479,9 @@ def compute_planned_cmrr_sweep(
 
     signal_values = np.asarray(values, dtype=np.float64)
     empty = pd.DataFrame(columns=CMRR_SWEEP_COLUMNS)
-    if signal_values.size == 0 or common_mode_v_rms <= 0 or sample_rate <= 0:
+    if signal_values.size == 0 or sample_rate <= 0:
+        return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
+    if common_mode_v_rms <= 0 and common_mode_lookup is None:
         return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
 
     filtered = apply_filters(
@@ -1477,7 +1529,13 @@ def compute_planned_cmrr_sweep(
             rejected += 1
             continue
         output_volts = mean_rms_uv * signal_scale_to_volts
-        cmrr_measured_db = 20.0 * np.log10(common_mode_v_rms / output_volts) if output_volts > 0 else float("inf")
+        common_mode_here = resolve_common_mode_v(
+            float(step.frequency_hz), common_mode_v_rms, common_mode_lookup
+        )
+        if not np.isfinite(common_mode_here) or common_mode_here <= 0:
+            rejected += 1
+            continue
+        cmrr_measured_db = 20.0 * np.log10(common_mode_here / output_volts) if output_volts > 0 else float("inf")
         correction_gain_db = float(
             compute_cmrr_correction_gain_db(
                 [step.frequency_hz],
@@ -1494,6 +1552,7 @@ def compute_planned_cmrr_sweep(
         rows.append(
             {
                 "Frequency (Hz)": float(step.frequency_hz),
+                "Vcm Used (Vrms)": float(common_mode_here),
                 "Output RMS (uVrms)": mean_rms_uv,
                 "CMRR Measured (dB)": cmrr_measured_db,
                 "ADC Gain Corr (dB)": correction_gain_db,
@@ -1581,6 +1640,7 @@ def compute_reference_cmrr_sweep(
     stability_tolerance_hz: float = 0.5,
     min_stable_run_windows: int = 1,
     min_output_rms_uv: float = 0.02,
+    common_mode_lookup: Optional[CommonModeLookup] = None,
 ) -> CMRRSweepResult:
     """CMRR where the applied frequency is read off a monitor channel.
 
@@ -1597,7 +1657,9 @@ def compute_reference_cmrr_sweep(
     monitor_values = np.asarray(reference_values, dtype=np.float64)
     empty = pd.DataFrame(columns=CMRR_SWEEP_COLUMNS)
     count = min(signal_values.size, monitor_values.size)
-    if count == 0 or common_mode_v_rms <= 0 or sample_rate <= 0:
+    if count == 0 or sample_rate <= 0:
+        return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
+    if common_mode_v_rms <= 0 and common_mode_lookup is None:
         return CMRRSweepResult(dataframe=empty, accepted_windows=0, rejected_windows=0)
     if window_duration_s <= 0:
         window_duration_s = 0.75
@@ -1632,7 +1694,11 @@ def compute_reference_cmrr_sweep(
             rejected += 1
             continue
         output_volts = output_rms * signal_scale_to_volts
-        cmrr_measured_db = 20.0 * np.log10(common_mode_v_rms / output_volts) if output_volts > 0 else float("inf")
+        common_mode_here = resolve_common_mode_v(float(frequency_hz), common_mode_v_rms, common_mode_lookup)
+        if not np.isfinite(common_mode_here) or common_mode_here <= 0:
+            rejected += 1
+            continue
+        cmrr_measured_db = 20.0 * np.log10(common_mode_here / output_volts) if output_volts > 0 else float("inf")
         correction_gain_db = float(
             compute_cmrr_correction_gain_db(
                 [frequency_hz],
@@ -1644,6 +1710,7 @@ def compute_reference_cmrr_sweep(
             {
                 "Time (s)": (start_index + 0.5 * window_size) / float(sample_rate),
                 "Frequency (Hz)": float(frequency_hz),
+                "Vcm Used (Vrms)": float(common_mode_here),
                 "Output RMS (uVrms)": float(output_rms),
                 "CMRR Measured (dB)": cmrr_measured_db,
                 "ADC Gain Corr (dB)": correction_gain_db,
@@ -1657,7 +1724,14 @@ def compute_reference_cmrr_sweep(
     aggregated, accepted, unstable = _aggregate_sweep_windows(
         frame,
         columns=CMRR_SWEEP_COLUMNS,
-        mean_columns=["Frequency (Hz)", "Output RMS (uVrms)", "CMRR Measured (dB)", "ADC Gain Corr (dB)", "CMRR (dB)"],
+        mean_columns=[
+            "Frequency (Hz)",
+            "Vcm Used (Vrms)",
+            "Output RMS (uVrms)",
+            "CMRR Measured (dB)",
+            "ADC Gain Corr (dB)",
+            "CMRR (dB)",
+        ],
         value_column="CMRR (dB)",
         std_column="CMRR Std (dB)",
         stability_tolerance_hz=stability_tolerance_hz,

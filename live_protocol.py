@@ -74,6 +74,30 @@ SPI_CLOCK_CHOICES = (
 )
 ADS_SPI_FRAME_BITS = 3 * 8 + 8 * 8 * 3  # 3 status bytes + 8 x 24-bit samples = 216
 
+# BR/EDR transmit power levels the controller actually implements. The board snaps a
+# request to the nearest of these and reports what it read back, so only real levels
+# are offered here.
+BLUETOOTH_POWER_CHOICES = (
+    (-12, "-12 dBm (minimum)"),
+    (-6, "-6 dBm"),
+    (0, "0 dBm"),
+    (3, "3 dBm"),
+    (4, "4 dBm (default)"),
+    (6, "6 dBm"),
+    (9, "9 dBm (maximum)"),
+)
+
+# SPP write size. 330 is the Arduino library's own chunk, which queues and returns;
+# anything larger hands the write to esp_spp_write() directly and waits for each
+# acknowledgement. Measured on this board the library path is the faster one, which is
+# why it is the default and the larger sizes are marked as the experimental path.
+SPP_WRITE_CHOICES = (
+    (330, "330 B (library queue - fastest measured)"),
+    (990, "990 B (direct - experimental)"),
+    (1980, "1980 B (direct - experimental)"),
+    (4096, "4096 B (direct - experimental)"),
+)
+
 # Output decimation. The converter runs at the selected output data rate and the
 # firmware block-averages N conversions before it publishes a packet, so the
 # packet rate stays where the serial/BLE link is comfortable while the ADS1299
@@ -177,11 +201,31 @@ def gain_scalar_from_ordinal(ordinal: int) -> int:
     return GAIN_SCALARS[-1]
 
 
-def max_sustained_packet_rate(baud: int) -> int:
-    """Packets per second the serial link can carry with 10% headroom."""
+# USB CDC-ACM is not a physical UART: the "baud rate" is nominal and the throughput
+# is set by the endpoint and host driver. These describe the achievable floor.
+USB_CDC_PACKETS_PER_SECOND = 12000
+USB_CDC_BAUD_THRESHOLD = 1_000_000
 
-    usable_bits = (max(int(baud), 9600) // 10) * 9
-    return max(usable_bits // (PACKET_LENGTH * 10), 1)
+
+def max_sustained_packet_rate(baud: int) -> int:
+    """Packets per second the serial link can carry with 10% headroom.
+
+    Over USB this is CDC-ACM, not a UART: the ESP32's USB serial does not run at
+    "baud" in any physical sense, and the figure is limited by the endpoint and the
+    host driver rather than by a bit clock. Deriving it from the nominal baud rate
+    made the app believe 2 Mbaud carried only ~5.4 k packets/s and force extra
+    decimation for rates that the link handles comfortably. A real CDC link carries
+    several hundred kB/s, so the baud-derived figure is kept only as a floor for
+    genuinely slow links.
+    """
+
+    baud = max(int(baud), 9600)
+    usable_bits = (baud // 10) * 9
+    derived = usable_bits // (PACKET_LENGTH * 10)
+    if baud >= USB_CDC_BAUD_THRESHOLD:
+        # CDC: the byte budget is a packet-count question, not a bit-rate one.
+        derived = max(derived, USB_CDC_PACKETS_PER_SECOND)
+    return max(derived, 1)
 
 
 def spi_frame_microseconds(spi_clock_hz: int = ADS_SPI_CLOCK_HZ, device_count: int = 2) -> float:
@@ -826,6 +870,11 @@ class HardwareSettings:
     chip_reference_modes: list[str] = field(default_factory=list)
     spi_clock_hz: int = ADS_SPI_CLOCK_HZ
     decimation: int = 1
+    # Bluetooth link tuning. The power is the controller's BR/EDR level and is
+    # applied to the board on connect; the SPP write size is a host-side choice that
+    # decides which firmware write path a throughput test uses.
+    bluetooth_power_dbm: int = 4
+    spp_write_bytes: int = 330
     channels: list[ChannelSetting] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -1648,6 +1697,9 @@ class AppSettings:
     # Everything the automated function-generator sweep remembers (resource,
     # amplitude, drive mode, frequency list, dwell rules, monitor channel).
     sweep: dict[str, object] = field(default_factory=dict)
+    # Link capacity assumptions. The Bluetooth budget starts at the conservative
+    # built-in default and only changes when the user adopts a measured value.
+    link: dict[str, object] = field(default_factory=dict)
     version: int = SETTINGS_VERSION
 
     def as_dict(self) -> dict[str, object]:
@@ -1666,8 +1718,8 @@ class AppSettings:
                 "measurement": dict(self.measurement),
             },
             "sweep": dict(self.sweep),
+            "link": dict(self.link),
         }
-
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> "AppSettings":
         connection = payload.get("connection") if isinstance(payload.get("connection"), dict) else {}
@@ -1688,6 +1740,7 @@ class AppSettings:
             auto_connect=bool(connection.get("auto_connect", True)),
             measurement=dict(recording.get("measurement") or {}) if isinstance(recording.get("measurement"), dict) else {},
             sweep=dict(payload.get("sweep") or {}) if isinstance(payload.get("sweep"), dict) else {},
+            link=dict(payload.get("link") or {}) if isinstance(payload.get("link"), dict) else {},
             version=version,
         )
         settings.migrate()

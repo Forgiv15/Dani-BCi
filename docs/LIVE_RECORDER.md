@@ -771,6 +771,7 @@ down, repeat.
 | **Curve fit** | `No fit`, `Order 2`, `Order 3` (default) or `Order 4`: a polynomial in `log10(frequency)` through the swept points. |
 | **Show fit** | Draws the fit as a dashed line in the channel's own colour (not repeated in the legend) and hides it again without recomputing. |
 | **Fit @ 50 Hz** | The fitted value at 50 Hz, shown for the first channel or as mean and range across all plotted channels. Also written into the report as a per-channel table with `R^2` and the number of points. |
+| **CM voltage** (CMRR tab) | How Vcm is established: flat amplitude, sinc3 roll-off, measured on the CM monitor channel, or monitor frequencies with the bias curve supplying the voltage. See *The four common-mode voltage definitions* below the export section. |
 
 Every curve carries a legend with the channel name and matches the colour used
 in the tables, and the same legend is part of the exported PDF/PNG figure.
@@ -1097,6 +1098,474 @@ commands.
 > 17-step sweep is a few hundred milliseconds of serial traffic plus the dwell
 > times. What *was* worth taking from that project is its "verify, never trust a
 > blind write" habit, which is now `verify_step()` / the *Test generator* button.
+
+## Bias reference curve (what voltage the generator actually delivered)
+
+*Tools -> Bias reference curve...* answers a question CMRR cannot answer on its
+own: at each frequency, how big was the common-mode voltage really?
+
+`CMRR = 20 log10(Vcm / Vout)`. `Vcm` is usually typed in as one number - "I set the
+generator to 1 Vrms" - but the source impedance, the cable, the input network and
+the ADS1299's sinc3 filter all take a share, and the share grows with frequency.
+Using the nominal number does not make that error go away, it books it as CMRR.
+
+The curve is built from **reference recordings**: one or more runs with channel 0
+wired straight across the generator output, no bias amplifier in the path. Channel
+0 then measures the real delivered voltage, and averaging several such runs
+suppresses each one's noise.
+
+* **Add recordings...** - two or more CSVs. **Reference channel** defaults to the
+  first channel, which is the convention these recordings are made under.
+* A recording that carries a generator plan is read at the frequency of every
+  step, inside the time that step held. Without a plan the dominant tone of each
+  window is used, and windows whose tone does not dominate are dropped (those are
+  the sliding transitions between steps).
+* **Bucket** groups readings that are within that percentage of each other, so
+  5 Hz is averaged within 0.1 Hz and 200 Hz within 4 Hz. **Min recordings** drops
+  a frequency that too few files contributed to, so one noisy run cannot pass for
+  a well-averaged point.
+* **Fit** - a polynomial in log10(f) (least squares, order 1-20) or an exact fit
+  through every averaged point: monotone PCHIP, natural cubic spline (minimum
+  curvature), or straight lines. Exact fits are the honest choice once the points
+  already are the measurement; the polynomial is for a trend through scatter.
+* **Save curve...** writes a JSON file. This is calibration, not per-recording
+  data - build it once and reuse it.
+
+The figure shows the averaged points with their ±1 SD spread, the generator
+setpoint, and the fitted curve; below it the same curve expressed as a gain in dB
+against the setpoint, which is the front end's own response.
+
+### The four common-mode voltage definitions
+
+The CMRR Sweep tab has a **CM voltage** selector. These are four different answers to
+"what voltage was really at the input", and they differ by tens of decibels, so the
+choice is explicit and the resolved value is shown under the control:
+
+| Mode | Vcm used | When to use it |
+|------|----------|----------------|
+| **Flat** | The constant amplitude in the Analysis panel, for every frequency | The stimulus is trustworthy as a number and the front end is flat enough across the band |
+| **Sinc3 roll-off** | That same amplitude, reduced with frequency by the ADS1299 digital filter at the recording's data rate | You want the converter's own filter accounted for without a monitor channel. At 500 SPS the sinc3 response is 0.95x at 50 Hz and 0.78x at 110 Hz |
+| **CM monitor measured** | The voltage actually measured on the monitor channel, per frequency - as-is | The converter measured the common-mode voltage itself, so no sinc3 correction is applied: it is already in the number |
+| **CM monitor + bias curve** | Frequency and timing from the monitor channel; voltage from the fitted bias reference curve | A bias network attenuates the stimulus. The sweep still knows where it is (from the monitor), and the voltage is what the generator really delivered |
+
+Mode 2 uses the recording's own sample rate as the converter data rate. In daisy mode
+the per-channel rate is half the chip's output data rate, so check the note under the
+selector before trusting the roll-off.
+
+**Mode 4 is the one that answers "what would this have been without the bias amp".**
+The monitor channel supplies the frequency and the timing - which is what it is good
+at, and all that survives when the amplitude is attenuated to 25 mV - while the
+voltage comes from the curve built out of bias-off runs:
+
+```
+bias on,  monitor measures   0.025 Vrms   ->  CMRR 105 dB
+bias on,  curve supplies     0.85-0.94 Vrms ->  CMRR 136 dB      (+31 dB)
+```
+
+That 31 dB *is* the bias network's attenuation, and the figure caption states it.
+
+Two rules the implementation follows, because each was a real bug:
+
+* **the curve is never scaled by a measured voltage.** Dividing the curve by the
+  attenuated measurement cancels the correction exactly. The only automatic scale is a
+  ratio of generator *setpoints* - if the recording states it was driven at 0.5 Vrms
+  and the curve was built at 1 Vrms, the curve is halved. No manual scale control
+  exists, because there should be nothing to get wrong.
+* **frequencies outside the curve's range are dropped, not extrapolated**, and appear
+  in the rejected count.
+
+Frequencies outside the curve's measured range are **dropped, not extrapolated**,
+and they appear in the rejected count - a point whose Vcm is unknown produces a
+made-up CMRR. The `Vcm Used (Vrms)` column records exactly which voltage every row
+was computed against, and the sweep info line reports the range actually supplied
+(for example `Vcm curve 0.86-0.94 Vrms`).
+
+### Reading the reference figure
+
+The **Reference input actually measured, and its fit** figure gains two traces when
+a curve is active:
+
+| Trace | What it is |
+|-------|------------|
+| green, `EXG Channel N measured` | what the monitor channel actually saw at the input - i.e. **after** the bias network |
+| red dashed, `generator set` | the amplitude the generator was told to produce |
+| blue, `Vcm used for CMRR` | the curve evaluated at each swept frequency, scaled - the number CMRR was divided by |
+| blue dashed, `bias curve (scaled)` | the same curve as a continuous line |
+
+The gap between the green and blue traces **is the bias network's attenuation**, and
+the caption under the figure states it: *"Bias network attenuates the common-mode
+voltage by 29.7 dB (0.0328x)"*. When the two traces differ by more than 6 dB the
+figure switches to a logarithmic voltage axis, because 0.03 V and 0.95 V cannot both
+be read on one linear axis - hiding one of them is exactly what made the curve look
+like it was doing nothing.
+
+The curve value is also written into the reference table as
+`Vcm from curve (Vrms)`, so the exported CSV and the PDF report carry it.
+
+### Why the CMRR number barely moves
+
+A curve fitted to 1 Vrms recordings returns values close to 1 V at the swept
+frequencies, so substituting it for a typed **1 Vrms** changes CMRR by about a
+decibel. That is not a fault: the curve is a *better* 1 V, not a different quantity.
+
+The case that matters is a **bias-on** run. There the monitor measures 0.02-0.03 Vrms,
+and mode 4 supplies 0.85-0.95 Vrms - so CMRR moves by **30-31 dB**, which is the bias
+network's attenuation. If it moves by 1-2 dB instead, the *CM voltage* selector is on
+mode 3 (which uses the attenuated measurement) rather than mode 4.
+
+The caption under the reference figure states the ratio directly, for example *"Blue
+trace is the voltage CMRR was divided by, 31.3 dB above what reached the input
+(0.0273x)"*, so both readings are always comparable.
+
+**Record the calibration at the same output data rate as the CMRR runs.** Part of
+what the curve measures is the ADS1299 sinc3 filter, and that response moves with
+the ODR. A curve built at 500 SPS describes 500 SPS measurements; the sample rate
+of every input file is listed in the file table so a mismatch is visible.
+
+## Bluetooth throughput benchmark
+
+*Tools -> Bluetooth throughput benchmark...* measures what the SPP link actually
+delivers to this PC. It is a bench tool about the radio, not part of an
+experiment, so it lives under Tools rather than beside the measurement controls.
+
+The firmware generates frames in memory and pushes them through the **production**
+transmission path - the same ring buffer, the same flush task on core 0, the same
+SPP stack, the same Windows virtual COM port - so the number is the link and only
+the link. **The ADS1299 is not read at all**: no SPI traffic, no conversions.
+
+| Control | Meaning |
+|---------|---------|
+| **Mode** | *Maximum throughput* (as fast as the link takes it), *Fixed rate* (32/64/100/150/200 KiB/s targets), *Automatic sweep* (steps up 32, 48, 64 ... 256 KiB/s and reports the highest rate that passes) |
+| **Duration** | Length of a single run, 30 s by default |
+| **Payload** | Frame payload: 128 to 4096 bytes. 990 is the classic SPP-friendly size; 1024 matches the firmware's flush chunk |
+| **SPP write** | Bytes per `esp_spp_write()`: 990 (default), 1980 or 4096 on the direct path, plus **330 B** which deliberately runs the Arduino library path as a lossy reference. See *Raising the throughput ceiling* |
+| **Sweep settle / measure** | Per step: how long the rate is held before counting, then how long is measured. The measurement window is judged on its own counters, so the ramp into a rate cannot flatter it |
+
+### Raising the throughput ceiling
+
+A first run of this benchmark peaked at **31.3 KiB/s** and lost a few packets, with
+nothing at all arriving above 48 KiB/s. That was not the radio's limit - it was the
+Arduino `BluetoothSerial` wrapper:
+
+* it splits every write into **330-byte** `esp_spp_write()` calls;
+* the radio allows **only one outstanding write**, so throughput is
+  `chunk / acknowledgement round-trip` - about 32 KiB/s at 330 bytes;
+* when the stack reports congestion it **discards the rest of that chunk**, so the
+  dropped bytes arrive at the PC as truncated frames. That is what the
+  corrupt-packet count was showing, and at higher rates it shredded the stream
+  completely, which is why the upper sweep steps verified zero packets.
+
+The bulk stream now bypasses the wrapper. `btRawWrite()` calls `esp_spp_write()`
+directly, with the rules the API imposes: one outstanding write at a time, nothing
+sent while the link is congested until `ESP_SPP_CONG_EVT` clears it, and a 100 ms
+acknowledgement wait instead of the library's 1000 ms. A chunk is never dropped
+part-way - if the stack will not take it, it is retried whole.
+
+**SPP write** selects the chunk size. Throughput is roughly `chunk / round-trip`, so
+990 bytes is about 3x the old ceiling and 1980 about 6x, until something else becomes
+the limit. Try 990, then 1980, then 4096, and keep the largest that stays stable.
+
+The one size that does **not** use the direct path is **330 B**: that is the library
+chunk, so selecting it runs the wrapper deliberately, as a reference point for how much
+the direct path actually buys. Everything above 330 uses the direct
+`esp_spp_write()` path, because the library path cannot carry a test: it copies every
+chunk with a `malloc` and discards the remainder of a chunk when the stack is congested -
+and a throughput test is nothing but congestion. Measured consequences of running a test
+on it were a heap down to 10 kB, thousands of write failures, and 3.5 kB arriving at the
+host with **zero** frames parseable out of it. The direct path takes no copy and never
+drops a partial chunk.
+
+It is active only while the test runs - the size resets the moment the test stops - so
+ordinary streaming and every text reply keep using the library path that has always
+worked. It also abandons itself after eight missed acknowledgements in a row and falls
+back, reporting it on the serial monitor. The **Write path** field shows which is live
+(`direct 990 B` / `library 330 B`), and the diagnostics line turns amber if a benchmark
+finds itself on the library path.
+
+The direct path needs two things, and the board prints both so a failure is never a
+guess. The `EVENT=diag` line carries:
+
+| Token | Meaning |
+|-------|---------|
+| `SPP` | The write size currently in force |
+| `THRESH` | The library chunk it must exceed to use the direct path (330) |
+| `HANDLE` | The SPP client handle the firmware is holding; `0` means the board has no client, so no direct write is possible |
+| `FAST` | `1` when the direct path is live |
+| `STACK` | Bytes the stack has **accepted** from the benchmark. This is the one that matters: if it stays at `0`, nothing is leaving the board whatever `QUEUED` says |
+| `ERR` | `esp_spp_write()` calls the stack refused - normal at a low rate, a fault if `STACK` stays `0` |
+| `ACK` | Completed writes whose acknowledgement never arrived |
+
+`FAST=0` with `ACTIVE=1` is one diagnostic; the app turns the line amber and names
+the input that failed - "no SPP handle yet" or "write size 330 is not above the
+library threshold 330". `FAST=1` with `STACK=0` and a rising `ERR` is the other,
+and it means the link will not take that write size at all.
+
+### What was wrong, and why it needed a rewrite
+
+Two defects in the write layer, both of which the numbers above make visible:
+
+* **The in-flight flag latched.** The flag that stops a second write overlapping the
+  first was being set from the *congestion* flag of the completed write. "This write
+  congested the link" therefore read as "a write is still outstanding", and only
+  another write could clear it - which was not allowed. One congested write stopped
+  the stream permanently. The flag is now cleared by `ESP_SPP_WRITE_EVT`
+  unconditionally, and by a 150 ms timeout if that event is ever lost. Congestion is
+  tracked separately and also expires.
+* **The flush task could spin.** When a status line could not be sent it retried
+  with no delay, burning a core at ~200 000 iterations a second; the data ring was
+  then never reached, which is why the diagnostics showed `STACK=0` with `FAILS`
+  climbing into the hundreds of thousands. Text now yields, and a line that cannot be
+  sent within a second is dropped - it is diagnostic output about a link that is
+  already broken.
+
+A benchmark also **ends itself** now. If the stack accepts no data for 2.5 s the
+board stops the run and restores the library write path, so a failed test can never
+leave the link engaged and the board needing a reconnect. The app treats that as the
+end of the run and re-enables Start.
+
+### The real limit was memory, not the radio
+
+Every failed run in the field pointed at the same thing once the numbers were read
+together: the board had **about 12 kB of heap free** during a test, and Bluedroid
+cannot transmit without contiguous memory for each SPP write. Its own library
+complained in plain text:
+
+```
+E[BluetoothSerial.cpp:165] _spp_queue_packet(): SPP TX Packet Malloc Failed!
+```
+
+### Measured: the library queue is the fast path
+
+Once the memory problem was gone the numbers were unambiguous:
+
+| Write path | Chunk | Verified throughput | Frames intact |
+|-----------|-------|--------------------|---------------|
+| library queue | 330 B | **88-99 KiB/s** | 96-98 % |
+| direct `esp_spp_write` | 4096 B | 11.3 KiB/s | 74.8 % |
+| direct `esp_spp_write` | 990 B | 1.3 KiB/s | 26 % |
+
+The direct path is the *slow* one, and the reason is architectural rather than
+tuning:
+
+* **`BluetoothSerial::write()` queues and returns.** Its own `_spp_tx_task` fills a
+  330-byte send buffer and blocks on the acknowledgement, so the sample ring refills
+  while a write is in flight - the pipeline is two deep by construction.
+* **`esp_spp_write()` permits exactly one outstanding write.** A producer that waits
+  for each acknowledgement can only ever reach `chunk / round-trip`, and on this link
+  the round trip is long enough that 990 bytes does worse than 330 queued.
+
+So 330 through the library is the default and the recommended setting. The larger
+sizes remain selectable so the comparison can be repeated on other hardware, where
+the acknowledgement may be much faster.
+
+### Where the remaining loss comes from
+
+The library discards the remainder of a chunk when the stack reports congestion
+(`if(!_spp_send_buffer()){ len = 0; }`). At a saturated offered rate that is normal,
+and the host resynchronises on the frame sync word, so the cost is bounded to the
+frame being carried. That is why "automatic sweep" is the honest way to find a
+clean rate: it reports loss per step, and the verdict marks a rate as sustainable
+only when almost everything verified.
+
+Two things were making it worse than it needed to be:
+
+* benchmark diagnostics went through `Serial`, which routes to Bluetooth whenever the
+  host is on Bluetooth - so the once-per-second status line competed with the data it
+  was measuring, and failed to send, and was retried. `FAILS=50186` on a 21 s run was
+  almost entirely this. Diagnostics now always go to the cable.
+* text replies were attempted during a benchmark at all. They are now suppressed
+  while a test runs, so the radio carries data only.
+
+Three buffers accounted for the memory that caused all of it:
+
+| Buffer | Size | When it existed |
+|--------|------|-----------------|
+| Bluetooth transmit ring | 32 kB | always |
+| **SD sample queue** | **32 kB** | **always, even with no card inserted** |
+| Benchmark frame scratch | 4 kB (up to) | always, once a benchmark had ever run |
+
+The SD queue was the waste: it was created in `setup()` and never released, for a
+card that may not even be present. It is now created when a recording opens and
+released as soon as the recording closes (the writer task owns the deletion, since
+it is the only task blocked on it). The frame scratch is now sized to the frame in
+use - 276 bytes for a 256-byte payload, not 4 kB - and freed when a run ends.
+
+The transmit ring is sized per path, because the two need opposite things: **8 kB**
+for the direct path, which blocks its producer and therefore needs the rest of the
+memory in the heap for Bluedroid's per-write buffers; **32 kB** for the library path,
+which needs no extra heap and benefits from the depth to ride out Windows' read
+jitter. The original size is restored when the test stops.
+
+A benchmark now refuses to start below **20 kB** of free heap rather than producing
+thousands of errors and no throughput.
+
+### Bluetooth controls in Hardware Settings
+
+Two link settings are saved with the rest of the hardware state and applied on every
+connect, so a board is never left on a stale radio configuration:
+
+| Control | Meaning |
+|---------|---------|
+| **Bluetooth power** | BR/EDR transmit level from -12 to +9 dBm. Sent as `\|btpower=<dBm>;` and **read back from the controller** - the board reports what the controller accepted, not what was asked for, so a refused level cannot masquerade as applied. Also shown as `BTDBM=` in the `[PWR]` line |
+| **Bluetooth SPP write** | Bytes per SPP write, 330 to 4096. 330 is the measured-fastest library queue path and is the default; the larger values select the direct write and are marked experimental |
+
+### SPI clock
+
+The bus clock is checked against two things before it is accepted, because both
+failures look like "the stream turned to gibberish" rather than like an error:
+
+* **Can the bus carry the selected rate?** Two 216-bit frames per sample must fit
+  inside one sample period. At 1 MHz that is 432 us, so 2 kSPS would spend 86 % of
+  every second on SPI, and the frame read overruns the next DRDY - every sample after
+  that is taken from the wrong conversion. A clock below what the selected data rate
+  needs is now **refused with the numbers**, rather than accepted and left to corrupt.
+* **Do the converters still answer?** After the change the device ID is read back over
+  the new clock. A wrong or absent answer reverts to the previous clock and says so.
+
+The rate code `0` is a real value (16000 SPS) and was being read as "not set" and
+replaced with 250 SPS, which made the fastest rate silently unselectable.
+
+
+### Write size on the library path
+
+`BT_LIBRARY_WRITE_CHUNK` is now exactly the library's own internal buffer (330), not
+1024. Handing `BluetoothSerial` 1024 bytes makes it assemble 330 + 330 + 364 and
+**discard the 364** on the first congestion, and it `malloc`s a whole copy per call.
+At 330 the library's send buffer is emptied on every write, so there is never a
+remainder to lose - which is why the one configuration that ever worked by accident
+(payload 256 on the 330 path) was the one where a frame fit in a single piece.
+
+The library writes in **330-byte** pieces and discards the rest of a piece when the
+stack congests, so **a frame larger than 330 bytes cannot survive the 330-byte path**.
+A 990-byte payload on a 330-byte write produced 18 kB of received bytes and not one
+parseable frame. The firmware now never hands the library more than 330 bytes for
+exactly that reason, and the app reduces the payload to fit when 330 B is selected and
+says so in the run summary; 990 B and above use the direct path and take any payload
+up to 4096 bytes.
+
+### Benchmark link: the board serves one Bluetooth client
+
+| Data link | What it reads |
+|-----------|---------------|
+| **Main window link** | The connection the recorder already holds. Used automatically when the main window is on Bluetooth |
+| **This window's own Bluetooth port** | A second, separate SPP connection - only possible when the main window is on USB |
+| **USB** | The cable, as a reference only. Never reported as Bluetooth performance |
+
+**The board accepts one SPP client at a time.** A second connection makes the firmware
+treat the existing one as stale: it disconnects the tracked handle and starts link
+recovery, which drops the running stream and leaves the port unusable until the
+adapter or the board is reset. So the window will:
+
+* remove the port the main window is holding from its list;
+* default to *Main window link* the moment the recorder connects over Bluetooth;
+* refuse to open a second connection at all, and say why;
+* release the handle - including on a failed open - so the port is never left busy.
+
+That last point is what made the port look permanently "used by something else":
+the guard now runs `cancel_read()` before `close()` (a Windows Bluetooth port can sit
+in a read and ignore the close) and waits for the reader thread to exit.
+
+**Commands always prefer the cable**, so with USB on commands and Bluetooth on data
+the board stays fully controllable while the radio is saturated and **Stop** is never
+queued behind test traffic.
+
+Bytes are only ever tapped from **one** link - attaching the receiver to two would
+count every packet twice.
+
+### Why the throughput gain is opt-in
+
+An earlier revision made the direct write path the default and doubled the transmit
+ring to 64 kB. That produced the worst kind of failure: the PC saw `SZD_EEG`,
+connected, and the board never answered. Two causes were possible - memory pressure
+on the Bluetooth stack, or a handshake problem in the direct path - so both were
+addressed rather than guessed between:
+
+* the ring is back to **32 kB**, and it now refuses to allocate at all if it would
+  leave less than **96 kB of heap** for Bluedroid. That reserve exists because the
+  ring is allocated *before* the stack starts, and Bluedroid's own TX/RX buffers come
+  out of what is left. This is the failure mode to protect against, because it looks
+  like "advertises, connects, never answers" rather than like an allocation error.
+* the direct path is now **opt-in** and **self-healing** (see *SPP write* above).
+
+The boot log now states the outcome, so this is never a guess again:
+
+```
+[BT] transmit ring 32768 B, heap after 118000 B
+```
+
+If you want to prove where a Bluetooth failure sits, the discriminator is the USB
+serial monitor: a board that answers there but not over SPP has a link problem, and
+one that answers nowhere has not booted.
+
+### What the numbers mean
+
+Three different byte counts are shown, and they answer different questions:
+
+* **Verified payload** - bytes this PC received, parsed and proved byte-for-byte
+  against the payload the firmware must have generated for that sequence number.
+  *This* is throughput.
+* **Firmware accepted** - bytes the Bluetooth stack took from the firmware's ring.
+  They can be accepted and still never arrive.
+* **Firmware queue** and **queue fill** - what the generator produced versus how
+  much is still waiting. A queue that keeps growing means the link is behind, not
+  that the buffer is too small.
+
+**Corrupt**, **Missing** and **Sequence errors** come from the CRC, from
+regenerating the payload, and from gaps in the sequence numbering.
+
+Three byte counts, three different faults:
+
+| Field | If it is zero |
+|-------|---------------|
+| **Raw bytes** | Nothing reached this program: the link or the port is the problem |
+| **Received** | Bytes arrived but none formed a benchmark frame: framing problem, usually an older firmware image |
+| **Verified payload** | Frames arrived but failed their checks: corruption |
+
+The **Board diagnostics** line under the summary shows the firmware's own view - whether
+the generator is active, what the ring holds, how many bytes the stack accepted, and
+whether `BluetoothSerial.write` is failing. It is the only way to tell "the firmware
+never produced anything" from "the PC never received it", and it refreshes once a
+second while a test runs.
+
+The **Status** field is derived, not typed: *stable* means everything arrived and
+the queue stayed flat; *congested* means the queue rode high or the firmware hit
+transmission stalls; *losing data* means packets went missing.
+
+**Payload throughput is not the radio's PHY bitrate.** Bluetooth Classic carries far
+more on air than survives SPP framing, L2CAP fragmentation and the Windows driver.
+The figure shown is the application bytes that verifiably crossed the boundary.
+
+### Safety
+
+The test stops the sample stream first and refuses to start if it does not stop,
+because the generator and the acquisition path share one ring buffer. It refuses
+to start when no Bluetooth host is connected, or when the board does not report
+`BENCH` support - an older image accepts the commands and sends nothing, which
+looks exactly like a dead link. The generator is bounded to 4 ms per `loop()`
+iteration, so **Stop** always lands even at maximum speed. On stop the firmware
+returns to its normal idle state and does not restart the stream by itself.
+
+If the selected port is a cable rather than a Bluetooth port, the window says so in
+amber and labels the result *USB reference (NOT Bluetooth)* - a USB measurement is
+a useful reference but it is a different link.
+
+Results save to **JSON** (full record, including the per-second samples) or **CSV**
+(one row per second) for a paper.
+
+## Bluetooth link budget
+
+The recorder used to assume a fixed 32 KiB/s for planning sample rates over
+Bluetooth. That figure is a conservative estimate, not a measured limit.
+
+The benchmark's **Use measured rate as link budget...** adopts a *verified
+sustainable* rate - never a peak - with a safety margin on top (20 % by default,
+and applied only to an adopted value). The margin is 0 % until something measured
+is adopted, so nothing changes for anyone who never runs the test, and clearing the
+stored value returns to the built-in 32 KiB/s.
+
+The sample-rate feasibility calculations, the packet-rate budget and the link note
+all read that one budget. The distinction between ADS1299 sample rate, output
+packet rate and per-channel rate in daisy mode is unchanged.
 
 ## Exporting from the analyzer
 
@@ -1776,6 +2245,86 @@ Three firmware behaviours exist specifically to keep the data spike-free:
 The SPI clock is `ADS_SPI_CLOCK_HZ` in `src/main.cpp` (currently 2 MHz); raising
 it to 4 MHz is allowed by the ADS1299 datasheet and would double the SPI budget
 to ~8300 SPS, but the serial link becomes the binding limit long before that.
+
+### Power control (current-consumption testing)
+
+*Device -> Power control...* opens a window that switches each subsystem on and off
+so its current draw can be measured on the bench supply. The window only *switches*
+and *reports*; the supply does the measuring.
+
+| Group | What can be switched |
+|-------|----------------------|
+| **ADS1299** | Per converter: run / idle / standby, data rate, and PGA for every channel of that chip. Board-wide: hold `PWDN` low, hold `RESET` low, ADS1's clock output. Plus **Start/Stop stream** and **Restore converters to normal** |
+| **Command link** | Send over the main USB link, or open the panel's **own** Bluetooth SPP connection |
+| **Peripherals** | Accelerometer (power-down), SD card (released), synthetic test stream |
+| **Bluetooth** | Stack on/off, transmit power in the controller's steps (-12 ... +9 dBm, read back from the controller), modem sleep |
+| **ESP32 sleep** | Light sleep for N ms (continues, no reset) and deep sleep for N ms (restarts) |
+
+Opening the panel **only reads**. It sends `|status;` and nothing else, so a current
+measurement is never disturbed just by looking at the board. Anything that changes
+state is an explicit click; **Restore converters to normal** (`restore=1`) is there
+for when a converter really was left in a test state, and the panel prompts for it
+when a linked converter reports no DRDY edges.
+
+`PWDN` and `RESET` are **tick-to-disable**: clear means the pin is high and the
+converters run normally, which is how the board boots. Ticking either box drives the
+shared pin low. That is the only useful direction for a current test - nobody wants
+to power the converters *on* by hand - and it makes the boxes read the same way as
+the accelerometer, card and radio boxes next to them.
+
+**The Bluetooth TX power only moves the current reading while the radio is
+actually transmitting.** With no SPP host attached the controller idles; hold the
+link open and let data flow over it, then compare `-12` with `+9` dBm.
+
+The **Controller holds** line under the power combo is the read-back: Apply sends
+the request and the board answers with `esp_bredr_tx_power_get()`, so the panel
+shows *confirmed* when the controller took the level, and *"the controller did not
+take +9 dBm"* when it clamped it. The level in the status line is that read-back
+too, never the echo of the request.
+
+**The panel does not trust a setting, it proves it.** The *Board reports* block shows
+per converter: whether it answers on SPI, its device ID, how many registers differ
+from what was programmed, and **how many DRDY edges it produced in a 60 ms window**
+(`DRDY 59/60 in 60 ms  converting`, or `DRDY 0/60 ... NO DATA`). The packet counter
+(`packets sent`) shows whether the stream is really delivering. A converter can be
+perfectly configured and still produce nothing - `DRDY 0` is the field that
+separates the two.
+
+**The Bluetooth connection is the panel's own.** The board leaves Bluetooth mode when
+nothing is using the SPP link, so measuring the radio's current means holding that
+port open from a program. The panel therefore opens its own connection to the SPP
+COM port - a different port from the cable, which the main window already holds - and
+can send every command over either transport. It works with the USB link connected,
+disconnected, or both.
+
+Three things are deliberately explicit rather than hidden:
+
+* **`PWDN` and `RESET` are wired to both converters on this board**, so those two
+  are board-wide and the window says so instead of pretending to be per-chip. The
+  per-chip mode is real: it goes through the `START`/`STOP`/`STANDBY` SPI opcodes,
+  not the shared `START` pin.
+* **`CLK_EN` is the clock output driver, not the oscillator.** The ADS1299's
+  oscillator always runs; `CLK_EN` only drives it out on the CLK pin for the second
+  converter. Turning it off stops ADS2 and saves the output driver, nothing more.
+* **Light sleep can continue the session; deep sleep cannot.** Light sleep keeps
+  RAM and the program counter, so the board resumes where it left off - the UART
+  divisor is refreshed on wake because light sleep changes the APB clock. Deep sleep
+  powers down everything outside the RTC domain and *always* restarts the chip when
+  the timer expires.
+
+Both sleep modes stop streaming and (for light sleep) stop the radio first: an
+active Bluetooth controller wakes the chip immediately, so light sleep with the
+radio running would measure nothing.
+
+The window **never polls**. It reads the state once when it opens and again only on
+*Refresh*, because a periodic query would put card and SPI traffic into the very
+measurement the window exists to make. Every control acknowledges with a `[PWR]`
+line, so the panel can show which request was refused and why.
+
+The synthetic test stream is worth knowing about: with `test` on, the firmware
+generates packets at the configured rate **without touching the converters**, and it
+starts the stream itself. Without that the setting was accepted and nothing was ever
+sent, because the generator lives inside the streaming task.
 
 ### Bluetooth in the firmware
 

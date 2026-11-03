@@ -377,6 +377,251 @@ writes, so the card stores the configuration the converters are actually running
 The GPIO37 button reads that file and applies it before recording, which is what
 makes a standalone recording reproduce the settings last reviewed in the GUI.
 
+## Power-control commands (`|` prefix)
+
+These exist to put the board into a known current-consumption state and measure it.
+One `;`-terminated `key=value` line each:
+
+```
+|status;
+|ads1=standby;
+|adspwdn=0;
+|light=3000;
+```
+
+The prefix is `|` and not `!` because `!@#$%^&*` are the Cyton "activate channel"
+shortcuts - using `!` would have broken OpenBCI compatibility for channel 1.
+
+| Key | Value | Effect |
+|-----|-------|--------|
+| `status` | - | `[PWR] EVENT=... DONE=1` line with the whole state |
+| `restore` | 1 | Re-detect both converters and re-apply the full configuration |
+| `stream` | 0/1 | Start/stop acquisition. Refused while `PWDN` or `RESET` is held low |
+| `bench` | 0/1 | Start/stop the Bluetooth SPP throughput benchmark |
+| `benchrate` | bytes/s | Benchmark target, 0 = as fast as the link takes it |
+| `benchchunk` | 16-4096 | Payload bytes per benchmark frame |
+| `benchspp` | 128-4096 | Bytes handed to one `esp_spp_write()`. Above 330 switches to the direct path; 330 keeps the library path |
+| `benchdur` | ms | Benchmark auto-stop, 0 = until told to stop |
+| `benchstats` | 1 | Queue one firmware statistics packet immediately |
+| `benchdiag` | 1 | `[BENCH] EVENT=diag ...` - generator state, ring fill, write failures, client state. Emitted on the **cable**, never over Bluetooth |
+| `btpower` | -12..9 | BR/EDR transmit level. Applied and then **read back from the controller**; the reply reports the level the controller accepted and `[PWR]` carries it as `BTDBM=` |
+| `btdrop` | 1 | Disconnect the SPP client from the board's side, clearing the single-client slot |
+
+`benchdiag` is the field you want when a test receives nothing. It reports
+`ACTIVE` (generator running), **`FAST` (1 = the non-dropping direct path is in use)**,
+`HANDLE` (the SPP client handle held; `0` = no client, so no direct write is possible),
+`THRESH` (the library chunk the write size must exceed, 330), `SPP` (the write size in
+force), `RING`/`RINGSZ`/`USED` (is the ring accepting), `QUEUED`/`STACK` (bytes produced
+versus **accepted by the stack** - `STACK` is the one that proves data left the board),
+`ERR` (`esp_spp_write` calls the stack refused), `ACK` (writes whose completion event
+never arrived), `FAILS` (`BluetoothSerial.write` failures), `S2R` (the mirror-to-radio
+flag), `CLIENT` (does the board see a host) and `HEAP`. A diag line is printed once a
+second while a benchmark runs. The statistics packet carries the handle in its final
+field, so the app can show it without the text line.
+
+Reading one: `ACTIVE=1 CLIENT=1 FAST=1` with `STACK` climbing is a healthy link.
+`FAST=0` means the benchmark is on the library path, which shreds frames - and
+`HANDLE=0` or `SPP` not above `THRESH` says which of the two inputs is responsible.
+`FAST=1` with `STACK=0` and `ERR` climbing means the link refuses that write size.
+`CLIENT=0` means the board has no SPP client at all, whatever Windows says.
+
+A benchmark **stops itself** when the stack accepts no data for 2.5 s, reporting
+`[BENCH] EVENT=stopped REASON=no-progress`, and restores the library write path and
+the transmit ring on the way out. That is deliberate: a run that has wedged the write
+path must not need a reconnect to recover. Every `REASON` is a single hyphenated token
+(`no-progress`, `host-request`, `duration-elapsed`, `bluetooth-stopped`,
+`host-disconnected`) so it survives the app's whitespace tokenising.
+
+`startBenchmark` refuses with `REASON=heap-too-low` when less than 20 kB of heap is
+free. Bluedroid allocates a transmit buffer per write, so below that the test produces
+errors rather than throughput - and its library says so directly:
+`_spp_queue_packet(): SPP TX Packet Malloc Failed!`. The SD sample queue is the usual
+reason: it is 32 kB and is now allocated only while a recording is open.
+| `lis3dh` | 0/1 | Accelerometer CTRL_REG1 = 0 (power-down, ~0.5 uA) or its 100 Hz setting |
+| `ads1`, `ads2` | `run` / `idle` / `standby` | Per-converter mode through the SPI opcodes |
+| `ads1rate`, `ads2rate` | 0-6 | That converter's DR bits (16000 ... 250 SPS) |
+| `ads1gain`, `ads2gain` | 0-6 | PGA of every channel of that converter (x1 ... x24) |
+| `adspwdn` | 0/1 | **Both** converters: 0 drives the shared PWDN pin low |
+| `adsreset` | 0/1 | **Both** converters: 0 holds the shared RESET pin low |
+| `adsclkout` | 0/1 | CONFIG1 CLK_EN of ADS1 (the clock *output driver*) |
+| `sd` | 0/1 | Release the card (`SD.end()`, CS high, bus parked) or mount it again |
+| `bt` | 0/1 | Stop/start the SPP stack; USB control is unaffected |
+| `btdbm` | -12..9 | BR/EDR transmit power, snapped to the controller's steps |
+| `btsleep` | 0/1 | `esp_bt_sleep_enable()` / `_disable()` |
+| `test` | 0/1 | Synthetic stream: generate packets instead of reading the converters, **and start the stream** |
+| `light` | ms | Light sleep, then continue (no reset) |
+| `deep` | ms | Deep sleep; the board restarts when the timer expires |
+
+The `[PWR]` reply is the feedback that matters, so it carries proof rather than
+just settings:
+
+```
+[PWR] EVENT=applied FW=2 ADS1=run ADS1_LINK=1 ADS1_ID=0x3E ADS1_PROB=0 ADS1_DRDY=59
+      ADS2=run ADS2_LINK=1 ADS2_ID=0x3E ADS2_PROB=0 ADS2_DRDY=58
+      SPS=1000 PWDN=1 RESET=1 CLKOUT=1 LIS3DH=1 SD=1 BT=1 BTDBM=3 BTSLEEP=0
+      TEST=0 STREAM=1 TX=12345 HEAP=120000 DONE=1
+```
+
+| Field | Meaning |
+|-------|---------|
+| `FW` | Protocol version of this line. Absent or `< 2` means an older image |
+| `BENCH` | Bluetooth benchmark protocol version; absent means the image cannot run it |
+| `ADS<n>_LINK` | The converter answers on SPI at all |
+| `ADS<n>_ID` | Device ID read back (0x3E is an ADS1299) |
+| `ADS<n>_PROB` | Registers that differ from what was programmed, from `verifyDeviceRegisters()` |
+| `ADS<n>_DRDY` | **DRDY edges counted in a 60 ms window** - the only field that proves data is being produced |
+| `TX` | `publishedConversions`, so two reads show whether packets are actually going out |
+
+`PWDN` and `RESET` report the physical **pin level** from `digitalRead()`, not the
+firmware's belief and not the command: `1` means the pin is high and the converters
+are enabled, which is how the board boots. `0` means the pin is being held low.
+Protocol version 1 (any image without the `FW` tag) reported the opposite - the
+"held low" flag - which is why the GUI converts values from an untagged board.
+
+`BTDBM` is the level the controller **reports holding** via
+`esp_bredr_tx_power_get()`, not the level that was requested. BR/EDR transmit power
+only affects the current reading while the radio is transmitting, so with no
+Bluetooth host attached the number changes and the supply reading does not.
+
+## Throughput benchmark packets (firmware -> host)
+
+While `bench=1` the board emits a binary stream alongside (never inside) the normal
+text lines. Everything is little-endian:
+
+```
+offset  size  field
+0       4     sync marker A5 5A C3 3C
+4       1     protocol version (2)
+5       1     type: 1 = data, 2 = firmware statistics
+6       4     sequence number
+10      2     payload length
+12      4     firmware millis
+16      n     payload
+16+n    4     CRC-32 (zlib polynomial) over bytes 4 .. 16+n
+```
+
+The version was bumped to 2 when the payload formula changed, so a mixed pair of
+firmware and host application fails visibly - nothing parses - instead of producing
+100 % "corrupt" frames.
+
+The **payload is not random**: byte *j* of packet *seq* is
+`((seq*2654435761 + j*2246822519) ^ ...) >> 13` - an elementwise function of the two
+indices. The host regenerates it, so a frame that passes the CRC but carries the wrong
+payload is still caught, and the firmware never has to store anything.
+
+Elementwise rather than a sequential generator on purpose: the host must recompute the
+payload for every frame, and a byte-at-a-time xorshift cost about a million interpreted
+operations per second at line rate, which pegged a core and froze the GUI. The
+vectorised form runs at ~85 MB/s on the host, so the receiver is never the bottleneck.
+
+A **statistics packet** carries 64 bytes: queued bytes, bytes the stack accepted,
+queue fill, peak fill, stalls, uptime, target rate, payload length, frame length,
+packets queued, ring size, SPP congestion events, SPP acknowledgement timeouts, the
+SPP write size in use, whether the direct write path is active, how many times it
+fell back, and the SPP client handle. Those are the firmware's side of the story;
+only the host's verified count is throughput.
+
+`BT_FAST` is what makes the write path auditable: a throughput number is meaningless
+without it, because 330-byte library writes and 1980-byte direct writes are not the
+same experiment.
+
+The firmware also emits three plain text lines, each starting in column 0 so the
+GUI can route on the prefix:
+
+```
+[BENCH] EVENT=started RATE=<bytes/s> CHUNK=<payload> SPP=<write size> DUR=<ms> RING=<bytes>
+[BENCH] EVENT=stopped REASON=<why> PACKETS=.. QUEUED=.. STACK=.. STALLS=.. PEAK=.. MS=..
+[BENCH] EVENT=failed  REASON=<why>
+```
+
+`failed` is the important one: a board that declines to start goes silent, which
+from the host looks identical to a dead link. It is reported instead.
+
+### Why the link was capped at 32 KiB/s
+
+The Arduino `BluetoothSerial` wrapper writes in **330-byte** `esp_spp_write()`
+calls and waits for a tx-done acknowledgement after each one, and when the stack
+reports congestion it **discards the remainder of the chunk**. Since the radio
+permits only one outstanding write at a time, throughput is
+`chunk / round-trip` - about 32 KiB/s at 330 bytes - and congested writes reach the
+host as truncated frames, which is what the corrupt-packet count was showing.
+
+`benchspp` above 330 selects a direct `esp_spp_write()` path that follows the API's
+own rules (one outstanding write; no write while congested until `ESP_SPP_CONG_EVT`
+clears it) with a 100 ms acknowledgement wait instead of the library's 1000 ms.
+Nothing is dropped on congestion: the chunk is retried whole. **It is active only
+while a benchmark runs** - the write size resets to the library chunk the moment the
+test stops - and it falls back to the library automatically after eight consecutive
+missed acknowledgements. Selecting exactly **330** is therefore a deliberate run on
+the library path, useful only as a reference for what the direct path buys.
+
+### Why the direct write is slower than the library queue
+
+Measured on this board, same link, same host:
+
+| Write path | Chunk | Verified throughput | Frames intact |
+|-----------|-------|--------------------|---------------|
+| library queue | 330 B | **88-99 KiB/s** | 96-98 % |
+| direct `esp_spp_write` | 4096 B | 11.3 KiB/s | 74.8 % |
+| direct `esp_spp_write` | 990 B | 1.3 KiB/s | 26 % |
+
+`BluetoothSerial::write()` queues a chunk and returns immediately; its own
+`_spp_tx_task` blocks on the acknowledgement, so the sample ring refills while the
+write is in flight. The direct path calls `esp_spp_write()` from the producer and, by
+the API's one-outstanding-write rule, must wait for completion before it may write
+again - so its ceiling is `chunk / round-trip`, and on this link the round trip is
+long enough that 990 bytes loses to 330 queued. The direct path is therefore
+experimental; 330 through the library is the default.
+
+`BT_LIBRARY_WRITE_CHUNK` is exactly 330 - the library's own internal buffer - for two
+reasons, both measured here:
+
+* `BluetoothSerial` mallocs a *copy* of every chunk it is handed, so asking for
+  1024 bytes is a 1 kB allocation per write on a heap that has no room for it. The
+  library reports it plainly: `_spp_queue_packet(): SPP TX Packet Malloc Failed!`.
+* when the stack reports congestion it does `if(!_spp_send_buffer()){ len = 0; }` -
+  it **discards the rest of the chunk it is assembling**. Handing it 1024 bytes means
+  330 + 330 + 364, and the 364 is thrown away mid-frame. At 330 the send buffer is
+  emptied on every call, so there is never a remainder to lose. 330 is also ten whole
+  33-byte sample packets, so a frame cannot span a write boundary.
+
+Ordinary streaming and text replies always use the library path. The 330-byte
+*benchmark* option runs a test on that same path deliberately, because it is the one
+that sustains the highest verified rate.
+
+The sync marker is what makes the two streams separable: the host strips complete
+benchmark frames and hands everything else to the ordinary text/packet parser, so
+`Success:` replies still arrive during a test.
+
+A register readback cannot distinguish a configured chip from a converting one,
+which is why `ADS<n>_DRDY` exists: `0` with `ADS<n>=run` means the chip is
+configured but not converting.
+
+Notes that matter for interpreting a measurement:
+
+* **A released `PWDN` or `RESET` returns an *unconfigured* converter.** It answers
+  on SPI with its register defaults - no reference buffer, no clock output, every
+  channel powered down - so it looks dead. Releasing either one now runs the same
+  recovery path as boot (`restoreConverters()`), and `restore=1` forces it on demand.
+* `ads1=run` also re-applies the whole configuration before starting conversion, so
+  "run" means "running with the settings this app holds".
+* **`PWDN` and `RESET` are shared by both ADS1299s**, so those two keys are
+  board-wide. `START` is shared as a pin as well, but the converters also honour
+  the per-device `START`/`STOP`/`STANDBY`/`WAKEUP` opcodes, so `ads1`/`ads2` really
+  are independent. The firmware uses only the opcodes for that reason.
+* `test=1` **starts the stream**, because the generator lives inside the streaming
+  task: accepting the setting without starting the stream sent nothing at all.
+
+* `light` is deferred to the main loop so the acknowledgement reaches the host
+  first, and it stops the stream and the radio (light sleep with an active
+  Bluetooth controller wakes immediately). On wake the UART divisor is refreshed and
+  the board reports the wake cause and its unchanged reset reason. **Deep sleep
+  always restarts the chip** - there is no way around that, which is why the reply
+  and the window both say so.
+
+Querying costs card and SPI traffic, so `|status;` is on demand only: the window
+reads it when the panel opens and when *Refresh* is pressed, never on a timer.
+
 ## ADS1299 register defaults applied (Cyton-like)
 
 On startup, `d` command, and after the self test:
