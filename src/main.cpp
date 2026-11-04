@@ -70,6 +70,12 @@ static constexpr UBaseType_t BT_FLUSH_TASK_PRIO = 2;
 static constexpr int BT_FLUSH_TASK_CORE = 0;
 static constexpr uint32_t LED_PERIOD_USB_MS = 500;
 static constexpr uint32_t LED_PERIOD_BT_MS = 125;  // 4x faster: Bluetooth mode
+// Recording pattern: three 50 ms pulses, then 950 ms of darkness. Three uneven
+// flashes are never produced by any of the transport patterns, so "is it recording?"
+// is answerable at a glance from across the bench.
+static constexpr uint32_t RECORD_LED_PULSE_ON_MS = 50;
+static constexpr uint32_t RECORD_LED_PULSE_OFF_MS = 50;
+static constexpr uint32_t RECORD_LED_GAP_MS = 950;
 
 static constexpr int PIN_ADS1_DRDY = 34;
 static constexpr int PIN_ADS1_CS = 5;
@@ -125,7 +131,7 @@ static constexpr uint8_t WIRE_CHANNELS = 8;                                 // a
 static constexpr uint8_t GUI_CHANNELS = (TOTAL_ADS_CHANNELS == 8) ? 8 : 16; // channels the GUI sees
 static constexpr bool DAISY_MODE = (TOTAL_ADS_CHANNELS > 8);                // interleaved 16ch emulation
 
-static constexpr uint32_t SERIAL_BAUD = 2000000;
+static constexpr uint32_t SERIAL_BAUD = 3000000;
 static constexpr uint32_t SERIAL_TX_BUFFER = 4096;
 static constexpr bool USE_DEBUG_APP_MODE = false;
 static constexpr uint32_t LIS3DH_I2C_CLOCK_HZ = 400000;
@@ -135,8 +141,9 @@ static constexpr uint32_t LIS3DH_I2C_CLOCK_HZ = 400000;
 // most effective way to cut the time the writer task holds the bus - which is what
 // competes with the Bluetooth flush task for the CPU. If the card refuses to
 // initialise at this rate the bring-up retries at the conservative default.
-static constexpr uint32_t SD_SPI_CLOCK_HZ = 10000000;
-static constexpr uint32_t SD_SPI_CLOCK_FALLBACK_HZ = 4000000;
+static constexpr uint32_t SD_SPI_CLOCK_HZ = 20000000;
+static constexpr uint32_t SD_SPI_CLOCK_FALLBACK_HZ = 10000000;
+static constexpr uint32_t SD_SPI_CLOCK_MINIMUM_HZ = 4000000;
 static uint32_t sdSpiClockActive = SD_SPI_CLOCK_HZ;
 // 24-bit two's complement full scale of the ADS1299, used for the microvolt
 // conversion of SD samples (the host uses the same value).
@@ -608,6 +615,14 @@ static volatile uint32_t missedConversions = 0;
 // is losing what it produced.
 static volatile uint32_t spiReadMaxUs = 0;
 static volatile uint32_t spiReadLastUs = 0;
+// The part of the read spent waiting for the SPI mutex, separated from the transfer
+// itself: a mutex hold and a slow bus look identical when only the total is reported.
+static volatile uint32_t spiLockLastUs = 0;
+static volatile uint32_t spiLockMaxUs = 0;
+// A gap report is formatted in the acquisition task but printed by loop(), so the
+// UART never runs on the conversion path.
+static char pendingGapLine[192] = {0};
+static volatile bool gapLinePending = false;
 // Conversions that actually became packets, so DRDY edges and published packets
 // can be compared: edges above packets means conversions are being missed.
 static volatile uint32_t publishedConversions = 0;
@@ -632,10 +647,20 @@ static constexpr uint32_t HOST_PRESENCE_WINDOW_MS = 50;
 // a deliberate stop.
 static bool suppressAutoStream = false;
 
-// Set by the record-button interrupt, consumed by the main loop, which owns the
-// ADC bus.
+// Set by the record-button handling, consumed by the main loop, which owns the ADC
+// bus and the card.
 static volatile bool recordButtonPressed = false;
-static volatile uint32_t recordButtonLastEdgeMs = 0;
+// A level change has to hold for this many consecutive polls before it counts. Ten
+// milliseconds per poll, so 4 samples is a 40 ms debounce: long enough for any
+// mechanical switch, short enough that a deliberate press is never missed.
+static constexpr uint32_t RECORD_BUTTON_POLL_MS = 10;
+static constexpr uint8_t RECORD_BUTTON_DEBOUNCE_SAMPLES = 4;
+// Starting a recording and then immediately stopping it produces a file with no data
+// in it, which is the one outcome worse than not recording at all. A stop is ignored
+// until this much time has passed since the recording started, whatever the button
+// does.
+static constexpr uint32_t RECORD_BUTTON_MIN_RUN_MS = 2000;
+static volatile uint32_t recordButtonLastActionMs = 0;
 
 // Bumped for every recording, so queued samples from a previous file are dropped.
 static volatile uint32_t sdGeneration = 0;
@@ -725,42 +750,41 @@ static constexpr UBaseType_t STREAMING_TASK_PRIO = 22;
 // the radio link always wins the CPU, and the SD queue absorbs the difference.
 static constexpr UBaseType_t SD_TASK_PRIO = 1;
 static constexpr UBaseType_t AUX_TASK_PRIO = 3;
+// The USB writer sits with the radio tasks: it must keep the UART full, but a byte
+// that is a millisecond late is invisible next to a missed conversion.
+static constexpr UBaseType_t USB_FLUSH_TASK_PRIO = 2;
 
 static void ledBlinkTask(void* parameter) {
   (void)parameter;
   bool ledOn = false;
 
   for (;;) {
-    // While the card is recording the LED is a recording indicator first and a
-    // transport indicator second, because losing a recording is worse than not
-    // knowing which link is up:
+    // Recording gets a pattern of its own, independent of the transport.
     //
-    //   USB link       -> solid on
-    //   Bluetooth link -> 950 ms on / 50 ms off (a deliberate "long on" blink)
-    //   no host link   -> 900 ms on / 50 off / 50 on / 50 off (two quick off
-    //                     flashes: recording, but nothing is listening)
+    // It used to be "solid on while recording over USB", which is the same thing the
+    // LED shows when merely connected - so there was no way to tell whether a
+    // recording had actually started. Three 50 ms pulses followed by 950 ms of
+    // darkness is unmistakable and reads the same on every link.
+    //
+    //   recording          -> 3 x (50 ms on, 50 ms off), then 950 ms off
+    //   USB link           -> solid on
+    //   Bluetooth link     -> 950 ms on / 50 ms off
+    //   no host link       -> fast blink
     if (sdRecording) {
-      const uint8_t phase = btModeActive ? 1 : 0;
-      if (hostLinkMode == HOST_LINK_USB) {
+      for (int pulse = 0; pulse < 3; ++pulse) {
         digitalWrite(PIN_STATUS_LED, HIGH);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        continue;
+        vTaskDelay(pdMS_TO_TICKS(RECORD_LED_PULSE_ON_MS));
+        digitalWrite(PIN_STATUS_LED, LOW);
+        vTaskDelay(pdMS_TO_TICKS(RECORD_LED_PULSE_OFF_MS));
       }
-      if (phase == 1) {
-        digitalWrite(PIN_STATUS_LED, HIGH);
-        vTaskDelay(pdMS_TO_TICKS(950));
-        digitalWrite(PIN_STATUS_LED, LOW);
-        vTaskDelay(pdMS_TO_TICKS(50));
-      } else {
-        digitalWrite(PIN_STATUS_LED, HIGH);
-        vTaskDelay(pdMS_TO_TICKS(900));
-        digitalWrite(PIN_STATUS_LED, LOW);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        digitalWrite(PIN_STATUS_LED, HIGH);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        digitalWrite(PIN_STATUS_LED, LOW);
-        vTaskDelay(pdMS_TO_TICKS(50));
-      }
+      digitalWrite(PIN_STATUS_LED, LOW);
+      vTaskDelay(pdMS_TO_TICKS(RECORD_LED_GAP_MS));
+      continue;
+    }
+
+    if (hostLinkMode == HOST_LINK_USB) {
+      digitalWrite(PIN_STATUS_LED, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
 
@@ -811,6 +835,7 @@ static void streamingTask(void* parameter);
 static void sdWriterTask(void* parameter);
 static void lis3dhTask(void* parameter);
 static void bringUpBluetooth();
+static bool setBluetoothEnabled(bool enabled);
 static void IRAM_ATTR adsDrdyIsr0();
 static void IRAM_ATTR adsDrdyIsr1();
 
@@ -1159,6 +1184,113 @@ static void btTextRingAdvance(size_t count) {
   portEXIT_CRITICAL(&btRingLock);
 }
 
+// ---------------------------------------------------------------------------
+// USB transmit ring: the same idea as the Bluetooth ring, for the cable.
+//
+// The USB side used to be written inline by the acquisition task. At 8 k packets/s
+// that is 8 k UART writes a second, each with its own driver bookkeeping, all of it
+// charged to the task that has 250 us between conversions. Queueing moves that cost
+// to a task that has nothing else to do.
+// ---------------------------------------------------------------------------
+static constexpr size_t USB_TX_RING_BYTES = 8192;
+// Big enough that a write fills the UART FIFO in few calls; the driver still bounds
+// the call at what it can take.
+static constexpr size_t USB_FLUSH_CHUNK = 1024;
+static uint8_t* usbRing = nullptr;
+static size_t usbRingSize = 0;
+static volatile size_t usbHead = 0;
+static volatile size_t usbTail = 0;
+static portMUX_TYPE usbRingLock = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t usbPacketsQueued = 0;
+static volatile uint32_t usbPacketsDropped = 0;
+static volatile size_t usbRingPeak = 0;
+
+static size_t usbRingUsedLocked() {
+  return (usbHead >= usbTail) ? (usbHead - usbTail)
+                              : (usbRingSize - usbTail + usbHead);
+}
+
+// Safe from any task: the two indices are read under the same lock that moves them,
+// so a diagnostic can never report a fill that never existed.
+static size_t usbRingUsedBytes() {
+  if (usbRing == nullptr) {
+    return 0;
+  }
+  portENTER_CRITICAL(&usbRingLock);
+  const size_t used = usbRingUsedLocked();
+  portEXIT_CRITICAL(&usbRingLock);
+  return used;
+}
+
+static bool usbQueuePacket(const uint8_t* packet, size_t length) {
+  if (usbRing == nullptr || length == 0 || length >= usbRingSize) {
+    return false;
+  }
+  bool queued = false;
+  portENTER_CRITICAL(&usbRingLock);
+  const size_t used = usbRingUsedLocked();
+  if (usbRingSize - used - 1 >= length) {
+    const size_t first = min(length, usbRingSize - usbHead);
+    memcpy(usbRing + usbHead, packet, first);
+    if (first < length) {
+      memcpy(usbRing, packet + first, length - first);
+    }
+    usbHead = (usbHead + length) % usbRingSize;
+    queued = true;
+    const size_t nowUsed = usbRingUsedLocked();
+    if (nowUsed > usbRingPeak) {
+      usbRingPeak = nowUsed;
+    }
+  }
+  portEXIT_CRITICAL(&usbRingLock);
+  if (queued) {
+    usbPacketsQueued++;
+  } else {
+    // Dropping is better than blocking the acquisition task; the host sees the gap
+    // in the sample counter and the counter here says how much was lost.
+    usbPacketsDropped++;
+  }
+  return queued;
+}
+
+// Drains the ring to the UART. Never on the acquisition core at a high priority:
+// its job is to keep the UART full, not to be timely.
+static void usbFlushTask(void* parameter) {
+  (void)parameter;
+  uint8_t chunk[USB_FLUSH_CHUNK];
+  for (;;) {
+    size_t taken = 0;
+    portENTER_CRITICAL(&usbRingLock);
+    const size_t used = usbRingUsedLocked();
+    taken = min(used, sizeof(chunk));
+    if (taken > 0) {
+      const size_t first = min(taken, usbRingSize - usbTail);
+      memcpy(chunk, usbRing + usbTail, first);
+      if (first < taken) {
+        memcpy(chunk + first, usbRing, taken - first);
+      }
+    }
+    portEXIT_CRITICAL(&usbRingLock);
+
+    if (taken == 0) {
+      vTaskDelay(1);
+      continue;
+    }
+    // Written in one call; the driver blocks only until the FIFO has room, and this
+    // task has nothing else to do while it waits.
+    const size_t written = usbHostPort.write(chunk, taken);
+    if (written == taken) {
+      portENTER_CRITICAL(&usbRingLock);
+      usbTail = (usbTail + taken) % usbRingSize;
+      portEXIT_CRITICAL(&usbRingLock);
+    } else {
+      // Partial or refused: keep the bytes and retry, so a gap in the stream only
+      // ever comes from the ring actually overflowing.
+      vTaskDelay(1);
+    }
+  }
+}
+
 // Mirrors the stream into the radio ring. Never blocks: if the ring is full the
 // oldest packet is dropped and counted, because stalling here would cost a
 // conversion on the ADS1299 side.
@@ -1203,29 +1335,54 @@ class HostLink : public Stream {
       return 0;
     }
     if (btStreamToRadio) {
-      if (size == 33 && buffer[0] == PACKET_START_BYTE) {
+      if (isDataPacket(buffer, size)) {
         btQueuePacket(buffer, size);
       } else {
         btQueueText(reinterpret_cast<const char*>(buffer), size);
       }
     }
-    // The USB port is mirrored unconditionally, without ever blocking: if the
-    // UART buffer cannot take the whole frame the copy is skipped and the packet
-    // counter shows the gap. Replying to both transports is deliberate - the
-    // cable being silent must never be the reason a reply disappears.
+    // Sample packets are handed to the flush task instead of written here.
+    //
+    // Writing them inline put the UART - and the USB stack behind it - on the
+    // acquisition task's critical path. At 4 kSPS the budget between conversions is
+    // 250 us and two 33-byte writes plus their driver overhead were spent inside it,
+    // which is exactly the pressure that made the SPI read occasionally overrun.
+    // Queueing is a memcpy and a counter bump; the flush task does the writing at a
+    // priority where taking longer costs nothing.
+    if (isDataPacket(buffer, size) && usbQueuePacket(buffer, size)) {
+      return size;
+    }
+    // Everything else - replies, diagnostics, and any packet the ring could not take -
+    // is written directly. A reply is rare and must never be delayed behind data.
     if (usbHostPort.availableForWrite() >= static_cast<int>(size)) {
       usbHostPort.write(buffer, size);
     }
     return size;
   }
 
+  // A run of one or more 33-byte sample frames. Detecting it by the start byte alone
+  // would also catch a text line that happens to begin with 0xA0, and requiring
+  // exactly 33 bytes would miss the batched pair a conversion produces.
+  static bool isDataPacket(const uint8_t* buffer, size_t size) {
+    return size >= 33 && (size % 33) == 0 && buffer[0] == PACKET_START_BYTE;
+  }
+
   int availableForWrite() override {
-    // Report headroom whenever any transport can take the data, so the
-    // acquisition task never drops a packet that the radio could have carried.
-    if (btStreamToRadio && btHasClient()) {
-      return max(usbHostPort.availableForWrite(), static_cast<int>(BT_FLUSH_CHUNK));
+    // Report the ring's headroom, not the UART's. The UART is drained by the flush
+    // task, so its instantaneous fullness says nothing about whether a packet can be
+    // accepted - and testing it here would drop packets the ring has room for, which
+    // is the opposite of what the ring exists to prevent.
+    int headroom = 0;
+    if (usbRing != nullptr) {
+      const size_t used = usbRingUsedBytes();
+      headroom = static_cast<int>(usbRingSize > used ? usbRingSize - used - 1 : 0);
+    } else {
+      headroom = usbHostPort.availableForWrite();
     }
-    return usbHostPort.availableForWrite();
+    if (btStreamToRadio && btHasClient()) {
+      return max(headroom, static_cast<int>(BT_FLUSH_CHUNK));
+    }
+    return headroom;
   }
 
   int available() override {
@@ -1409,7 +1566,13 @@ static bool readLis3dhAuxData(int16_t out[3]) {
   return true;
 }
 
+static bool sdProbed = false;
+
 static bool bringUpSdCard() {
+  if (sdProbed) {
+    return sdPresent;
+  }
+  sdProbed = true;
   // CS is driven high before the bus is configured, so the card sees a defined
   // deselect from the first clock edge. The ESP32's GPIO15 also has its internal
   // pull-up active at reset, which keeps CS high through the whole boot.
@@ -1424,18 +1587,23 @@ static bool bringUpSdCard() {
   // input path is untouched.
   gpio_set_pull_mode(static_cast<gpio_num_t>(PIN_SD_MISO), GPIO_PULLUP_ONLY);
 
-  sdSpiClockActive = SD_SPI_CLOCK_HZ;
-  sdPresent = SD.begin(PIN_SD_CS, sdSpi, SD_SPI_CLOCK_HZ);
-  if (!sdPresent) {
-    // A slow or unbuffered card can refuse the first init at 10 MHz. Falling back
-    // is much better than reporting "no card": the recording still works, just at
-    // the library default.
-    sdPresent = SD.begin(PIN_SD_CS, sdSpi, SD_SPI_CLOCK_FALLBACK_HZ);
+  // Try fastest first and step down. Each write is one SPI transaction that the
+  // acquisition task has to share the CPU with, so a faster bus is a shorter stall
+  // and a smaller sample queue - but a card that cannot take the clock must still
+  // work, so the chain falls back rather than reporting "no card".
+  static const uint32_t kClockChain[] = {SD_SPI_CLOCK_HZ, SD_SPI_CLOCK_FALLBACK_HZ,
+                                         SD_SPI_CLOCK_MINIMUM_HZ};
+  sdPresent = false;
+  for (uint32_t candidate : kClockChain) {
+    sdPresent = SD.begin(PIN_SD_CS, sdSpi, candidate);
     if (sdPresent) {
-      sdSpiClockActive = SD_SPI_CLOCK_FALLBACK_HZ;
-      usbHostPort.printf("[SD] card did not initialise at %lu kHz, using %lu kHz\n",
-                         static_cast<unsigned long>(SD_SPI_CLOCK_HZ / 1000),
-                         static_cast<unsigned long>(SD_SPI_CLOCK_FALLBACK_HZ / 1000));
+      sdSpiClockActive = candidate;
+      if (candidate != SD_SPI_CLOCK_HZ) {
+        usbHostPort.printf("[SD] card refused %lu kHz, using %lu kHz\n",
+                           static_cast<unsigned long>(SD_SPI_CLOCK_HZ / 1000),
+                           static_cast<unsigned long>(candidate / 1000));
+      }
+      break;
     }
   }
   if (sdPresent) {
@@ -1581,6 +1749,9 @@ static void sdFlushWriteBuffer() {
 
 static void writeSampleToSd(const SdSample& sample) {
   if (sdMutex == nullptr || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    // The lock is held by the acquisition-side flush or by the close path. Count it:
+    // a sample that silently disappears is worse than one that shows up in DROPPED.
+    sdSamplesDropped++;
     return;
   }
 
@@ -1668,16 +1839,70 @@ static void writeSampleToSd(const SdSample& sample) {
   xSemaphoreGive(sdMutex);
 }
 
-// Creates the sample queue on demand. Doing it lazily is what keeps ~32 kB of heap
-// available for Bluedroid in the common case where no card is inserted: a starved
-// heap does not fail loudly, it makes esp_spp_write() refuse and the link carry
-// nothing, which looks like a broken radio.
+// Creates the sample queue on demand, sized to what the heap can actually spare.
+//
+// This board has to fit three consumers in ~228 kB of heap: Bluedroid (measured at
+// 152 kB with a client connected), the Bluetooth transmit ring, and this queue.
+// Allocating a fixed 512 entries and hoping is what made "Bluetooth and SD at the
+// same time" fail - 32 kB simply does not exist once the radio is up.
+//
+// The reserve is a *working margin only*. An earlier version also reserved
+// BLUEDROID_NEED_BYTES here, which was wrong twice over: `bringUpBluetooth()` runs
+// in setup(), so the radio's footprint is already missing from getFreeHeap() by the
+// time this runs, and reserving it again demanded ~165 kB free on a board that has
+// 35-40 kB while streaming. The result was that the queue could never be allocated
+// and every card recording stopped after its header with "not enough free memory".
+// The only phase that must reserve Bluedroid is the transmit ring, which is
+// allocated *before* the radio comes up (see BT_HEAP_RESERVE_BYTES in setup()).
+static constexpr size_t BLUEDROID_NEED_BYTES = 152744;  // measured, client connected
+static constexpr size_t SD_HEAP_MARGIN_BYTES = 12 * 1024;
+// Headroom kept free once the queue exists: the radio mallocs on connect and
+// disconnect, so it is given more room while it is running than when it is stopped.
+static constexpr size_t SD_QUEUE_MARGIN_RADIO = 10 * 1024;
+static constexpr size_t SD_QUEUE_MARGIN_IDLE = 6 * 1024;
+// Below this the queue cannot cover even one card transaction, so recording is
+// refused rather than started with a buffer that is certain to drop samples.
+static constexpr int SD_QUEUE_MIN_LENGTH = 32;
+
 static bool ensureSdQueue() {
   if (sdQueue != nullptr) {
     return true;
   }
-  sdQueue = xQueueCreate(SD_QUEUE_LENGTH, sizeof(SdSample));
-  return sdQueue != nullptr;
+  // Largest first. A shorter queue costs latency headroom, not correctness: it only
+  // has to cover one card stall, which is tens of milliseconds.
+  static const int kQueueLengths[] = {SD_QUEUE_LENGTH, 384, 256, 192, 128, 96, 64,
+                                      SD_QUEUE_MIN_LENGTH};
+  const size_t margin = btStackReady ? SD_QUEUE_MARGIN_RADIO : SD_QUEUE_MARGIN_IDLE;
+  const size_t freeNow = ESP.getFreeHeap();
+  // xQueueCreate wants one contiguous block, so the *largest* free block decides
+  // success, not the total: a fragmented heap reports plenty of free bytes and still
+  // refuses a 36 kB allocation.
+  const size_t largestNow = ESP.getMaxAllocHeap();
+  const size_t available = freeNow > margin ? freeNow - margin : 0;
+  for (int length : kQueueLengths) {
+    if (length > SD_QUEUE_LENGTH) {
+      continue;
+    }
+    // Queue control block and per-entry overhead, rounded up generously.
+    const size_t bytes = static_cast<size_t>(length) * sizeof(SdSample) + 128;
+    if (bytes > available || bytes > largestNow) {
+      continue;
+    }
+    sdQueue = xQueueCreate(static_cast<UBaseType_t>(length), sizeof(SdSample));
+    if (sdQueue != nullptr) {
+      usbHostPort.printf("[SD] sample queue %d entries (%u B), heap %u B (largest block %u B), "
+                         "margin %u B\n",
+                         length, static_cast<unsigned>(bytes), static_cast<unsigned>(freeNow),
+                         static_cast<unsigned>(largestNow), static_cast<unsigned>(margin));
+      return true;
+    }
+  }
+  usbHostPort.printf("[SD] no room for a sample queue: heap %u B, largest block %u B, "
+                     "margin %u B, smallest queue %u B\n",
+                     static_cast<unsigned>(freeNow), static_cast<unsigned>(largestNow),
+                     static_cast<unsigned>(margin),
+                     static_cast<unsigned>(SD_QUEUE_MIN_LENGTH * sizeof(SdSample) + 128));
+  return false;
 }
 
 static void releaseSdQueue() {
@@ -1782,69 +2007,100 @@ static int32_t sdGainScalar(uint8_t channel) {
 // read an SD file exactly like a live one - which is what makes the two
 // recordings comparable.
 //
-// Every line is built by writing the parts straight to the file rather than into
-// a fixed buffer. The previous version formatted the channel-name row into a
-// 224-byte buffer and then memcpy'd 68 more bytes into it: with 12 channels that
-// overflowed by 13 bytes, smashed the stack and panicked (reset reason 4), which
-// is why the file was created but stayed empty.
+// The whole header is formatted into one RAM buffer and handed to the card in a
+// single write. Writing it with ~60 individual print() calls meant ~60 VFS calls,
+// each its own transaction on the SPI bus, before a single sample could be queued.
+// A fixed buffer is safe here (unlike the earlier bug, which formatted into a
+// 224-byte buffer and then copied 68 more bytes into it past the end): the size is
+// derived from the channel count and snprintf cannot write past its limit.
 static void writeSdHeader(File& file, uint32_t rateHz, uint32_t decimation) {
-  file.print("%OpenBCI Raw EXG Data\r\n");
-  file.print("%Number of channels = ");
-  file.print(static_cast<unsigned>(sdRecordedCount));
-  file.print("\r\n");
-  file.print("%Sample Rate = ");
-  file.print(static_cast<unsigned long>(rateHz));
-  file.print(" Hz\r\n");
-  file.print("%Session = ");
-  file.print(sdSessionName);
-  file.print("\r\n");
-  file.print("%Data Format = EXG channels in microvolts, accelerometer in g, timestamp in seconds\r\n");
-  file.print("%Source = SD card (ESP32 internal recording)\r\n");
-  file.print("%Decimation = /");
-  file.print(static_cast<unsigned long>(decimation));
-  file.print("\r\n");
-  file.print("%Started = ");
-  file.print(static_cast<unsigned long>(millis()));
-  file.print(" ms since boot\r\n");
+  static constexpr size_t kHeaderBytes = 1024 + 16 * SD_SESSION_NAME_MAX;
+  char* buffer = static_cast<char*>(malloc(kHeaderBytes));
+  if (buffer == nullptr) {
+    return;
+  }
+  char* cursor = buffer;
+  char* const end = buffer + kHeaderBytes;
+  const auto add = [&](const char* fmt, ...) {
+    if (cursor >= end - 1) {
+      return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    const int written = vsnprintf(cursor, static_cast<size_t>(end - cursor), fmt, args);
+    va_end(args);
+    if (written > 0) {
+      cursor += (static_cast<size_t>(written) < static_cast<size_t>(end - cursor))
+                    ? static_cast<size_t>(written)
+                    : static_cast<size_t>(end - cursor) - 1;
+    }
+  };
+
+  add("%%OpenBCI Raw EXG Data\r\n");
+  add("%%Number of channels = %u\r\n", static_cast<unsigned>(sdRecordedCount));
+  add("%%Sample Rate = %lu Hz\r\n", static_cast<unsigned long>(rateHz));
+  add("%%Session = %s\r\n", sdSessionName);
+  add("%%Data Format = EXG channels in microvolts, accelerometer in g, timestamp in seconds\r\n");
+  add("%%Source = SD card (ESP32 internal recording)\r\n");
+  add("%%Decimation = /%lu\r\n", static_cast<unsigned long>(decimation));
+  add("%%Started = %lu ms since boot\r\n", static_cast<unsigned long>(millis()));
 
   // Channel map and gains: the analyzer needs both to know which physical input
   // each column came from and how to interpret the accelerometer columns.
-  file.print("%Channel Map = ");
+  add("%%Channel Map = ");
   for (uint8_t i = 0; i < sdRecordedCount; ++i) {
-    if (i > 0) {
-      file.print(',');
-    }
-    file.print(static_cast<unsigned>(sdRecordedChannels[i] + 1));
+    add(i > 0 ? ",%u" : "%u", static_cast<unsigned>(sdRecordedChannels[i] + 1));
   }
-  file.print("\r\n");
-
-  file.print("%Board Channel Gains = ");
+  add("\r\n");
+  add("%%Board Channel Gains = ");
   for (uint8_t i = 0; i < sdRecordedCount; ++i) {
-    if (i > 0) {
-      file.print(',');
-    }
-    file.print(static_cast<long>(sdGainScalar(sdRecordedChannels[i])));
+    add(i > 0 ? ",%ld" : "%ld", static_cast<long>(sdGainScalar(sdRecordedChannels[i])));
   }
-  file.print("\r\n");
-
-  file.print("%Reference ADS1 = ");
-  file.print(referenceModeName(chipReferenceMode[0]));
-  file.print("\r\n");
-  file.print("%Reference ADS2 = ");
-  file.print(referenceModeName(chipReferenceMode[1]));
-  file.print("\r\n");
+  add("\r\n");
+  add("%%Reference ADS1 = %s\r\n", referenceModeName(chipReferenceMode[0]));
+  add("%%Reference ADS2 = %s\r\n", referenceModeName(chipReferenceMode[1]));
 
   // Channel-name row, exactly as an OpenBCI file has it, then the accelerometer
   // and bookkeeping columns.
   for (uint8_t i = 0; i < sdRecordedCount; ++i) {
-    if (i > 0) {
-      file.print(',');
-    }
-    file.print("EXG Channel ");
-    file.print(static_cast<unsigned>(i));
+    add(i > 0 ? ",EXG Channel %u" : "EXG Channel %u", static_cast<unsigned>(i));
   }
-  file.print(",Accel Channel 0,Accel Channel 1,Accel Channel 2,Marker,Timestamp\r\n");
+  add(",Accel Channel 0,Accel Channel 1,Accel Channel 2,Marker,Timestamp\r\n");
+
+  file.write(reinterpret_cast<const uint8_t*>(buffer), static_cast<size_t>(cursor - buffer));
   file.flush();
+  free(buffer);
+}
+
+// Frees the radio's ~150 kB when it is holding memory for nothing, so a card
+// recording can start on a board that would otherwise refuse the queue.
+//
+// The conditions are deliberately narrow: no client may be attached (so no live link
+// is dropped) and the host must not be talking over the radio (so the command channel
+// survives). The cable, or no host at all, is fine - in both cases the radio's memory
+// is doing nothing. Any other case returns false and the caller reports the memory
+// failure instead of silently killing Bluetooth.
+static bool reclaimRadioForSd() {
+  if (!btStackReady) {
+    return false;
+  }
+  if (btHasClient()) {
+    return false;
+  }
+  if (hostLinkMode == HOST_LINK_BT) {
+    return false;
+  }
+  const size_t before = ESP.getFreeHeap();
+  usbHostPort.printf("[SD] reclaiming the idle Bluetooth stack for the sample queue "
+                     "(heap %u B)\n",
+                     static_cast<unsigned>(before));
+  if (!setBluetoothEnabled(false)) {
+    return false;
+  }
+  usbHostPort.printf("[SD] Bluetooth stopped, heap %u B (+%d B)\n",
+                     static_cast<unsigned>(ESP.getFreeHeap()),
+                     static_cast<int>(ESP.getFreeHeap()) - static_cast<int>(before));
+  return true;
 }
 
 static bool openSdFile(uint32_t durationMs, const char* label) {
@@ -1862,6 +2118,20 @@ static bool openSdFile(uint32_t durationMs, const char* label) {
 
   if (!makeSdRecordingName(sdFileName, sizeof(sdFileName))) {
     emitFailure("no SD filename available");
+    return false;
+  }
+
+  // Reserve the sample queue *before* the file is created, so a recording that
+  // cannot accept samples never leaves an empty header-only file on the card. If the
+  // heap cannot spare even a minimal queue, the idle radio is asked for its ~150 kB
+  // first - but only when it has no client and the host is on the cable.
+  if (!ensureSdQueue() && reclaimRadioForSd()) {
+    ensureSdQueue();
+  }
+  if (sdQueue == nullptr) {
+    sdFileName[0] = '\0';
+    emitFailure("not enough free memory for the SD sample queue - close Bluetooth or "
+                "reduce the transmit buffer, then try again");
     return false;
   }
 
@@ -1913,18 +2183,6 @@ static bool openSdFile(uint32_t durationMs, const char* label) {
   }
   sdBytesWritten = static_cast<uint32_t>(sdFile.position());
   sdHeaderWritten = true;
-  if (!ensureSdQueue()) {
-    // Never start a recording that cannot accept a single sample: the file would
-    // open, gain a header and stay empty.
-    sdFile.close();
-    sdFileName[0] = '\0';
-    if (sdMutex != nullptr) {
-      xSemaphoreGive(sdMutex);
-    }
-    emitFailure("not enough free memory for the SD sample queue - close Bluetooth or "
-                "reduce the transmit buffer, then try again");
-    return false;
-  }
   sdRecording = true;
   sdRecordStartMs = millis();
   sdRecordDurationMs = durationMs;
@@ -1962,9 +2220,12 @@ static void closeSdFile() {
     xSemaphoreGive(sdMutex);
   }
   // Nothing can queue a sample now that sdRecording is false, so the queue is
-  // released as soon as the writer task next sees it idle: the 32 kB it returns is
-  // what makes a Bluetooth benchmark possible straight after a recording.
-  sdQueueReleasePending = true;
+  // released as soon as the writer task next sees it idle - but only if the card has
+  // gone away. Keeping it while the card is present is what lets a second recording
+  // start again, because by then Bluetooth owns the heap it would need.
+  if (!sdPresent) {
+    sdQueueReleasePending = true;
+  }
   usbHostPort.printf("[SD] closed, %u B heap free\n", static_cast<unsigned>(ESP.getFreeHeap()));
 }
 
@@ -2292,32 +2553,40 @@ static void emitSdStatus(const char* event) {
   char nameField[SD_SESSION_NAME_MAX + 1];
   statusSafeName(sdSessionName, nameField, sizeof(nameField));
 
-  char line[448];
+  char line[512];
+  const unsigned queueCapacity =
+      sdQueue != nullptr
+          ? static_cast<unsigned>(uxQueueSpacesAvailable(sdQueue) + uxQueueMessagesWaiting(sdQueue))
+          : 0u;
   snprintf(line, sizeof(line),
            "[SD] EVENT=%s PRESENT=%d RECORDING=%d FILE=%s NAME=%s CHANNELS=%u RATE=%lu "
-           "TOTAL_MB=%lu FREE_MB=%lu FREE_BYTES=%lu EST_SEC=%lu SAMPLES=%lu DROPPED=%lu BYTES=%lu "
-           "QUEUED=%u QPEAK=%u QBUF=%u BUFKB=%u WRITE_MS=%lu RATE_KB=%lu SPIKHZ=%lu HEAP=%u DONE=1\n",
+           "TOTAL_MB=%lu FREE_MB=%lu FREE_BYTES=%llu EST_SEC=%lu SAMPLES=%lu DROPPED=%lu BYTES=%lu "
+           "QUEUED=%u QPEAK=%u QCAP=%u QBUF=%u BUFKB=%u WRITE_MS=%lu RATE_KB=%lu SPIKHZ=%lu "
+           "HEAP=%u HEAPBLK=%u DONE=1\n",
            (event != nullptr && event[0] != '\0') ? event : "-", present ? 1 : 0, sdRecording ? 1 : 0,
            sdFileName[0] != '\0' ? sdFileName : "-", nameField,
            static_cast<unsigned>(sdRecordedCount), static_cast<unsigned long>(rate),
            static_cast<unsigned long>(totalMb), static_cast<unsigned long>(freeMb),
-           static_cast<unsigned long>(freeBytes > 0xFFFFFFFFULL ? 0xFFFFFFFFULL : freeBytes),
+           // 64-bit: a 16 GB card's free space does not fit in 32 bits, and clamping
+           // it to 0xFFFFFFFF read like an error in the log.
+           static_cast<unsigned long long>(freeBytes),
            static_cast<unsigned long>(sdEstimatedSeconds(freeBytes)),
            static_cast<unsigned long>(sdSamplesWritten), static_cast<unsigned long>(sdSamplesDropped),
            static_cast<unsigned long>(sdBytesWritten),
            // How much of the RAM buffering is in use. QUEUED is the sample queue
-           // right now, QPEAK its high-water mark: a peak near the capacity means
-           // the card cannot keep up with the sample rate, not that the buffer is
-           // too small. WRITE_MS is the longest single card transaction, i.e. the
-           // stall the Bluetooth flush task had to preempt.
+           // right now, QPEAK its high-water mark and QCAP its capacity: a peak near
+           // the capacity means the card cannot keep up with the sample rate, not
+           // that the buffer is too small. WRITE_MS is the longest single card
+           // transaction, i.e. the stall the Bluetooth flush task had to preempt.
            static_cast<unsigned>(sdQueue != nullptr ? uxQueueMessagesWaiting(sdQueue) : 0),
-           static_cast<unsigned>(sdQueuePeak),
+           static_cast<unsigned>(sdQueuePeak), queueCapacity,
            static_cast<unsigned>(sdWriteBufferLength),
            static_cast<unsigned>(SD_WRITE_BUFFER_BYTES / 1024),
            static_cast<unsigned long>(sdMaxFlushMs),
            static_cast<unsigned long>(sdBytesPerSecond / 1024UL),
            static_cast<unsigned long>(sdSpiClockActive / 1000UL),
-           static_cast<unsigned>(ESP.getFreeHeap()));
+           static_cast<unsigned>(ESP.getFreeHeap()),
+           static_cast<unsigned>(ESP.getMaxAllocHeap()));
   Serial.print(line);
 }
 
@@ -2389,44 +2658,123 @@ static void ensureStreamingForHost() {
 // the configuration that the live window stored on the card, applies it, and then
 // starts recording - so the physical button works standalone, without a host.
 static void toggleSdRecordingFromButton() {
+  const uint32_t now = millis();
   if (sdRecording) {
+    // Starting and immediately stopping leaves an empty file, which is worse than not
+    // recording. A stop before the minimum run time is refused and says so, rather
+    // than being silently swallowed - otherwise the button looks broken.
+    const uint32_t elapsed = now - sdRecordStartMs;
+    if (sdRecordStartMs != 0 && elapsed < RECORD_BUTTON_MIN_RUN_MS) {
+      char msg[96];
+      snprintf(msg, sizeof(msg), "record button: %lu ms into the recording, holding for %lu ms",
+               static_cast<unsigned long>(elapsed),
+               static_cast<unsigned long>(RECORD_BUTTON_MIN_RUN_MS - elapsed));
+      emitFailure(msg);
+      usbHostPort.printf("[BTN] stop ignored, %lu ms of %lu ms minimum\n",
+                         static_cast<unsigned long>(elapsed),
+                         static_cast<unsigned long>(RECORD_BUTTON_MIN_RUN_MS));
+      return;
+    }
     stopSdRecordingFromBoard("button");
+    recordButtonLastActionMs = now;
     return;
   }
   if (!sdPresent) {
     emitFailure("record button pressed but no SD card is present");
+    usbHostPort.println("[BTN] ignored: no card");
     return;
   }
   // Apply the stored configuration first; without one, record with whatever is
   // already programmed so the button is never dead.
   loadSdConfiguration(true);
   startSdRecordingFromBoard("button");
+  recordButtonLastActionMs = millis();
 }
 
-// RISING-edge interrupt: the pin is pulled down, so a press drives it high and
-// fires exactly one interrupt per press. The ISR only timestamps the edge;
-// debouncing and the actual work stay out of interrupt context.
-static void IRAM_ATTR recordButtonIsr() {
+// True while the record button must not start or stop anything.
+static bool recordButtonLockedOut() {
+  if (sdRecording) {
+    return sdRecordStartMs != 0 && (millis() - sdRecordStartMs) < RECORD_BUTTON_MIN_RUN_MS;
+  }
+  return recordButtonLastActionMs != 0 &&
+         (millis() - recordButtonLastActionMs) < RECORD_BUTTON_MIN_RUN_MS;
+}
+
+// Record button (PIN_RECORD_BUTTON, GPIO35 on this board).
+//
+// **GPIO35 has no internal pull resistors at all.** GPIO34..39 are input-only and the
+// SoC does not provide pulls for them, so `INPUT_PULLDOWN` silently does nothing and
+// the pin floats. That is why the button appeared dead: with no defined resting level
+// there is no clean rising edge to interrupt on.
+//
+// So the pin is polled instead of edge-triggered, the resting level is learned at
+// boot, and the wiring is reported. Polling also works whatever external resistor is
+// fitted - the point is the *change*, not which level is "pressed".
+static uint8_t recordButtonIdleLevel = 0;
+static uint8_t recordButtonStableLevel = 0;
+static uint8_t recordButtonCandidateLevel = 0;
+static uint8_t recordButtonCandidateCount = 0;
+static uint32_t recordButtonLastPollMs = 0;
+static bool recordButtonLevelKnown = false;
+
+static void pollRecordButton() {
   const uint32_t now = millis();
-  if (now - recordButtonLastEdgeMs < RECORD_BUTTON_DEBOUNCE_MS) {
+  if (now - recordButtonLastPollMs < RECORD_BUTTON_POLL_MS) {
     return;
   }
-  recordButtonLastEdgeMs = now;
+  recordButtonLastPollMs = now;
+
+  const uint8_t level = digitalRead(PIN_RECORD_BUTTON) != 0 ? 1 : 0;
+  if (!recordButtonLevelKnown) {
+    // First sample after boot is the resting level. A button held down at power-up
+    // therefore reads as "idle" until it is released and pressed again, which is the
+    // safe interpretation: nothing starts recording because a switch was left on.
+    recordButtonIdleLevel = level;
+    recordButtonStableLevel = level;
+    recordButtonCandidateLevel = level;
+    recordButtonCandidateCount = 0;
+    recordButtonLevelKnown = true;
+    return;
+  }
+
+  if (level != recordButtonCandidateLevel) {
+    recordButtonCandidateLevel = level;
+    recordButtonCandidateCount = 1;
+    return;
+  }
+  if (recordButtonCandidateCount < RECORD_BUTTON_DEBOUNCE_SAMPLES) {
+    recordButtonCandidateCount++;
+    return;
+  }
+  if (level == recordButtonStableLevel) {
+    return;
+  }
+  recordButtonStableLevel = level;
+  if (level == recordButtonIdleLevel) {
+    // Released again: a press is the transition *away* from idle and back, and the
+    // action is taken on the press so a held switch does not repeat.
+    return;
+  }
   recordButtonPressed = true;
 }
 
 static void beginRecordButton() {
-  // Internal pull-down, so a released button reads 0 and a pressed one reads 1.
-  // GPIO34..39 have no pull resistors active at reset, but they do have internal
-  // ones firmware can enable, so no external resistor is required. Without the
-  // pull-down the pin floats and a rising edge may never be seen at all.
+  // A pull is requested even though the SoC ignores it on this pin: if the board is
+  // ever re-spun onto a pin that has one, this is already correct.
   pinMode(PIN_RECORD_BUTTON, INPUT_PULLDOWN);
-  attachInterrupt(digitalPinToInterrupt(PIN_RECORD_BUTTON), recordButtonIsr, RISING);
-  // A button already held at power-up produces no edge, so seed the flag from the
-  // pin state and let the main loop act on it.
-  if (digitalRead(PIN_RECORD_BUTTON) != 0) {
-    recordButtonPressed = true;
-  }
+  delayMicroseconds(200);
+  const uint8_t level = digitalRead(PIN_RECORD_BUTTON) != 0 ? 1 : 0;
+  recordButtonIdleLevel = level;
+  recordButtonStableLevel = level;
+  recordButtonCandidateLevel = level;
+  recordButtonCandidateCount = 0;
+  recordButtonLevelKnown = true;
+  recordButtonLastPollMs = millis();
+
+  usbHostPort.printf("[BTN] record button on GPIO%d, idle level %u%s\n", PIN_RECORD_BUTTON,
+                     static_cast<unsigned>(level),
+                     level == 0 ? "" : " (reads HIGH at rest - check the external pull)");
+  btLogEvent("btn idle=%u", static_cast<unsigned>(level));
 }
 
 static const char* resetReasonName(esp_reset_reason_t reason) {
@@ -2897,6 +3245,8 @@ static const char* const kChannelRegisterNames[8] = {"CH1SET", "CH2SET", "CH3SET
 // Programs every register of every linked converter from the cached state.
 // Called before each stream start so a half-applied configuration cannot be
 // streamed, and by the 'Y' repair command.
+static uint8_t repairDeviceRegisters(size_t deviceIndex);
+
 static void programAllDevices() {
   for (size_t i = 0; i < DEVICE_COUNT; ++i) {
     DeviceCtx& dev = devices[i];
@@ -2922,10 +3272,89 @@ static void programAllDevices() {
                             setting.biasInclude, srb2, false);
     }
   }
+
+  // Every configuration path funnels through here, so this is where a write that
+  // did not stick is caught and rewritten. Without it a marginal SCLK leaves the
+  // converter on a plausible but wrong configuration - a slower data rate, or a
+  // montage that reads as saturation - with nothing anywhere reporting an error.
+  // RREG is only legal outside RDATAC, hence the guard.
+  if (!streaming) {
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+      if (devices[i].linkOk) {
+        repairDeviceRegisters(i);
+      }
+    }
+  }
 }
 
 // Reads every register back and reports the ones that do not match. Returns the
 // number of problems so the caller can decide whether the state is usable.
+struct RegisterExpectation {
+  const char* name;
+  uint8_t address;
+  uint8_t value;
+};
+
+// The register state this firmware believes it has programmed. Shared by the check
+// and the repair so the two can never disagree about what "correct" means.
+static uint8_t buildRegisterExpectations(size_t deviceIndex, RegisterExpectation* out, uint8_t maxOut) {
+  DeviceCtx& dev = devices[deviceIndex];
+  const uint8_t config1 = expectedConfig1(deviceIndex);
+  const uint8_t bias = expectedBiasMask(deviceIndex);
+  const uint8_t misc1 = chipReferenceMode[deviceIndex] == REFERENCE_MODE_SRB1 ? 0x20 : 0x00;
+
+  uint8_t count = 0;
+  if (count >= maxOut) return count;
+  out[count++] = {"CONFIG1", CONFIG1, config1};
+  if (count >= maxOut) return count;
+  out[count++] = {"CONFIG2", CONFIG2, 0xC0};
+  if (count >= maxOut) return count;
+  out[count++] = {"CONFIG3", CONFIG3, 0xEC};
+  if (count >= maxOut) return count;
+  out[count++] = {"BIAS_SENSP", BIAS_SENSP, bias};
+  if (count >= maxOut) return count;
+  out[count++] = {"BIAS_SENSN", BIAS_SENSN, bias};
+  if (count >= maxOut) return count;
+  out[count++] = {"MISC1", MISC1, misc1};
+  for (uint8_t ch = 0; ch < dev.channelCount && count < maxOut; ++ch) {
+    const uint8_t real = static_cast<uint8_t>(dev.channelOffset + ch);
+    out[count++] = {kChannelRegisterNames[ch], static_cast<uint8_t>(CH1SET + ch),
+                    expectedChannelRegister(real)};
+  }
+  return count;
+}
+
+// Rewrites every register whose contents do not match. A WREG that is clocked
+// marginally lands a wrong value rather than nothing at all, so "write it once and
+// hope" is not enough: this is what makes a configuration actually stick, and it
+// costs nothing when everything already matches.
+static uint8_t repairDeviceRegisters(size_t deviceIndex) {
+  DeviceCtx& dev = devices[deviceIndex];
+  if (!dev.linkOk) {
+    return 0;
+  }
+  RegisterExpectation expectations[CONFIG4 + 1];
+  const uint8_t count = buildRegisterExpectations(deviceIndex, expectations, CONFIG4 + 1);
+
+  uint8_t remaining = 0;
+  for (uint8_t i = 0; i < count; ++i) {
+    const uint8_t actual = dev.ads->readRegister(expectations[i].address);
+    if (actual == expectations[i].value) {
+      continue;
+    }
+    if (dev.ads->writeRegisterVerified(expectations[i].address, expectations[i].value, 4)) {
+      Serial.printf("[CHK] REPAIRED DEV=%s REG=%s WAS=%02X NOW=%02X\n", dev.name,
+                    expectations[i].name, actual, expectations[i].value);
+    } else {
+      remaining++;
+      Serial.printf("[CHK] UNREPAIRABLE DEV=%s REG=%s WANT=%02X STUCK=%02X\n", dev.name,
+                    expectations[i].name, expectations[i].value,
+                    dev.ads->readRegister(expectations[i].address));
+    }
+  }
+  return remaining;
+}
+
 static uint8_t verifyDeviceRegisters(size_t deviceIndex) {
   DeviceCtx& dev = devices[deviceIndex];
   if (!dev.linkOk) {
@@ -2935,29 +3364,8 @@ static uint8_t verifyDeviceRegisters(size_t deviceIndex) {
   uint8_t regs[CONFIG4 + 1] = {0};
   dev.ads->readRegisters(0x00, CONFIG4 + 1, regs);
 
-  const uint8_t config1 = expectedConfig1(deviceIndex);
-  const uint8_t bias = expectedBiasMask(deviceIndex);
-  const uint8_t misc1 = chipReferenceMode[deviceIndex] == REFERENCE_MODE_SRB1 ? 0x20 : 0x00;
-
-  struct Expect {
-    const char* name;
-    uint8_t address;
-    uint8_t value;
-  };
-
-  Expect expectations[CONFIG4 + 1];
-  uint8_t count = 0;
-  expectations[count++] = {"CONFIG1", CONFIG1, config1};
-  expectations[count++] = {"CONFIG2", CONFIG2, 0xC0};
-  expectations[count++] = {"CONFIG3", CONFIG3, 0xEC};
-  expectations[count++] = {"BIAS_SENSP", BIAS_SENSP, bias};
-  expectations[count++] = {"BIAS_SENSN", BIAS_SENSN, bias};
-  expectations[count++] = {"MISC1", MISC1, misc1};
-  for (uint8_t ch = 0; ch < dev.channelCount && count < CONFIG4 + 1; ++ch) {
-    const uint8_t real = static_cast<uint8_t>(dev.channelOffset + ch);
-    expectations[count++] = {kChannelRegisterNames[ch], static_cast<uint8_t>(CH1SET + ch),
-                             expectedChannelRegister(real)};
-  }
+  RegisterExpectation expectations[CONFIG4 + 1];
+  const uint8_t count = buildRegisterExpectations(deviceIndex, expectations, CONFIG4 + 1);
 
   uint8_t problems = 0;
   for (uint8_t i = 0; i < count; ++i) {
@@ -3022,7 +3430,12 @@ static uint8_t repairAndVerify(const char* reason) {
       Serial.printf("[CHK] DEV=%s LINK=0 (not configured, check the SPI bus)\n", devices[i].name);
       continue;
     }
-    totalProblems += verifyDeviceRegisters(i);
+    // Verify, and rewrite anything that did not stick. The retry is what turns a
+    // marginal SCLK from "the settings are wrong" into a configuration that is
+    // actually applied; only a register that still refuses is reported.
+    const uint8_t stuck = repairDeviceRegisters(i);
+    const uint8_t remaining = verifyDeviceRegisters(i);
+    totalProblems += remaining > stuck ? remaining : stuck;
   }
 
   char reference[48];
@@ -3226,17 +3639,20 @@ static bool waitForDeviceDrdy(DeviceCtx& dev, uint32_t timeoutMs) {
 // section on the data output format). Anything else means the SPI read was
 // misaligned or the part was not in RDATAC, in which case the sample must be
 // discarded rather than published as a spike.
-static bool readDeviceFrame(DeviceCtx& dev, int32_t channels[TOTAL_ADS_CHANNELS]) {
+static bool readDeviceFrameLocked(DeviceCtx& dev, int32_t channels[TOTAL_ADS_CHANNELS]) {
   // A frame is only valid if no conversion boundary happened while the bytes
   // were being clocked out. Reading across a DRDY reload returns a bit-shifted
   // frame whose status nibble can still look valid, which is what produced
   // single-sample spikes on every channel of that converter.
+  //
+  // The caller must hold the shared SPI transaction (see beginSharedTransaction);
+  // this is the only way to keep both converters in one bus transaction.
   for (int attempt = 0; attempt < 2; ++attempt) {
     int32_t frame[8] = {0};
     uint32_t status = 0;
     const uint32_t drdyBefore = dev.drdyCount;
 
-    if (!dev.ads->readDataFrame(frame, status)) {
+    if (!dev.ads->readDataFrameLocked(frame, status)) {
       return false;
     }
 
@@ -3257,6 +3673,56 @@ static bool readDeviceFrame(DeviceCtx& dev, int32_t channels[TOTAL_ADS_CHANNELS]
   }
 
   return false;
+}
+
+// Reads every linked converter inside ONE bus transaction. Both devices share the
+// mutex, the SPISettings and the MISO line, so locking and re-applying the settings
+// twice per conversion was avoidable overhead on the critical path.
+static bool readAllDeviceFrames(int32_t fresh[TOTAL_ADS_CHANNELS], bool& anyLinked,
+                               bool& readFailed) {
+  anyLinked = false;
+  readFailed = false;
+  // Any instance can bracket the batch: the mutex and the SPI bus are file-static,
+  // and setSpiClock() is applied to every instance, so their settings are identical.
+  // Device 0 is used unconditionally to keep the lookup off the conversion path.
+  ADS1299* bus = devices[0].ads;
+
+  // Split the read into "waiting for the bus" and "using it". They have different
+  // causes - a mutex hold versus a slow transfer - and reporting one number for both
+  // made a 555 us outlier impossible to attribute.
+  const uint32_t lockStart = micros();
+  bus->beginSharedTransaction();
+  const uint32_t lockUs = micros() - lockStart;
+  spiLockLastUs = lockUs;
+  if (lockUs > spiLockMaxUs) {
+    spiLockMaxUs = lockUs;
+  }
+  for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+    if (!devices[i].linkOk) {
+      continue;
+    }
+    anyLinked = true;
+    if (readDeviceFrameLocked(devices[i], fresh)) {
+      devices[i].drdyPending = false;
+      devices[i].failedReads = 0;
+    } else {
+      readFailed = true;
+      // Holding the last value forever hides a dead converter: the packet
+      // counter keeps advancing, so the host sees a healthy stream made of a
+      // frozen sample. After a few misses publish zeros instead, which the
+      // recorder shows as "no data" and the analyzer sees as a flat line.
+      if (devices[i].failedReads < 0xFF) {
+        devices[i].failedReads++;
+      }
+      if (devices[i].failedReads > STALE_FRAME_LIMIT) {
+        for (uint8_t ch = 0; ch < devices[i].channelCount; ++ch) {
+          fresh[devices[i].channelOffset + ch] = 0;
+        }
+      }
+    }
+  }
+  bus->endSharedTransaction();
+  return true;
 }
 
 static void pack24be(int32_t value, uint8_t* out3) {
@@ -3733,21 +4199,32 @@ static void emitAcquisitionHealth() {
   lastMs = nowMs;
 
   const bool daisy = daisyActive;
-  // One packet per conversion in daisy mode carries one converter half, so the
-  // per-channel rate is half the packet rate; in 8-channel mode it is 1:1.
-  const double packetRate = 1000.0 * static_cast<double>(periodPackets) / static_cast<double>(elapsedMs);
-  const double channelRate = daisy ? packetRate / 2.0 : packetRate;
+  // ``publishedConversions`` counts conversions, and each one now emits one packet
+  // per converter. So the per-channel rate equals the conversion rate, and the
+  // packet rate is that times the number of converters. The earlier version halved
+  // the per-channel rate for daisy, which correctly described the old
+  // one-packet-per-conversion scheme and now under-reported both figures by 2x.
+  const uint8_t converters = daisy ? static_cast<uint8_t>(DEVICE_COUNT) : 1;
+  const double conversionRate =
+      1000.0 * static_cast<double>(periodPackets) / static_cast<double>(elapsedMs);
+  const double channelRate = conversionRate;
+  const double packetRate = conversionRate * converters;
   const double edgesPerSecond = 1000.0 * edges / static_cast<double>(elapsedMs);
 
-  char line[240];
+  char line[320];
   snprintf(line, sizeof(line),
            "#DX ch_rate=%.1f pkt_rate=%.1f drdy_s=%.1f pkts=%lu miss=%lu late=%lu gap_max_us=%lu corrupt=%lu "
-           "spi_us=%lu spi_max_us=%lu usb_free=%d bt_buf=%u core=%d prio=%u\n",
+           "spi_us=%lu spi_max_us=%lu spi_lock_us=%lu spi_lock_max_us=%lu usb_free=%d usb_q=%u usb_drop=%lu "
+           "bt_buf=%u core=%d prio=%u\n",
            channelRate, packetRate, edgesPerSecond, static_cast<unsigned long>(published),
            static_cast<unsigned long>(missedConversions), static_cast<unsigned long>(lateConversions),
            static_cast<unsigned long>(worstGapUs), static_cast<unsigned long>(corruptFrames),
            static_cast<unsigned long>(spiReadLastUs), static_cast<unsigned long>(spiReadMaxUs),
-           usbHostPort.availableForWrite(), static_cast<unsigned>(btRingUsedBytes()),
+           static_cast<unsigned long>(spiLockLastUs), static_cast<unsigned long>(spiLockMaxUs),
+           usbHostPort.availableForWrite(),
+           static_cast<unsigned>(usbRing != nullptr ? usbRingUsedBytes() : 0),
+           static_cast<unsigned long>(usbPacketsDropped),
+           static_cast<unsigned>(btRingUsedBytes()),
            xPortGetCoreID(), static_cast<unsigned>(uxTaskPriorityGet(nullptr)));
   const size_t length = strlen(line);
   if (usbHostPort.availableForWrite() >= static_cast<int>(length)) {
@@ -3877,50 +4354,69 @@ static void calibrateTouchKey() {
   touchThreshold = static_cast<uint16_t>(static_cast<float>(touchBaseline) * SZD_BT_TOUCH_TRIGGER_RATIO);
 }
 
-static void publishConversion(const int32_t fresh[TOTAL_ADS_CHANNELS], const int32_t previous[TOTAL_ADS_CHANNELS],
-                              bool havePrevious, uint32_t sequence) {
-  const bool boardSample = (sequence & 1) != 0;
-  const uint8_t packetIndex = static_cast<uint8_t>(sequence);
-
-  uint8_t packet[33];
-  packet[0] = PACKET_START_BYTE;
-  packet[1] = packetIndex;
-
-  uint8_t offset = 2;
-  for (uint8_t slot = 0; slot < WIRE_CHANNELS; ++slot) {
-    int32_t value = 0;
-
-    if (daisyActive) {
-      // Slots 1..6 carry the active converter, slots 7..8 stay zero.
-      if (slot < ADS_CHANNELS_PER_CHIP) {
-        const uint8_t real = boardSample ? slot : static_cast<uint8_t>(ADS_CHANNELS_PER_CHIP + slot);
-        value = havePrevious ? ((previous[real] + fresh[real]) / 2) : fresh[real];
-      }
-    } else {
-      if (slot < TOTAL_ADS_CHANNELS) {
-        value = fresh[slot];
-      }
-    }
-
-    pack24be(value, &packet[offset]);
-    offset += 3;
-  }
+// Emits the wire packets for one conversion.
+//
+// In Cyton+Daisy mode this sends ONE PACKET PER CONVERTER, back to back, so every
+// channel is published once per conversion. The alternative - one packet per
+// conversion alternating between the converters - halves every channel's rate, which
+// is what made "4000 SPS" behave like 2000 per channel and made the displayed rate
+// disagree with the rate the part was actually running at.
+//
+// The packet format is unchanged, so the decoder still separates the two by the
+// sample-counter parity: even carries converter 1, odd carries converter 2.
+static void publishConversion(const int32_t fresh[TOTAL_ADS_CHANNELS], const int32_t /*unused*/[TOTAL_ADS_CHANNELS],
+                              bool /*havePrevious*/, uint32_t sequence) {
+  const uint8_t converters = daisyActive ? static_cast<uint8_t>(DEVICE_COUNT) : 1;
 
   int16_t currentAux[3] = {0, 0, 0};
-  fillAuxPayload(packet, currentAux);
-  packet[32] = PACKET_END_STANDARD;
-  queueSampleForSd(packetIndex, fresh, currentAux);
-  publishedConversions++;
+  // One write for the whole conversion, not one per converter: the UART call is the
+  // expensive part and the two packets belong together anyway.
+  uint8_t batch[33 * 2];
+  uint8_t batchPackets = 0;
+  for (uint8_t chip = 0; chip < converters; ++chip) {
+    uint8_t* packet = &batch[batchPackets * 33];
+    packet[0] = PACKET_START_BYTE;
+    // The host separates the two converters by the sample-counter parity, and its
+    // convention is ODD = converter 1, EVEN = converter 2, with converter 1 arriving
+    // first. Emitting 2*sequence for converter 1 would put it on the even index and
+    // the host would hand it to the second converter's slots - and because it waits
+    // for the odd packet before combining, it would never publish a sample at all.
+    packet[1] = static_cast<uint8_t>(sequence * converters + chip + 1);
 
-  // Never block the acquisition task on the UART: a stalled host must not cost
-  // us a conversion. Dropping a packet is harmless because the GUI maps
-  // board/daisy by the sample-counter parity inside the packet.
-  if (Serial.availableForWrite() < static_cast<int>(sizeof(packet))) {
-    droppedPackets++;
-    return;
+    uint8_t offset = 2;
+    for (uint8_t slot = 0; slot < WIRE_CHANNELS; ++slot) {
+      int32_t value = 0;
+      if (daisyActive) {
+        // Slots 1..6 carry this converter's six inputs, slots 7..8 stay zero.
+        if (slot < ADS_CHANNELS_PER_CHIP) {
+          value = fresh[chip * ADS_CHANNELS_PER_CHIP + slot];
+        }
+      } else if (slot < TOTAL_ADS_CHANNELS) {
+        value = fresh[slot];
+      }
+      pack24be(value, &packet[offset]);
+      offset += 3;
+    }
+
+    fillAuxPayload(packet, currentAux);
+    packet[32] = PACKET_END_STANDARD;
+    batchPackets++;
   }
 
-  Serial.write(packet, sizeof(packet));
+  // Never block the acquisition task on the UART: a stalled host must not cost
+  // us a conversion. Dropping is harmless because the host resynchronises on the
+  // start byte and counts the gap.
+  const size_t batchBytes = static_cast<size_t>(batchPackets) * 33;
+  if (Serial.availableForWrite() < static_cast<int>(batchBytes)) {
+    droppedPackets++;
+  } else {
+    Serial.write(batch, batchBytes);
+  }
+
+  // One SD row per conversion, not per converter: the card stores the full channel
+  // set anyway.
+  queueSampleForSd(static_cast<uint8_t>(sequence), fresh, currentAux);
+  publishedConversions++;
 }
 
 static void handleRadioCommandByte(uint8_t cmd) {
@@ -4290,39 +4786,67 @@ static bool applySpiClockSetting(uint32_t hz) {
   for (size_t i = 0; i < DEVICE_COUNT; ++i) {
     devices[i].ads->setSpiClock(hz);
   }
-  // Read the identity back over the new clock. A device that answers with the wrong
-  // ID - or not at all - is not running at this rate, so the change is undone rather
-  // than leaving a stream of plausible-looking nonsense behind.
-  bool identityOk = true;
+
+  // Prove the new clock can actually carry a register write before keeping it.
+  //
+  // A WREG that is clocked marginally lands a *wrong value* rather than failing
+  // outright: a corrupted data-rate field reads back as a plausible slower rate and a
+  // corrupted CHnSET reads back as a plausible different montage. That is why a
+  // clock that is too fast for this board's wiring presents as "the channel settings
+  // are not correct and the rate drops to 250 or 500 SPS", with no error anywhere.
+  // Writing CONFIG1 back with its own value is a no-op for the configuration, so it
+  // is a safe thing to test with.
+  bool clockOk = true;
+  uint8_t failedDevice = 0;
+  uint8_t failedRegister = 0;
   for (size_t i = 0; i < DEVICE_COUNT; ++i) {
     if (!devices[i].linkOk) {
       continue;
     }
-    const uint8_t id = devices[i].ads->readRegister(0x00);
-    if (id != devices[i].deviceId) {
-      identityOk = false;
-      char msg[128];
-      snprintf(msg, sizeof(msg),
-               "ADS%u answered 0x%02X at %lukHz instead of 0x%02X - reverting to %lukHz",
-               static_cast<unsigned>(i + 1), id, static_cast<unsigned long>(hz / 1000UL),
-               devices[i].deviceId, static_cast<unsigned long>(previousHz / 1000UL));
-      emitFailure(msg);
+    devices[i].ads->clearVerifyFailures();
+    const uint8_t original = devices[i].ads->config1Value();
+    // The probe value must genuinely differ, or a write that lands nothing would
+    // "verify" against the old contents. Only the data-rate field is changed, to
+    // another legal rate, and the original value is written back immediately after.
+    const uint8_t probe = static_cast<uint8_t>((original & 0xF8) | ((original + 1) & 0x07));
+    const bool wrote = devices[i].ads->writeRegisterVerified(CONFIG1, probe, 4) &&
+                       devices[i].ads->writeRegisterVerified(CONFIG1, original, 4);
+    if (!wrote) {
+      clockOk = false;
+      failedDevice = static_cast<uint8_t>(i + 1);
+      failedRegister = devices[i].ads->lastVerifyFailureRegister();
+      break;
+    }
+    if (devices[i].ads->readRegister(0x00) != devices[i].deviceId) {
+      clockOk = false;
+      failedDevice = static_cast<uint8_t>(i + 1);
+      failedRegister = 0x00;
       break;
     }
   }
-  if (!identityOk) {
+
+  if (!clockOk) {
+    // Reverting is the honest outcome: the converters are on a bus that cannot carry
+    // this clock, and a stream configured by half-applied writes is worse than a
+    // slower one that is correct.
     adsSpiClockHz = previousHz;
     for (size_t i = 0; i < DEVICE_COUNT; ++i) {
       devices[i].ads->setSpiClock(previousHz);
     }
-    // The converters were addressed while streaming was stopped, so RDATAC has to be
-    // re-armed either way; restarting from here does that.
     programAllDevices();
     if (wasStreaming) {
       startStreaming();
     }
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "SCLK %lukHz cannot write registers reliably on this board (ADS%u register 0x%02X "
+             "did not verify) - kept %lukHz. Shorten the SPI wiring or accept the lower clock",
+             static_cast<unsigned long>(hz / 1000UL), static_cast<unsigned>(failedDevice),
+             static_cast<unsigned>(failedRegister), static_cast<unsigned long>(previousHz / 1000UL));
+    emitFailure(msg);
     return true;
   }
+
   if (wasStreaming) {
     startStreaming();
   }
@@ -6342,6 +6866,21 @@ static void streamingTask(void* parameter) {
       decimCount = 0;
       wasStreaming = true;
     }
+
+    // If the host has sent anything, let the lower-priority command task run.
+    //
+    // The acquisition task runs far above the loop task, and above roughly 4 kSPS
+    // there is no idle gap left in a conversion period for the loop task to be
+    // scheduled in at all - so a "stop streaming" byte sat unread while the board
+    // kept streaming, and the only way out was to pull the cable. Yielding for one
+    // tick only when a byte is actually waiting means normal streaming costs
+    // nothing, and a command always gets processed. The samples lost to that tick
+    // are irrelevant next to being unable to stop.
+    const bool hostWaiting =
+        usbHostPort.available() > 0 || (btStackReady && btSerial.available() > 0);
+    if (hostWaiting) {
+      vTaskDelay(1);
+    }
     // Block until the next conversion. This yields the CPU, so the idle task
     // and the task watchdog keep running.
     //
@@ -6358,43 +6897,12 @@ static void streamingTask(void* parameter) {
       continue;
     }
 
-    if (!powerTestStream) {
-    // How long this conversion waited. Anything over 1.5 periods means another
-    // task or an interrupt kept the acquisition task off the CPU.
-    static uint32_t lastGapReportMs = 0;
-    if (previousUs != 0) {
-      const uint32_t gapUs = wokeUs - previousUs;
-      const uint32_t periodUs = static_cast<uint32_t>(1000000.0 / sampleRateFromCode(sampleRateCode));
-      if (gapUs > (periodUs * 3) / 2) {
-        lateConversions++;
-      }
-      if (gapUs > worstGapUs) {
-        worstGapUs = gapUs;
-      }
-      // Log a gap the moment it happens, with the counters that can explain it.
-      // A visible step in the traces with no [GAP] line is not a timing problem -
-      // it is the analog side - and knowing which of the two it is decides what
-      // to investigate next. Rate limited, because a sustained stall would
-      // otherwise flood the link.
-      const uint32_t nowMs = millis();
-      if (gapUs > (periodUs * 5) / 2 && (lastGapReportMs == 0 || nowMs - lastGapReportMs >= 100)) {
-        lastGapReportMs = nowMs;
-        char line[192];
-        snprintf(line, sizeof(line),
-                 "[GAP] MS=%lu GAP_US=%lu PERIOD_US=%lu LATE=%lu MISSED=%lu REC=%d QUEUED=%u "
-                 "SPI_US=%lu HEAP=%u\n",
-                 static_cast<unsigned long>(nowMs), static_cast<unsigned long>(gapUs),
-                 static_cast<unsigned long>(periodUs),
-                 static_cast<unsigned long>(lateConversions),
-                 static_cast<unsigned long>(missedConversions), sdRecording ? 1 : 0,
-                 static_cast<unsigned>(sdQueue != nullptr ? uxQueueMessagesWaiting(sdQueue) : 0),
-                 static_cast<unsigned long>(spiReadLastUs), static_cast<unsigned>(ESP.getFreeHeap()));
-        usbHostPort.print(line);
-      }
-    }
-    previousUs = wokeUs;
-    }
-
+    // Read the converters before anything else.
+    //
+    // This block used to run the gap statistics - including formatting a ~190-byte
+    // line and printing it to USB - *before* the SPI read. A USB write at 2 Mbaud
+    // costs ~10 ms, which was spent between the DRDY edge and the first SCLK of the
+    // conversion it was meant to observe. Diagnostics must never sit in that path.
     // Seed with the previous conversion so a failed read holds the last good
     // sample instead of publishing zeros or a spike.
     int32_t fresh[TOTAL_ADS_CHANNELS];
@@ -6426,30 +6934,7 @@ static void streamingTask(void* parameter) {
     bool readFailed = false;
     const uint32_t readStartUs = micros();
     if (!powerTestStream) {
-    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
-      if (!devices[i].linkOk) {
-        continue;
-      }
-      anyLinked = true;
-      if (readDeviceFrame(devices[i], fresh)) {
-        devices[i].drdyPending = false;
-        devices[i].failedReads = 0;
-      } else {
-        readFailed = true;
-        // Holding the last value forever hides a dead converter: the packet
-        // counter keeps advancing, so the host sees a healthy stream made of a
-        // frozen sample. After a few misses publish zeros instead, which the
-        // recorder shows as "no data" and the analyzer sees as a flat line.
-        if (devices[i].failedReads < 0xFF) {
-          devices[i].failedReads++;
-        }
-        if (devices[i].failedReads > STALE_FRAME_LIMIT) {
-          for (uint8_t ch = 0; ch < devices[i].channelCount; ++ch) {
-            fresh[devices[i].channelOffset + ch] = 0;
-          }
-        }
-      }
-    }
+      readAllDeviceFrames(fresh, anyLinked, readFailed);
     }
 
     const uint32_t readUs = micros() - readStartUs;
@@ -6462,6 +6947,45 @@ static void streamingTask(void* parameter) {
     // that landed while we were reading, so one conversion produces exactly
     // one published sample.
     while (xSemaphoreTake(conversionSem, 0) == pdTRUE) {
+    }
+
+    if (!powerTestStream) {
+      // How long this conversion waited. Anything over 1.5 periods means another
+      // task or an interrupt kept the acquisition task off the CPU.
+      static uint32_t lastGapReportMs = 0;
+      if (previousUs != 0) {
+        const uint32_t gapUs = wokeUs - previousUs;
+        const uint32_t periodUs = static_cast<uint32_t>(1000000.0 / sampleRateFromCode(sampleRateCode));
+        if (gapUs > (periodUs * 3) / 2) {
+          lateConversions++;
+        }
+        if (gapUs > worstGapUs) {
+          worstGapUs = gapUs;
+        }
+        // Log a gap the moment it happens, with the counters that can explain it.
+        // A visible step in the traces with no [GAP] line is not a timing problem -
+        // it is the analog side - and knowing which of the two it is decides what
+        // to investigate next. Rate limited, because a sustained stall would
+        // otherwise flood the link.
+        const uint32_t nowMs = millis();
+        if (gapUs > (periodUs * 5) / 2 && (lastGapReportMs == 0 || nowMs - lastGapReportMs >= 100)) {
+          lastGapReportMs = nowMs;
+          // Printed from loop(), not here. This used to run inside the acquisition
+          // task, formatting ~190 bytes and pushing them at the UART between two
+          // conversions - the most expensive possible place for a diagnostic.
+          snprintf(pendingGapLine, sizeof(pendingGapLine),
+                   "[GAP] MS=%lu GAP_US=%lu PERIOD_US=%lu LATE=%lu MISSED=%lu REC=%d QUEUED=%u "
+                   "SPI_US=%lu HEAP=%u\n",
+                   static_cast<unsigned long>(nowMs), static_cast<unsigned long>(gapUs),
+                   static_cast<unsigned long>(periodUs),
+                   static_cast<unsigned long>(lateConversions),
+                   static_cast<unsigned long>(missedConversions), sdRecording ? 1 : 0,
+                   static_cast<unsigned>(sdQueue != nullptr ? uxQueueMessagesWaiting(sdQueue) : 0),
+                   static_cast<unsigned long>(spiReadLastUs), static_cast<unsigned>(ESP.getFreeHeap()));
+          gapLinePending = true;
+        }
+      }
+      previousUs = wokeUs;
     }
 
     if (!anyLinked && !powerTestStream) {
@@ -6683,7 +7207,12 @@ static bool postReadSample(DeviceCtx& dev, int32_t out[TOTAL_ADS_CHANNELS]) {
   if (!waitForDeviceDrdy(dev, drdyTimeoutMs())) {
     return false;
   }
-  if (!readDeviceFrame(dev, out)) {
+  // readDeviceFrame works inside a shared bus transaction; a single-device read
+  // brackets itself with the same one the acquisition loop uses.
+  devices[0].ads->beginSharedTransaction();
+  const bool ok = readDeviceFrameLocked(dev, out);
+  devices[0].ads->endSharedTransaction();
+  if (!ok) {
     return false;
   }
   dev.drdyPending = false;
@@ -7153,10 +7682,36 @@ void setup() {
   // *before* bringUpBluetooth(), and Bluedroid's TX/RX buffers come out of what is
   // left - so an oversized ring produces the worst possible failure: the device
   // advertises and connects, then never answers.
-  static constexpr size_t BT_HEAP_RESERVE_BYTES = 96 * 1024;
+  //
+  // 96 kB was too optimistic: Bluedroid measured 152 kB with a client connected, so
+  // the ring could pass this test and still leave the radio short. The reserve is now
+  // the measured figure plus the same margin the SD queue uses, which makes the ring
+  // fall back to 16 kB - about 60 ms at 8 k packets/s, plenty for scheduling jitter -
+  // whenever something else has taken the memory.
+  static const size_t BT_HEAP_RESERVE_BYTES = BLUEDROID_NEED_BYTES + SD_HEAP_MARGIN_BYTES;
+
+  // Probe the card here, before the radio ring - but deliberately do NOT allocate the
+  // sample queue yet.
+  //
+  // The queue is created when a recording starts (ensureSdQueue), which is the only
+  // moment the heap picture is final: Bluedroid has either been brought up or not.
+  // Allocating it at boot meant guessing what the radio would need afterwards, and a
+  // guess that is too small starves Bluedroid (the device advertises, connects, then
+  // never answers) while a guess that is too large refuses the queue for ever.
+  // Leaving it to the recording start also leaves the transmit ring more room, which
+  // is where the memory actually buys throughput.
+  bringUpSdCard();
+  // With a card inserted the ring is capped at 8 kB. The ring only absorbs jitter in
+  // the radio link, and 8 kB is ~90 ms at the measured 88 kB/s class speed - far more
+  // than the flush task ever needs. The sample queue, in contrast, is what keeps the
+  // card from dropping samples, and it can only be as large as the heap allows. Since
+  // both come out of the same 320 kB, the ring yields to the queue when a card is
+  // present: that is 24 kB more buffering for the thing that actually loses data.
+  static const size_t BT_RING_BYTES_WITH_CARD = 8192;
+  const size_t ringCeiling = sdPresent ? BT_RING_BYTES_WITH_CARD : SZD_BT_TX_BUFFER_BYTES;
   static const size_t kBtRingSizes[] = {SZD_BT_TX_BUFFER_BYTES, 32768, 24576, 16384, 8192};
   for (size_t candidate : kBtRingSizes) {
-    if (candidate > SZD_BT_TX_BUFFER_BYTES) {
+    if (candidate > ringCeiling) {
       continue;
     }
     if (ESP.getFreeHeap() < candidate + BT_HEAP_RESERVE_BYTES) {
@@ -7165,10 +7720,10 @@ void setup() {
     btRing = static_cast<uint8_t*>(malloc(candidate));
     if (btRing != nullptr) {
       btRingSize = candidate;
-      if (candidate != SZD_BT_TX_BUFFER_BYTES) {
+      if (candidate != ringCeiling) {
         usbHostPort.printf("[BT] only %u B of transmit buffer available (wanted %u B, heap %u)\n",
                            static_cast<unsigned>(candidate),
-                           static_cast<unsigned>(SZD_BT_TX_BUFFER_BYTES),
+                           static_cast<unsigned>(ringCeiling),
                            static_cast<unsigned>(ESP.getFreeHeap()));
       }
       break;
@@ -7181,6 +7736,36 @@ void setup() {
                        static_cast<unsigned>(ESP.getFreeHeap()));
   }
   calibrateTouchKey();
+
+  // The USB ring: a few tens of milliseconds at the highest useful rate, so a host
+  // that briefly stops reading costs latency rather than samples. It falls back
+  // rather than failing, because without it the cable still works - it just goes
+  // back to writing inline from the acquisition task.
+  static const size_t kUsbRingSizes[] = {USB_TX_RING_BYTES, 4096, 2048};
+  for (size_t candidate : kUsbRingSizes) {
+    if (candidate > USB_TX_RING_BYTES) {
+      continue;
+    }
+    // Leave room for the Bluetooth stack, which is brought up after this.
+    if (ESP.getFreeHeap() < candidate + 64 * 1024) {
+      continue;
+    }
+    usbRing = static_cast<uint8_t*>(malloc(candidate));
+    if (usbRing != nullptr) {
+      usbRingSize = candidate;
+      break;
+    }
+  }
+  usbHead = 0;
+  usbTail = 0;
+  if (usbRing == nullptr) {
+    usbHostPort.println("[USB] no transmit ring - sample packets are written inline");
+  } else if (usbRingSize != USB_TX_RING_BYTES) {
+    usbHostPort.printf("[USB] transmit ring %u B (wanted %u B, heap %u)\n",
+                       static_cast<unsigned>(usbRingSize),
+                       static_cast<unsigned>(USB_TX_RING_BYTES),
+                       static_cast<unsigned>(ESP.getFreeHeap()));
+  }
 
   usbHostPort.printf("[HEAP] %u B free before Bluetooth, SD queue is allocated on demand\n",
                      static_cast<unsigned>(ESP.getFreeHeap()));
@@ -7203,15 +7788,18 @@ void setup() {
   // Acquisition alone on core 1; everything that can block lives on core 0.
   xTaskCreatePinnedToCore(streamingTask, "adsStream", 4096, nullptr, STREAMING_TASK_PRIO, nullptr, ACQUISITION_CORE);
   xTaskCreatePinnedToCore(sdWriterTask, "sdWriter", 4096, nullptr, SD_TASK_PRIO, nullptr, RADIO_CORE);
-  // No record-button task: the press is caught by a GPIO interrupt, so it does not
-  // depend on any task getting scheduled - which is why a polled version could be
-  // missed entirely while the radio or the card was busy.
+  // The record button is polled from loop(), not caught by an interrupt: GPIO35 has
+  // no internal pull resistor, so it has no defined resting level to edge-trigger on.
   xTaskCreatePinnedToCore(lis3dhTask, "lis3dh", 2048, nullptr, AUX_TASK_PRIO, nullptr, RADIO_CORE);
   // Bluetooth runs on its own core at a priority far below the acquisition
   // task, so a congested radio can slow the stream but never stall a conversion.
   // 5 kB: the Bluedroid write path plus its logging is deeper than it looks, and
   // a stack overflow here would look exactly like the board rebooting.
   xTaskCreatePinnedToCore(btFlushTask, "btFlush", 5120, nullptr, BT_FLUSH_TASK_PRIO, nullptr, BT_FLUSH_TASK_CORE);
+  // The cable gets its own writer for the same reason the radio has one. It sits on
+  // the radio core, below the Bluetooth writer: a late UART byte costs a few
+  // milliseconds of latency, while a late conversion costs a sample.
+  xTaskCreatePinnedToCore(usbFlushTask, "usbFlush", 3072, nullptr, USB_FLUSH_TASK_PRIO, nullptr, RADIO_CORE);
 
   if (USE_DEBUG_APP_MODE) {
     emitDebugHello();
@@ -7226,6 +7814,9 @@ void loop() {
   // Bounded in time, and always after the command poll, so a saturated radio can
   // never make the board unresponsive to STOP.
   benchmarkService();
+  // Polled, not edge-triggered: GPIO35 has no internal pull, so there is no reliable
+  // edge to interrupt on.
+  pollRecordButton();
   if (recordButtonPressed) {
     recordButtonPressed = false;
     toggleSdRecordingFromButton();
@@ -7255,6 +7846,12 @@ void loop() {
   }
   pollBluetoothLink();
   flushBluetoothDiagnostics();
+  // A queued gap report goes out here, from the low-priority task, never from the
+  // conversion path that detected it.
+  if (gapLinePending) {
+    gapLinePending = false;
+    usbHostPort.print(pendingGapLine);
+  }
   if (streaming) {
     emitAcquisitionHealth();
   }

@@ -628,6 +628,15 @@ option falls back to recording everything rather than producing an empty file.
 * `Points`: 256 to 16384 samples per transform.
 * `Window`: Hann, Hamming, Blackman, Rectangular.
 * `Smooth`: exponential smoothing of the magnitude spectrum (Off ... 0.999).
+  This averages *successive updates* of the same bin.
+* `Freq avg`: centred moving average *across neighbouring bins* (Off, 3, 5, 9,
+  17). Time smoothing steadies a trace that flickers between updates; this
+  steadies one that is jagged along the frequency axis, which is what a
+  single-window noise floor and therefore the `Avg` trace always is. The ends of
+  the window are divided by the number of bins actually inside it, so the first
+  and last bins do not fade towards zero. It is applied at draw time, so
+  changing it re-renders immediately (also while `Pause` is on) and never
+  touches the exponential state.
 * `Trace`: draw every channel that is ticked in the dock (`Visible`), one single
   channel (`CH 1` ... `CH 16`), or the mean of the visible channels (`Avg`).
 * `Scale`: `Auto` or a fixed uVrms ceiling; this is the actual y-axis limit.
@@ -649,7 +658,56 @@ option falls back to recording everything rather than producing an empty file.
   frequency, amplitude and the channel (or `avg`) the value belongs to. When the
   pointer leaves, the bottom right keeps showing the strongest peak.
 
-### Accelerometer (right, bottom)
+### The bottom quarter: reference, accelerometer or noise
+
+The panel under the FFT holds one of three views. They answer different questions
+and would fight over the space, so they are tabs rather than neighbours:
+
+| Tab | What it shows |
+| --- | --- |
+| `Reference channel` | The input wired across the generator, with its own time series and FFT in mV (see below). |
+| `Accelerometer` | Three-axis readout with the movement alarm. |
+| `Noise` | Per-channel input noise in fixed bands over the last ten seconds. |
+
+The chosen tab is remembered. Motion is reported even while another tab is in
+front: the tab reads `Accelerometer (moving)` and the status bar appends
+`board moving`, because the whole point of the alarm is to catch a knock that
+happened while you were looking at the spectrum.
+
+#### Noise tab
+
+* Bands: **0.1-100 Hz**, **0.5-100 Hz** and **0.1-250 Hz**, in `uVrms`.
+* Measured on the **raw** stream, before the display filters. The display chain
+  is high/low-passed (0.1-150 Hz by default), so measuring the 0.1-250 Hz band
+  after it would report the filter's stopband as an absence of noise. The bands
+  *are* the filter.
+* One row per checked channel plus an `Average` row, kept at the top so it stays
+  visible without scrolling: with twelve channels the bottom of the table is
+  normally out of view.
+* `Update`: every 500 ms or every 200 ms.
+* The window is the last **10 s** of the stream. Until ten seconds have been
+  collected the header says how much it actually used (`last 4.2 s of 10 s`).
+* `Average` is the RMS of the per-channel RMS values - a power average. Adding
+  noise traces in the time domain would let uncorrelated noise partially cancel,
+  which would report a front end better than it is.
+* A band that reaches above Nyquist is clipped by the sample rate and the note
+  under the table says so (`250 Hz (limited to 125 Hz by the sample rate)`): at
+  250 SPS a 300 Hz signal is already folded into the 200 Hz region, so the
+  number would otherwise look meaningful when it is not.
+* Selecting the tab locks the FFT to two decades, `10^-3 ... 10^-1 uVrms`. The
+  noise figures are read off the floor of the spectrum, so letting the axis
+  follow the strongest bin makes two runs incomparable; `Log` and `Scale` are
+  disabled and restored to your own values when you leave the tab. The stored
+  preferences are left alone while the mode is active.
+
+How the number is computed: one windowed rFFT of the ten-second block serves
+every band, and the band power is folded back with Parseval's relation,
+`ms = 2 * sum(|X_k|^2) / (N * sum(w^2))`, `rms = sqrt(ms)`. The answer therefore
+does not depend on the window, and bands cost no filter stage. A 10 uVrms sine
+inside a band reads back as `10.0`; the same sine outside the band reads as
+`~0`.
+
+### Accelerometer (bottom quarter, `Accelerometer` tab)
 
 * Three axis bars with a movement alarm: the outline flashes red and the label
   switches to `MOVING` when the vector difference from a slow baseline exceeds
@@ -1385,16 +1443,20 @@ Three buffers accounted for the memory that caused all of it:
 | Benchmark frame scratch | 4 kB (up to) | always, once a benchmark had ever run |
 
 The SD queue was the waste: it was created in `setup()` and never released, for a
-card that may not even be present. It is now created when a recording opens and
-released as soon as the recording closes (the writer task owns the deletion, since
-it is the only task blocked on it). The frame scratch is now sized to the frame in
-use - 276 bytes for a 256-byte payload, not 4 kB - and freed when a run ends.
+card that may not even be present. It is now created when a recording opens, sized
+to the heap that is actually free at that moment (see *Recording to the card while
+streaming over Bluetooth*), and kept while the card is present so a second
+recording does not re-enter the allocation. The frame scratch is now sized to the
+frame in use - 276 bytes for a 256-byte payload, not 4 kB - and freed when a run
+ends.
 
 The transmit ring is sized per path, because the two need opposite things: **8 kB**
 for the direct path, which blocks its producer and therefore needs the rest of the
 memory in the heap for Bluedroid's per-write buffers; **32 kB** for the library path,
 which needs no extra heap and benefits from the depth to ride out Windows' read
-jitter. The original size is restored when the test stops.
+jitter. With an SD card inserted it is capped at 8 kB at all times, because there the
+queue's ability to absorb a card stall is worth more than ring depth. The original
+size is restored when the test stops.
 
 A benchmark now refuses to start below **20 kB** of free heap rather than producing
 thousands of errors and no throughput.
@@ -1415,16 +1477,122 @@ The bus clock is checked against two things before it is accepted, because both
 failures look like "the stream turned to gibberish" rather than like an error:
 
 * **Can the bus carry the selected rate?** Two 216-bit frames per sample must fit
-  inside one sample period. At 1 MHz that is 432 us, so 2 kSPS would spend 86 % of
-  every second on SPI, and the frame read overruns the next DRDY - every sample after
-  that is taken from the wrong conversion. A clock below what the selected data rate
-  needs is now **refused with the numbers**, rather than accepted and left to corrupt.
-* **Do the converters still answer?** After the change the device ID is read back over
-  the new clock. A wrong or absent answer reverts to the previous clock and says so.
+  inside one sample period. At 2 MHz that is 216 us of every 250 us at 4 kSPS - 86 % of
+  the bus - so 4 kSPS needs **4 MHz or better**. A clock below what the selected data
+  rate needs is **refused with the numbers**, rather than accepted and left to corrupt.
+* **Can it actually write a register?** After the change the firmware writes CONFIG1
+  with a *different* data-rate field, reads it back, restores the original and reads
+  that back too. A clock that cannot make both writes stick is **reverted** and named.
+
+### Why a fast SCLK corrupts the settings
+
+A WREG that is clocked marginally does not fail loudly - it lands a **wrong value**.
+That is what these two symptoms were:
+
+| Symptom | Actual register |
+|---------|-----------------|
+| "I select 4 kSPS but it drops to 250 or 500 SPS" | `CONFIG1` keeps a different `DR` field |
+| "Above 4 MHz CH1's settings are wrong, CH2 and CH11 saturate" | `CHnSET` differs: a changed MUX reads as saturation |
+
+Both read back as plausible values, so nothing looks broken. Three things are now in
+place:
+
+* **The 4 tCLK hold before CS rises** was missing from `writeRegister`, `readRegisters`
+  and `sendCommand`. Without it the last byte clocked in is not latched, so the
+  register keeps its previous contents.
+* **Every configuration write is verified and retried.** `writeRegisterVerified()`
+  writes, reads back, and retries up to four times.
+* **`programAllDevices()` repairs itself.** It is the single funnel for every
+  configuration path, so after programming it compares all thirteen registers per
+  converter against what was intended and rewrites anything that did not take. A
+  successful repair is reported as `[CHK] REPAIRED DEV=.. REG=..`, and only a register
+  that still refuses is counted as a problem.
+
+`>` (Verify board configuration) therefore repairs as well as checks.
 
 The rate code `0` is a real value (16000 SPS) and was being read as "not set" and
 replaced with 250 SPS, which made the fastest rate silently unselectable.
 
+### Acquisition timing
+
+The conversion path is on a hard budget: at 4 kSPS a conversion is due every 250 us,
+and inside that window both converters must be clocked out.
+
+**The cable was on the critical path.** Sample packets used to be written to the UART
+by the acquisition task itself. At 8 k packets/s that is 8 000 driver calls a second,
+charged to the task that has 250 us between conversions. Two changes:
+
+* the two packets of one conversion are built into a single 66-byte buffer and handed
+  over in **one** write, not two;
+* data packets go into a **USB transmit ring** (8 kB) drained by its own task on the
+  radio core, so the acquisition task only pays a `memcpy` and a counter bump. A late
+  UART byte costs a millisecond of latency; a late conversion costs a sample.
+
+The ring falls back to 4 kB then 2 kB rather than failing, and if none can be
+allocated the firmware says so and writes inline as before. `availableForWrite()`
+reports the **ring's** headroom, not the UART's - a full UART must not cause a packet
+to be dropped when the ring has room.
+
+**Diagnostics are no longer on the conversion path.** The `[GAP]` line used to be
+formatted and printed from inside the acquisition task, ~190 bytes pushed at the UART
+between two conversions. It is now formatted there and printed by `loop()`.
+
+**One bulk transfer per frame.** A frame read used to be 27 separate `SPI.transfer()`
+calls. Each is a call into the SPI driver with its own busy-wait, so the per-byte form
+spent more time in the driver than on the wire - at 2 MHz the clocking is only 108 us,
+and the remainder was call overhead. It is now a single `transferBytes()` of the whole
+216-bit frame (3 status bytes + 8 slots). This is also why raising SCLK from 2 to 8 MHz
+bought far less than 4x: the clock was never the bottleneck.
+
+**One bus transaction for both converters.** Both devices share the mutex, the
+`SPISettings` and the MISO line, so locking and re-applying the transaction once per
+chip was pure overhead. `beginSharedTransaction()` / `endSharedTransaction()` now bracket
+the pair: lock once, read each device, unlock once. The CS pulses stay strictly
+sequential - asserting two chip selectors together would put two drivers on the same
+MISO line, so that is not an option and is not attempted.
+
+### Reading the SPI budget
+
+`#DX` carries two figures, because "the read was slow" has two different causes:
+
+| Field | Meaning |
+|-------|---------|
+| `spi_us` / `spi_max_us` | Whole two-converter read, including the wait for the bus |
+| `spi_lock_us` / `spi_lock_max_us` | The part of that spent acquiring the SPI mutex |
+
+If `spi_lock_max_us` is most of `spi_max_us`, another task was holding the bus - look
+at what was being configured. If it is small, the transfer itself stalled and the
+cause is below the firmware (cache, interrupt latency, wiring).
+
+The budget is the **conversion** period, `1 / data_rate`, not the packet period: one
+read serves one conversion, and a conversion produces two packets. Comparing against
+the packet rate halves the apparent budget and reports a healthy read as over-running.
+
+`usb_q` and `usb_drop` show how much the transmit ring is holding and how much it had
+to discard - the numbers that say whether the transport is keeping up.
+
+What is deliberately **not** done:
+
+* Both chip selects low at once. Two drivers on one MISO line.
+* Hoisting the transaction outside the acquisition loop for the whole session. It would
+  remove the remaining per-conversion lock, but several configuration paths take the
+  same mutex without first stopping the stream, so it would need that audit first.
+* Skipping the block-average divide when decimation is 1. It saves well under 1 us and
+  would mean two code paths for the published sample - not worth the divergence.
+* DMA. `transferBytes()` already goes through the API that switches to DMA above the
+  driver's size threshold, so a future step is to batch larger reads rather than change
+  the interface.
+
+### Where the read-ahead idea stops
+
+The converters cannot be read early. In `RDATAC` a device shifts out whatever is in its
+output register; clocking it before the conversion completes re-reads the *previous*
+sample. So asserting a chip select straight after the other one finishes cannot fetch
+the next conversion - it would simply return stale data.
+
+What is achievable, and is now done, is removing the dead time *between* the two reads:
+`csHigh(chip A)` and `csLow(chip B)` are adjacent inside a single transaction, with no
+mutex release or settings re-apply between them.
 
 ### Write size on the library path
 
@@ -1567,6 +1735,93 @@ The sample-rate feasibility calculations, the packet-rate budget and the link no
 all read that one budget. The distinction between ADS1299 sample rate, output
 packet rate and per-channel rate in daisy mode is unchanged.
 
+## CMRR, crosstalk and gain sweep fits
+
+The sweeps on the CMRR, crosstalk and gain tabs each carry the same four controls:
+**Curve fit**, **Ignore above**, **Show fit** and the summary line.
+
+**Curve fit** decides how the value at 50 Hz is read off the swept points.
+
+| Choice | Behaviour |
+|--------|-----------|
+| Polynomial in log10(f), order 2/3/4 | One curve through all points. Extrapolates, so it always produces a 50 Hz value even outside the swept range |
+| Linear between points (exact) | Passes through every measured point |
+| Exact, monotone (PCHIP) | As above; does not overshoot between points |
+| Exact, min curvature (spline) | As above; smoothest curve through the points |
+| No fit | Measured points only |
+
+The exact interpolants exist because of a specific failure: **one wild point at
+either end of the sweep drags a 3rd or 4th order polynomial away from everything
+else**. Measured on synthetic data with a single bad point at 200 Hz, the polynomial
+put 50 Hz at -64.6 dB when the true response was -60 dB - a 4.6 dB error - while
+PCHIP and linear returned -60.00 dB. They cannot be steered, because they touch every
+point.
+
+The trade-off is honest: an exact fit **cannot be evaluated outside the measured
+range**, so a 50 Hz value is reported only if the sweep spans 50 Hz. Its `R²` is 1 by
+construction - that says "this curve touches every point", not "this is a good
+model".
+
+**Ignore above** drops every point at or above the frequency in the box (100 Hz by
+default) from the fit, from the fitted figure and from the 50 Hz table. The measured
+scatter keeps showing them, so it stays visible what was dropped. This is the other
+way to stop a noisy high-frequency tail steering a polynomial: with the same data and
+the cutoff on, the polynomial returned -60.4 dB.
+
+Each tab has its own independent pair of settings, and the **reference (generator
+voltage) figure on the CMRR tab uses the same choice as the CMRR curves** - it is the
+counterpart of those curves, so both should be read with the same model.
+
+### Both references at once
+
+The **CM voltage** selector has a fifth entry: *Both: measured and bias-curve
+reference, side by side*. It computes these two from the same recording:
+
+| Reference | Vcm at each frequency |
+|-----------|----------------------|
+| **CM monitor measured** | The voltage the converter actually read on the monitor channel |
+| **Bias curve voltage** | The value the bias reference curve holds for that frequency |
+
+With a bias network in the way, those two answers differ by the network's attenuation,
+which is tens of dB. Before this option they were alternatives - computing one threw
+the other away - so comparing them meant two runs and a note on paper. Now:
+
+* the measured reference keeps the original four figures;
+* the bias-curve reference gets **its own two figures** (measured sweep and fitted
+  curves), titled with the reference name so the two sets cannot be read the wrong way
+  round;
+* the **50 Hz table carries a column for each**, plus the mean and the two converter
+  rows, so the comparison is one number against one number;
+* the **report** contains both figure sets and the two-column table, with a line saying
+  the columns came from the same recording and the difference between them is the bias
+  network's attenuation and nothing else.
+
+Both references go through the same chosen **Curve fit** and the same **Ignore above**
+cutoff, so the two columns are comparable rather than one exact and one polynomial.
+
+Switching away from *Both* hides the second pair of figures and discards their results,
+because they no longer describe the selected mode.
+
+### Per-converter 50 Hz values
+
+SRB1 and SRB2 are routed **per chip**, so a run that used SRB2 on one converter and
+not the other has two genuinely different measurements. The summary line and the
+50 Hz table therefore report three figures:
+
+```
+Fit @ 50 Hz: mean 70.00 dB (60.00 .. 80.00)  |  ADS1 (CH 1-6): 60.00 dB (n=6)  |  ADS2 (CH 7-12): 80.00 dB (n=6)
+```
+
+The table gets `Mean of fits`, `ADS1 (CH 1-6)` and `ADS2 (CH 7-12)` rows, and the same
+rows appear in the exported report.
+
+Membership is decided by **position in the recorded channel list**, not by how many
+channels produced a fit. That matters because the monitor channel never produces a fit:
+counting fitted channels would turn a 12-channel recording into 11 and silently drop
+the per-converter rows exactly when they are wanted. A recording with fewer than
+twelve channels is one converter and is left unsplit rather than cut at an arbitrary
+point.
+
 ## Exporting from the analyzer
 
 `Export -> Export report...` (or any of the three older entries, which just
@@ -1624,6 +1879,19 @@ active channel count and rate, and the recording time the remaining space buys a
 that configuration (`EST_SEC`, computed from the real line length of the channel
 set). While recording it also shows the file name and the written/dropped sample
 counters.
+
+Two things a start will no longer do, because both left junk on the card:
+
+* **It will not open a file it cannot fill.** The sample queue is reserved *before*
+  `SD.open`, so a start that is short of memory reports the reason and leaves no
+  empty `SZD_00xx.csv` behind.
+* **It will not silently drop a sample it could not take.** Every path that loses a
+  sample now increments `DROPPED`, including a writer that times out on the file
+  lock.
+
+The bus runs at **20 MHz** when the card accepts it, stepping down to 10 MHz and
+then 4 MHz. The chosen speed is in `[SD] card ready at N kHz SPI` and in `SPIKHZ`
+on every status line.
 
 ### Confirmation, and why a recording needs the stream
 
@@ -1764,30 +2032,166 @@ compared directly. Differences from a live file:
   so it holds every conversion while the live link carries half of them.
 * `%Source = SD card (ESP32 internal recording)` marks where it came from.
 
+### Recording to the card while streaming over Bluetooth
+
+Both at once works, and the reason it did not before was a **double count**, not a
+shortage of memory. The symptom was always the same:
+
+```
+Failure: not enough free memory for the SD sample queue - close Bluetooth or
+reduce the transmit buffer, then try again
+```
+
+Measured on this board:
+
+| Consumer | Bytes |
+|----------|-------|
+| Total heap | ~228 kB at boot |
+| Bluedroid with a client connected | **152 kB** |
+| Bluetooth transmit ring, no card | 32 kB |
+| Bluetooth transmit ring, card present | **8 kB** |
+| USB transmit ring | 8 kB |
+| Task stacks (acquisition, SD writer, LIS3DH, BT flush, USB flush) | 19 kB |
+| SD sample queue, per entry | **68 B** |
+
+The old check asked for `freeHeap >= queueBytes + 152744 + ring + 12 kB`, but
+`bringUpBluetooth()` runs in `setup()`, so the radio's 152 kB is *already gone*
+from `freeHeap` by the time a recording starts. Reserving it a second time demanded
+~165 kB free on a board that has 35-41 kB while streaming: the queue could never be
+allocated, so every card recording opened its file, wrote the header and stopped.
+That is exactly the 1 kB `SZD_00xx.csv` files this produced.
+
+What the firmware does now:
+
+* **The reserve is a working margin, not the radio's footprint** - 10 kB while the
+  stack runs, 6 kB when it is stopped. The only place that must reserve Bluedroid is
+  the transmit ring, which is allocated *before* the radio comes up.
+* **Size against the largest free block**, not the free total: `xQueueCreate` needs
+  one contiguous block, so a fragmented heap reports plenty of free bytes and still
+  refuses a 26 kB allocation. The queue takes the largest size from
+  `{512, 384, 256, 192, 128, 96, 64, 32}` that fits.
+* **The queue is allocated when the recording starts**, not at boot. That is the only
+  moment the heap picture is final, and it stops the queue holding memory for a
+  recording that may never happen.
+* **The queue is reserved before the file is created**, so a start that cannot accept
+  samples never leaves an empty file on the card.
+* **The transmit ring is capped at 8 kB when a card is present.** The ring only
+  absorbs radio jitter (8 kB is ~90 ms at the measured 88 kB/s class speed); the
+  queue is what stops the card dropping samples. Same 320 kB, so the ring yields.
+* **An idle radio is reclaimed.** If even a 32-entry queue does not fit, and the
+  stack has **no client** and the host is **not** talking over the radio, the
+  firmware stops Bluetooth (`esp_bluedroid_deinit` + `btStop`, ~150 kB back), logs
+  `[SD] reclaiming the idle Bluetooth stack`, and retries. Nothing is dropped by
+  this because no link is attached; `:bt 1` (or the Power control dialog) starts the
+  radio again.
+
+Typical results, from the numbers the board itself reports:
+
+| Situation | Free heap | Queue | Covers |
+|-----------|-----------|-------|--------|
+| USB, card inserted | ~41 kB | 384 entries | 768 ms at 500 SPS |
+| Bluetooth with a client | ~35 kB | 256 entries | 512 ms at 500 SPS |
+| USB after the reclaim | ~190 kB | 512 entries | 1.02 s at 500 SPS |
+| Fragmented heap (40 kB free, 6 kB largest block) | - | 64 entries | 128 ms |
+
+The status line reports what was chosen: `QUEUED`, `QPEAK` and `QCAP` are the queue
+in use, its high-water mark and its capacity, so `QPEAK` near `QCAP` means the card
+cannot keep up, not that the buffer is too small.
+
+### RAM, DMA and where the time actually goes
+
+Three questions come up whenever the card or the radio misbehaves, and the honest
+answers are worth writing down.
+
+**Is SPI DMA used?** No, and it cannot be in this framework version. Arduino-ESP32
+**2.0.17** (the `espressif32` platform this project pins) implements
+`spiTransferBytesNL()` in `esp32-hal-spi.c` as a **register loop**: it copies 16
+words at a time into `SPI.data_buf` and busy-waits on `cmd.usr`. There is no DMA
+path in `SPIClass` at all, and the `SD` library's sector transfers
+(`sd_diskio.cpp`) go through the same class. What *is* used is the fastest primitive
+available: `transferBytes()` for the ADS1299 frame and `writeBytes()` for the card
+sector, never byte-at-a-time loops.
+
+Would DMA help here? For the acquisition, no: one converter frame is 27 bytes - a
+single 64-byte chunk - and the DMA setup for that is longer than the transfer. At
+4000 SPS the two reads cost ~108 us of wire time out of a 250 us period; DMA would
+not shorten the wire, only free the CPU during it, and the acquisition task has its
+own core. For the card the same argument holds: 512 bytes at 20 MHz is 205 us, and
+a 4 kB write is one transaction per ~40 samples, so at 500 SPS the writer uses a
+couple of percent of its core. If you later want DMA on the acquisition path it
+means moving that bus to the IDF `spi_master` driver (or upgrading to core 3.x) -
+a rewrite of the timing-critical path, not a flag.
+
+**Where does the memory go?** Bluedroid is the elephant: 152 kB of ~228 kB free at
+boot, for a radio that is idle whenever the cable is in use. That is why the queue
+can never be 36 kB while the radio has a client, and why the reclaim path exists.
+
+**What actually makes the card faster** is not DMA but the clock and the batch size:
+the SD bus runs at **20 MHz** (falling back to 10 MHz and then 4 MHz if the card
+refuses it), samples are formatted into a **4 kB RAM buffer** and written as one
+transaction per ~40 rows, and the header is formatted into one buffer and written in
+**a single call** instead of ~60 small `print()`s.
+
+The deeper question - what the platform itself costs, whether ESP-IDF would change
+any of it, where DMA is and is not available, and what a Wi-Fi uplink would carry -
+is analysed in [PLATFORM_AND_LINK_ANALYSIS.md](PLATFORM_AND_LINK_ANALYSIS.md), with
+every figure labelled as measured, datasheet or estimate.
+
+
 ### Record button (GPIO35)
+A press of a button on **GPIO35** (the `SWITCH` net) toggles card recording: it loads
+`/SZD_CFG.TXT`, applies it to both ADS1299 (rate, decimation, SPI clock, reference
+modes, per-channel gain/input/bias/SRB2, and which channels are on), then starts
+recording. Pressing it again stops and closes the file. The session name from the
+stored configuration is used for the file name.
 
-A short press of a button on **GPIO35** (the `SWITCH` net) toggles card recording:
-it loads `/SZD_CFG.TXT`, applies it to both ADS1299 (rate, decimation, SPI clock,
-reference modes, per-channel gain/input/bias/SRB2, and which channels are on), then
-starts recording. Pressing it again stops and closes the file. The session name from
-the stored configuration is used for the file name.
+**The pin is polled, not edge-triggered.** GPIO34-39 are input-only and the SoC
+provides **no pull resistors for them at all** - `pinMode(35, INPUT_PULLDOWN)` is
+accepted and does nothing. An earlier version of this document claimed the internal
+pulls could be switched on; that was wrong, and it is why the button appeared dead:
+with no defined resting level there is no clean edge to interrupt on.
 
-The press is caught by a **rising-edge GPIO interrupt** (`attachInterrupt(...,
-RISING)`), not by polling. A polled version could miss a press completely while the
-radio flush task or the card writer held the CPU for tens of milliseconds, which is
-why the button used to do nothing. The ISR only timestamps the edge and raises a
-flag; debouncing is a 40 ms re-arm window inside the ISR, and all the SPI work
-happens on the main loop, which owns the ADC bus.
+So the firmware polls every 10 ms and needs **4 consecutive identical samples** (a
+40 ms debounce) before it accepts a change. It also learns the resting level at
+boot and takes the press to be the transition *away* from that level, which means
+the button works whether the external resistor pulls the pin up or down. The boot
+line reports what it measured:
 
-If the button is already held at power-up there is no edge to catch, so the pin is
-read once at start-up and the flag seeded from it.
+```
+[BTN] record button on GPIO35, idle level 0
+```
 
-**No external resistor is needed.** GPIO34-39 are input-only and have *no* pull
-resistors *enabled at reset* (which matters for boot strapping), but they do
-contain internal pull-up/pull-down resistors that firmware can switch on - so the
-button uses `pinMode(35, INPUT_PULLDOWN)` and simply switches the pin to 3V3 when
-pressed. The earlier note here claimed these pins cannot be pulled at all; that was
-wrong. (GPIO37, the pin used previously, is not bonded out on a WROOM-32E at all.)
+A `1` there means the pin reads high at rest - the external pull is pulling up, or
+the wiring is open - and is worth knowing before wondering why presses do nothing.
+
+**An external resistor is required** (10 kΩ to the rail the button does *not* switch
+to). Without one the pin floats and presses are indistinguishable from noise.
+
+A stop is **refused for the first 2 seconds** of a recording. Starting and immediately
+stopping leaves a file with no data in it, which is worse than not recording at all.
+A refused stop says so instead of being silently swallowed:
+
+```
+[BTN] stop ignored, 740 ms of 2000 ms minimum
+```
+
+Holding the button down does not repeat: one press, one toggle. A press is the
+transition away from the resting level and back.
+
+### LED feedback while recording
+
+The status LED (GPIO27) shows recording with a pattern of its own, on every transport:
+
+| State | Pattern |
+|-------|---------|
+| **Recording** | **3 quick pulses, then a pause** |
+| USB host connected | solid on |
+| Bluetooth host connected | 950 ms on / 50 ms off |
+| No host | fast blink |
+
+Recording used to be "solid on while recording over USB", which is exactly what the
+LED shows when merely connected - so there was no way to tell whether a recording had
+started. The triple pulse is unmistakable and identical on USB and Bluetooth.
 
 ### Writing to the card without disturbing the radio
 
@@ -1970,19 +2374,6 @@ covered by GPIO15's reset pull-up on CS and by the firmware-enabled internal
 pull-up (≈45 kΩ) on MISO. If a particular card still refuses to initialise, add
 10 kΩ from CS and MISO to 3V3 - those are the only two that matter.
 
-### LED feedback while recording
-
-The status LED becomes a recording indicator first and a transport indicator second,
-because losing a recording matters more than not knowing which link is up:
-
-| State | Pattern |
-|-------|---------|
-| Recording, USB host connected | **solid on** |
-| Recording, Bluetooth host connected | on **950 ms**, off **50 ms** |
-| Recording, no host connected | on 900 ms, off 50 ms, on 50 ms, off 50 ms (two quick off flashes) |
-| Not recording, USB link | 500 ms square wave |
-| Not recording, Bluetooth link | 125 ms square wave |
-
 ### Comparing the two recordings
 
 `gui_main.py` -> **Tools -> Compare two recordings...** opens a window that takes
@@ -2097,8 +2488,9 @@ export sections/formats and the measurement text.
 stimulus (a common-mode monitor, a crosstalk source or the gain stimulus). Choosing
 one:
 
-* gives it its own time series and FFT in the bottom-right panel, in **mV** with
-  its own full-scale setting, instead of sharing axes with microvolt channels;
+* gives it its own time series and FFT in the bottom-quarter `Reference channel`
+  tab, in **mV** with its own full-scale setting, instead of sharing axes with
+  microvolt channels;
 * **hides it from the main time series and the main FFT**, so it cannot flatten
   the traces you are actually looking at;
 * forces that input to **PGA x1** - a volt-level stimulus on x24 clips the ADC;
@@ -2114,6 +2506,11 @@ once and then keeps your choices:
 | 2 | 0.1 / 150 Hz default band, auto-connect flag |
 | 4 | 921600 baud, 500 SPS (250 Hz per channel), gain x24, normal input, SRB2, FFT log + auto scale, record only checked channels |
 | 5 | per-converter reference modes, selectable SPI clock (2 MHz default) and output decimation (off by default) |
+| 6 | 3 Mbaud, Bluetooth transmit power, SPP write size |
+
+New keys are added without a version bump when a missing key can safely keep its
+default: `fft_freq_smoothing_bins`, `bottom_tab` and `noise_interval_ms` are read
+back with `ViewSettings` defaults when an older file does not have them.
 
 Delete the file to return to defaults.
 

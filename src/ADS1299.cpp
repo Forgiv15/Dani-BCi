@@ -31,6 +31,12 @@ constexpr uint8_t kPowerDownMask = 0x80;
 
 constexpr uint8_t kLeadOffFreq31Hz = 0x02;
 
+// 3 status bytes + 8 x 24-bit channel slots. Sent as one SPI transfer.
+constexpr uint8_t kDataFrameBytes = 3 + 8 * 3;
+// MOSI is unused during an RDATAC frame - the device only shifts data out - so the
+// whole transmit side is zeros. Shared, so no per-frame buffer is set up.
+static const uint8_t kFrameZeros[kDataFrameBytes] = {0};
+
 // CONFIG2 bit 4 enables the internal test signal. Bits 7:6 are reserved (they
 // read back as 0 on the part), so only the meaningful bits are compared.
 constexpr uint8_t kIntCalMask = 0x10;
@@ -188,6 +194,7 @@ void ADS1299::sendCommand(uint8_t command) {
     spiLock();
     sharedSpi.beginTransaction(spiSettings);
     csLow();
+    delayMicroseconds(kDecodeDelayUs);
     transfer(command);
     // The ADS1299 needs CS held low for 4 tCLK (~2 us) after the last SCLK
     // edge before it latches the command opcode; releasing CS immediately can
@@ -260,6 +267,7 @@ void ADS1299::readRegisters(uint8_t startAddress, uint8_t count, uint8_t* data) 
     spiLock();
     sharedSpi.beginTransaction(spiSettings);
     csLow();
+    delayMicroseconds(kDecodeDelayUs);
     transfer(_RREG | (startAddress & 0x1F));
     delayMicroseconds(kDecodeDelayUs);
     transfer(count - 1);
@@ -267,6 +275,7 @@ void ADS1299::readRegisters(uint8_t startAddress, uint8_t count, uint8_t* data) 
     for (uint8_t i = 0; i < count; ++i) {
         data[i] = transfer(0x00);
     }
+    delayMicroseconds(kDecodeDelayUs);
     csHigh();
     sharedSpi.endTransaction();
     spiUnlock();
@@ -276,15 +285,50 @@ void ADS1299::writeRegister(uint8_t address, uint8_t value) {
     spiLock();
     sharedSpi.beginTransaction(spiSettings);
     csLow();
+    // CS must be low for 4 tCLK before the first SCLK, so the device is watching.
+    delayMicroseconds(kDecodeDelayUs);
     transfer(_WREG | (address & 0x1F));
     delayMicroseconds(kDecodeDelayUs);
     transfer(0x00);
     delayMicroseconds(kDecodeDelayUs);
     transfer(value);
+    // And for 4 tCLK after the last SCLK, or the byte just clocked in is not latched.
+    // Without this the register keeps its previous value, which looks exactly like
+    // "the setting was ignored".
+    delayMicroseconds(kDecodeDelayUs);
     csHigh();
     sharedSpi.endTransaction();
     spiUnlock();
     delayMicroseconds(kDecodeDelayUs);
+}
+
+bool ADS1299::writeRegisterVerified(uint8_t address, uint8_t value, uint8_t attempts) {
+    for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
+        writeRegister(address, value);
+        const uint8_t readback = readRegister(address);
+        if (readback == value) {
+            return true;
+        }
+        // A failed attempt is a timing problem, not a wrong value: back off so the
+        // next try starts from a quiet bus rather than immediately repeating it.
+        delayMicroseconds(50 * (attempt + 1));
+    }
+    verifyFailures++;
+    lastVerifyFailRegister = address;
+    return false;
+}
+
+uint32_t ADS1299::verifyFailureCount() const {
+    return verifyFailures;
+}
+
+uint8_t ADS1299::lastVerifyFailureRegister() const {
+    return lastVerifyFailRegister;
+}
+
+void ADS1299::clearVerifyFailures() {
+    verifyFailures = 0;
+    lastVerifyFailRegister = 0;
 }
 
 void ADS1299::setSpiClock(uint32_t spiClockHz) {
@@ -534,7 +578,11 @@ bool ADS1299::configureChannel(
     chset |= static_cast<uint8_t>(inputTypeOrdinal & 0x07);
 
     channelSettings[channelIndex] = chset;
-    writeRegister(CH1SET + channelIndex, chset);
+    // Verified, because a WREG clocked marginally lands a *wrong value* rather than
+    // failing: the single read-back below used to report "rejected" for a channel
+    // whose register had in fact been written with a corrupted montage. Retrying is
+    // what turns a marginal SCLK into a correct configuration.
+    bool ok = writeRegisterVerified(CH1SET + channelIndex, chset, 4);
 
     uint8_t mask = static_cast<uint8_t>(1U << channelIndex);
     if (biasInclude) {
@@ -564,10 +612,11 @@ bool ADS1299::configureChannel(
         writeRegister(LOFF_SENSP, leadOffSenseP);
         writeRegister(LOFF_SENSN, leadOffSenseN);
     }
-
     gain = gainScalarLut[gainOrdinal];
-    uint8_t readBack = readRegister(CH1SET + channelIndex);
-    const bool ok = readBack == chset;
+    // The verified write above already retried and read back; this only re-checks the
+    // final state so a register that refused after every attempt is still reported.
+    const uint8_t readBack = readRegister(CH1SET + channelIndex);
+    ok = ok && (readBack == chset);
     endConfigTransaction(wasRunning);
     return ok;
 }
@@ -580,8 +629,7 @@ bool ADS1299::setSrb1Routing(bool enable) {
     // negative input of all channels at once. Everything else in MISC1 stays
     // at its reset value.
     const uint8_t value = enable ? kSrb1Mask : 0x00;
-    writeRegister(MISC1, value);
-    const bool ok = readRegister(MISC1) == value;
+    const bool ok = writeRegisterVerified(MISC1, value, 4);
 
     endConfigTransaction(wasRunning);
     return ok;
@@ -657,32 +705,53 @@ bool ADS1299::readDataFrame(int32_t channels[8], uint32_t& status) {
 
     spiLock();
     sharedSpi.beginTransaction(spiSettings);
-    csLow();
+    const bool ok = readDataFrameLocked(channels, status);
+    sharedSpi.endTransaction();
+    spiUnlock();
+    return ok;
+}
 
-    status = 0;
-    for (int i = 0; i < 3; ++i) {
-        status = (status << 8) | transfer(0x00);
+void ADS1299::beginSharedTransaction() {
+    spiLock();
+    sharedSpi.beginTransaction(spiSettings);
+}
+
+void ADS1299::endSharedTransaction() {
+    sharedSpi.endTransaction();
+    spiUnlock();
+}
+bool ADS1299::readDataFrameLocked(int32_t channels[8], uint32_t& status) {
+    if (channels == nullptr) {
+        return false;
     }
 
-    // The RDATAC frame is always status + 8 channel slots (216 bits). Clock the
-    // whole frame even on a 6-channel part: stopping early leaves the device
-    // mid-frame, and a read that crosses a conversion reload then returns
-    // bit-shifted channel data.
-    for (uint8_t ch = 0; ch < 8; ++ch) {
-        uint32_t raw = 0;
-        raw = (raw << 8) | transfer(0x00);
-        raw = (raw << 8) | transfer(0x00);
-        raw = (raw << 8) | transfer(0x00);
+    // One bulk transfer for the whole 27-byte frame instead of 27 calls into the
+    // SPI driver. Each transfer() is a driver call with its own busy-wait, so the
+    // per-byte form spent more time in the driver than on the wire: at 2 MHz the
+    // clocking is 108 us, and the remaining cost was call overhead. This is the
+    // single largest saving available on the conversion path.
+    //
+    // The frame is 3 status bytes + 8 x 24-bit slots = 216 bits, and it must be
+    // clocked in full even on a 6-channel part: stopping early leaves the device
+    // mid-frame, and the next read then returns bit-shifted channel data.
+    uint8_t rx[kDataFrameBytes] = {0};
+    csLow();
+    sharedSpi.transferBytes(kFrameZeros, rx, kDataFrameBytes);
+    csHigh();
 
+    status = (static_cast<uint32_t>(rx[0]) << 16) | (static_cast<uint32_t>(rx[1]) << 8) |
+             static_cast<uint32_t>(rx[2]);
+
+    for (uint8_t ch = 0; ch < 8; ++ch) {
+        const uint8_t* slot = &rx[3 + ch * 3];
+        uint32_t raw = (static_cast<uint32_t>(slot[0]) << 16) |
+                       (static_cast<uint32_t>(slot[1]) << 8) |
+                       static_cast<uint32_t>(slot[2]);
         if (raw & 0x00800000UL) {
             raw |= 0xFF000000UL;
         }
         channels[ch] = (ch < activeChannels) ? static_cast<int32_t>(raw) : 0;
     }
-
-    csHigh();
-    sharedSpi.endTransaction();
-    spiUnlock();
 
     return true;
 }

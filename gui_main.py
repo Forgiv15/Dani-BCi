@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 import pyqtgraph.exporters
+from scipy.interpolate import CubicSpline, PchipInterpolator
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QImage, QPixmap
 from PyQt6.QtWidgets import (
@@ -126,12 +127,23 @@ VCM_FLAT = "flat"
 VCM_SINC3 = "sinc3"
 VCM_MONITOR = "monitor"
 VCM_MONITOR_CURVE = "monitor_curve"
+# Both monitor references at once: the measured voltage and the bias-curve voltage,
+# computed side by side from the same recording so the two answers can be compared
+# without recomputing and without losing the first one.
+VCM_BOTH = "both"
 VCM_MODE_LABELS = {
     VCM_FLAT: "flat amplitude",
     VCM_SINC3: "sinc3-corrected amplitude",
     VCM_MONITOR: "CM monitor measured",
     VCM_MONITOR_CURVE: "CM monitor frequencies + bias curve voltage",
+    VCM_BOTH: "CM monitor measured and bias curve voltage, side by side",
 }
+# Headings for the two reference columns when both are computed.
+VCM_SHORT_TITLES = {
+    VCM_MONITOR: "CM monitor measured",
+    VCM_MONITOR_CURVE: "bias curve voltage",
+}
+VCM_BOTH_MODES = (VCM_MONITOR, VCM_MONITOR_CURVE)
 
 
 def resolve_channel_name(reference: str, channel_names: Sequence[str]) -> str:
@@ -200,12 +212,25 @@ def _sweep_amplitude_vrms(metadata: dict[str, str]) -> float:
         return vrms
     vpp = _metadata_float(metadata, "Sweep Amplitude (Vpp)")
     return vpp / (2.0 * np.sqrt(2.0)) if vpp > 0 else 0.0
-SWEEP_FIT_ORDERS = (
-    ("No fit", 0),
-    ("Order 2", 2),
-    ("Order 3", 3),
-    ("Order 4", 4),
+# Fit choices for the sweep curves, in the same spirit as the bias-reference curve
+# builder: a global polynomial is convenient but a single wild point at either end of
+# the sweep drags a 3rd or 4th order fit away from everything else, so the exact
+# interpolants are offered alongside it. "kind" is what _fit_sweep_curve implements;
+# "order" is only meaningful for the polynomial.
+SWEEP_FIT_KINDS = (
+    ("No fit", "none", 0),
+    ("Linear between points (exact)", "linear", 0),
+    ("Exact, monotone (PCHIP)", "pchip", 0),
+    ("Exact, min curvature (spline)", "spline", 0),
+    ("Polynomial in log10(f), order 2", "poly", 2),
+    ("Polynomial in log10(f), order 3", "poly", 3),
+    ("Polynomial in log10(f), order 4", "poly", 4),
 )
+DEFAULT_SWEEP_FIT = ("poly", 3)
+# Above this, sweep points are dropped from the fit and from the fitted figure when
+# the operator asks. Measurement noise and the generator's own roll-off dominate up
+# there, and they are what pull a polynomial off the 50 Hz value.
+SWEEP_DEFAULT_MAX_FIT_HZ = 100.0
 SWEEP_FIT_REFERENCE_HZ = 50.0
 # Reported sweep figures are re-laid out wider than the on-screen widget so the
 # legend and the swept points stay readable at page width.
@@ -1082,6 +1107,11 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.crosstalk_sweep_fit_df = pd.DataFrame()
         self.gain_sweep_fit_df = pd.DataFrame()
         self.cmrr_sweep_fit_df = pd.DataFrame()
+        # The second reference, when the "both" Vcm mode is chosen: its own measured
+        # points and its own fits, kept apart so neither overwrites the other.
+        self.cmrr_sweep_df_alt = pd.DataFrame()
+        self.cmrr_sweep_fit_df_alt = pd.DataFrame()
+        self.cmrr_reference_titles: tuple[str, ...] = ()
         self.cmrr_reference_df = pd.DataFrame()
         self.cmrr_mean_fit_df = pd.DataFrame()
         self.cmrr_mean_fit_hz = float("nan")
@@ -1208,7 +1238,7 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             self._bias_dialog = BiasReferenceDialog(
                 self,
                 curve=self.bias_reference_curve,
-                use_curve=self.cmrr_vcm_mode() == VCM_MONITOR_CURVE,
+                use_curve=self.cmrr_vcm_mode() in (VCM_MONITOR_CURVE, VCM_BOTH),
             )
             self._bias_dialog.curveChanged.connect(self._on_bias_curve_changed)
             self._bias_dialog.useCurveChanged.connect(self._on_bias_curve_use_changed)
@@ -1249,16 +1279,19 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         curve = self.bias_reference_curve
         usable = curve is not None and len(curve)
         # The curve mode is only offered once there is a curve to use; the others are
-        # always available because they need nothing but the recording.
+        # always available because they need nothing but the recording. The "both"
+        # mode needs the curve as well, because half of it is the curve reference.
         model = combo.model()
-        item = model.item(3) if model is not None and model.rowCount() > 3 else None
-        if item is not None:
-            item.setEnabled(bool(usable))
-        if not usable and self.cmrr_vcm_mode() == VCM_MONITOR_CURVE:
-            monitor = self.cmrr_monitor_combo.currentText()
-            self._set_cmrr_vcm_mode(
-                VCM_MONITOR if monitor and monitor != NO_MONITOR_CHANNEL else VCM_FLAT
-            )
+        curve_rows = (3, 4)  # item indexes of the two curve-based modes
+        if model is not None:
+            for row in curve_rows:
+                item = model.item(row) if model.rowCount() > row else None
+                if item is not None:
+                    item.setEnabled(bool(usable))
+        monitor = self.cmrr_monitor_combo.currentText()
+        monitor_ok = bool(monitor) and monitor != NO_MONITOR_CHANNEL
+        if not usable and self.cmrr_vcm_mode() in (VCM_MONITOR_CURVE, VCM_BOTH):
+            self._set_cmrr_vcm_mode(VCM_MONITOR if monitor_ok else VCM_FLAT)
         mode = self.cmrr_vcm_mode()
         if mode == VCM_MONITOR_CURVE:
             coverage = curve.coverage_hz() or (0.0, 0.0)
@@ -1266,6 +1299,13 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
                 f"Bias curve ready: {curve.summary()}. Vcm is read from it at this recording's own "
                 f"frequencies ({coverage[0]:g}-{coverage[1]:g} Hz); outside that band points are "
                 "dropped rather than extrapolated."
+            )
+        elif mode == VCM_BOTH:
+            coverage = curve.coverage_hz() or (0.0, 0.0)
+            label.setText(
+                f"Both references: the voltage measured on the CM monitor channel, and the bias curve "
+                f"({coverage[0]:g}-{coverage[1]:g} Hz). Two sets of figures and two 50 Hz columns are "
+                "produced from one recording so they can be compared."
             )
         elif mode in (VCM_MONITOR, VCM_SINC3):
             label.setText(VCM_MODE_LABELS[mode] + " - the exact values appear after computing.")
@@ -1588,13 +1628,45 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
 
         row.addWidget(QLabel("Curve fit"))
         fit_combo = QComboBox()
-        for label, order in SWEEP_FIT_ORDERS:
-            fit_combo.addItem(label, order)
-        # A third-order fit in log10(f) is the useful default: it follows the
-        # rolled-off response without chasing single noisy points.
-        fit_combo.setCurrentIndex(max(fit_combo.findData(3), 0))
-        fit_combo.setToolTip("Polynomial in log10(frequency), fitted through the swept points")
+        for label, kind, order in SWEEP_FIT_KINDS:
+            fit_combo.addItem(label, (kind, order))
+        # A third-order polynomial in log10(f) is the previous default, kept so an
+        # existing report is comparable; the exact interpolants are there for when a
+        # wild point at either end of the sweep is steering the polynomial.
+        default_index = next(
+            (
+                position
+                for position in range(fit_combo.count())
+                if fit_combo.itemData(position) == DEFAULT_SWEEP_FIT
+            ),
+            0,
+        )
+        fit_combo.setCurrentIndex(default_index)
+        fit_combo.setToolTip(
+            "How the 50 Hz value is read off the swept points.\n\n"
+            "Polynomial: one curve through all the points. Convenient, but a single wild point at "
+            "low or high frequency drags a 3rd or 4th order fit away from the rest.\n\n"
+            "Linear / PCHIP / spline: pass through every measured point exactly, so no point can "
+            "steer a distant part of the curve. They cannot be evaluated outside the swept range, "
+            "and their R2 is always 1 because they are exact by construction."
+        )
         row.addWidget(fit_combo)
+
+        cutoff_check = QCheckBox("Ignore above")
+        cutoff_check.setToolTip(
+            "Leave the points above the frequency to the right out of the fit, the fitted figure "
+            "and the 50 Hz value. The measured scatter keeps showing them so it is visible what "
+            "was dropped."
+        )
+        row.addWidget(cutoff_check)
+        cutoff_spin = QDoubleSpinBox()
+        cutoff_spin.setRange(1.0, 2000.0)
+        cutoff_spin.setDecimals(0)
+        cutoff_spin.setSingleStep(10.0)
+        cutoff_spin.setValue(SWEEP_DEFAULT_MAX_FIT_HZ)
+        cutoff_spin.setSuffix(" Hz")
+        cutoff_spin.setToolTip("Points at or above this frequency are ignored while the box is ticked.")
+        row.addWidget(cutoff_spin)
 
         fit_check = QCheckBox("Show fit")
         fit_check.setChecked(True)
@@ -1615,6 +1687,8 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         setattr(self, f"{prefix}_sweep_snr_spin", snr_spin)
         setattr(self, f"{prefix}_sweep_fit_combo", fit_combo)
         setattr(self, f"{prefix}_sweep_fit_check", fit_check)
+        setattr(self, f"{prefix}_sweep_cutoff_check", cutoff_check)
+        setattr(self, f"{prefix}_sweep_cutoff_spin", cutoff_spin)
         setattr(self, f"{prefix}_sweep_fit_label", fit_label)
         setattr(self, f"{prefix}_sweep_fit_curves", [])
 
@@ -1624,6 +1698,8 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         mains_button.toggled.connect(lambda *_: self._mark_sweep_stale_for(prefix))
         fit_combo.currentIndexChanged.connect(self._on_sweep_fit_changed)
         fit_check.toggled.connect(self._on_sweep_fit_changed)
+        cutoff_check.toggled.connect(self._on_sweep_fit_changed)
+        cutoff_spin.valueChanged.connect(self._on_sweep_fit_changed)
 
         legend = plot.addLegend(offset=(-10, 10), labelTextSize="11pt", brush=(255, 255, 255, 210))
         legend.setColumnCount(2)
@@ -1657,9 +1733,35 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         button = getattr(self, f"{prefix}_sweep_mains_button", None)
         return bool(button.isChecked()) if button is not None else False
 
-    def _sweep_fit_order(self, prefix: str) -> int:
+    def _sweep_fit_spec(self, prefix: str) -> tuple[str, int]:
+        """The chosen fit: ("poly", 3), ("pchip", 0), ("none", 0) and so on."""
+
         combo = getattr(self, f"{prefix}_sweep_fit_combo", None)
-        return int(combo.currentData() or 0) if combo is not None else 0
+        if combo is None:
+            return DEFAULT_SWEEP_FIT
+        data = combo.currentData()
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            return str(data[0]), int(data[1])
+        return DEFAULT_SWEEP_FIT
+
+    def _sweep_fit_cutoff_hz(self, prefix: str) -> Optional[float]:
+        """Frequency above which points are dropped from the fit, or None."""
+
+        check = getattr(self, f"{prefix}_sweep_cutoff_check", None)
+        spin = getattr(self, f"{prefix}_sweep_cutoff_spin", None)
+        if check is None or spin is None or not check.isChecked():
+            return None
+        return float(spin.value())
+
+    def _sweep_frame_for_fit(self, prefix: str, frame: pd.DataFrame) -> pd.DataFrame:
+        """Apply the "ignore above" cutoff to the points the fit will see."""
+
+        cutoff = self._sweep_fit_cutoff_hz(prefix)
+        if cutoff is None or frame.empty or "Frequency (Hz)" not in frame:
+            return frame
+        frequencies = pd.to_numeric(frame["Frequency (Hz)"], errors="coerce")
+        keep = frequencies < cutoff
+        return frame.loc[keep.fillna(False)]
 
     def _mark_sweep_stale_for(self, prefix: str) -> None:
         """Throw away one sweep's results after its options changed."""
@@ -1681,33 +1783,86 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
     def _fit_sweep_curve(
         frequencies: np.ndarray,
         values: np.ndarray,
-        order: int,
+        kind: str = "poly",
+        order: int = 3,
         reference_hz: float = SWEEP_FIT_REFERENCE_HZ,
     ) -> Optional[dict[str, object]]:
-        """Fit a polynomial in log10(frequency) and evaluate it at the reference."""
+        """Fit one swept curve and read it off at the reference frequency.
 
-        if order <= 0:
+        ``poly`` fits a polynomial in log10(f) and extrapolates to the reference.
+        ``linear``/``pchip``/``spline`` pass through every measured point exactly, so
+        no single wild point can steer a distant part of the curve - but they are
+        only defined inside the measured range, and a reference outside it comes back
+        as ``nan`` rather than as an invented number.
+        """
+
+        if kind == "none":
             return None
         frequencies = np.asarray(frequencies, dtype=np.float64)
         values = np.asarray(values, dtype=np.float64)
         finite = np.isfinite(frequencies) & np.isfinite(values) & (frequencies > 0)
         frequencies = frequencies[finite]
         values = values[finite]
-        if frequencies.size < order + 1 or np.unique(frequencies).size < order + 1:
+        if frequencies.size < 2:
             return None
+
+        # Sorted, with duplicate frequencies collapsed: an exact interpolator refuses
+        # a repeated x, and a repeat is not new information anyway.
+        order_index = np.argsort(frequencies)
+        frequencies = frequencies[order_index]
+        values = values[order_index]
+        unique, first = np.unique(frequencies, return_index=True)
+        frequencies = unique
+        values = values[first]
+        if frequencies.size < 2:
+            return None
+
         log_frequency = np.log10(frequencies)
-        coefficients = np.polyfit(log_frequency, values, order)
         grid = np.linspace(log_frequency.min(), log_frequency.max(), 200)
-        fitted = np.polyval(coefficients, grid)
-        residuals = values - np.polyval(coefficients, log_frequency)
+        query = float(np.log10(reference_hz))
+        spans_reference = (log_frequency.min() - 1e-12) <= query <= (log_frequency.max() + 1e-12)
+
+        if kind == "poly":
+            if frequencies.size < order + 1:
+                return None
+            coefficients = np.polyfit(log_frequency, values, order)
+            fitted = np.polyval(coefficients, grid)
+            residuals = values - np.polyval(coefficients, log_frequency)
+            at_reference = float(np.polyval(coefficients, query))
+            label = f"polynomial order {order}"
+        elif kind == "linear":
+            fitted = np.interp(grid, log_frequency, values)
+            residuals = np.zeros_like(values)
+            at_reference = float(np.interp(query, log_frequency, values)) if spans_reference else float("nan")
+            label = "linear"
+        elif kind == "pchip":
+            interpolator = PchipInterpolator(log_frequency, values)
+            fitted = np.asarray(interpolator(grid), dtype=np.float64)
+            residuals = values - np.asarray(interpolator(log_frequency), dtype=np.float64)
+            at_reference = float(interpolator(query)) if spans_reference else float("nan")
+            label = "PCHIP"
+        elif kind == "spline":
+            interpolator = CubicSpline(log_frequency, values, bc_type="natural")
+            fitted = np.asarray(interpolator(grid), dtype=np.float64)
+            residuals = values - np.asarray(interpolator(log_frequency), dtype=np.float64)
+            at_reference = float(interpolator(query)) if spans_reference else float("nan")
+            label = "spline"
+        else:
+            return None
+
         total = values - values.mean()
         total_sum = float(np.sum(total**2))
+        # For an exact interpolant the residuals are zero by construction, so R2 is 1.
+        # That is reported honestly rather than hidden: it says "this curve touches
+        # every point", not "this curve is a good model".
         r_squared = 1.0 - float(np.sum(residuals**2)) / total_sum if total_sum > 0 else 1.0
         return {
-            "order": int(order),
+            "kind": str(kind),
+            "order": int(order) if kind == "poly" else 0,
+            "description": label,
             "frequencies": np.power(10.0, grid),
             "values": fitted,
-            "at_reference": float(np.polyval(coefficients, np.log10(reference_hz))),
+            "at_reference": at_reference,
             "r_squared": float(r_squared),
             "points": int(frequencies.size),
         }
@@ -1720,6 +1875,9 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         value_column: str,
         channel_labels: Sequence[str],
         channel_column: str = "Channel",
+        frame: Optional[pd.DataFrame] = None,
+        curves_key: Optional[str] = None,
+        label_widget: Optional[object] = None,
     ) -> tuple[pd.DataFrame, list[dict[str, object]]]:
         """Fit one curve per channel; return the summary and the fits.
 
@@ -1727,31 +1885,47 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         measurement figure - the CMRR tab shows the measured points and the fits in
         separate figures so neither obscures the other.
 
+        ``frame`` overrides the source table and ``curves_key`` the attribute the
+        drawn curves are kept in, so the same fit machinery can serve a second Vcm
+        reference without a second set of controls. ``label_widget=None`` suppresses
+        the summary label for such a call.
+
         ``channel_column`` names the column that holds the channel of each point:
         the crosstalk table calls it ``Target``. Matching the wrong name silently
         fitted every point of every channel into one curve.
         """
 
+        curves_attribute = curves_key or f"{prefix}_sweep_fit_curves"
         if plot is not None:
-            for curve in getattr(self, f"{prefix}_sweep_fit_curves", []):
+            for curve in getattr(self, curves_attribute, []):
                 plot.removeItem(curve)
-        setattr(self, f"{prefix}_sweep_fit_curves", [])
+        setattr(self, curves_attribute, [])
 
-        frame = getattr(self, f"{prefix}_sweep_df", pd.DataFrame())
-        label = getattr(self, f"{prefix}_sweep_fit_label", None)
-        order = self._sweep_fit_order(prefix)
+        if frame is None:
+            frame = getattr(self, f"{prefix}_sweep_df", pd.DataFrame())
+        if label_widget is None:
+            label = getattr(self, f"{prefix}_sweep_fit_label", None)
+        else:
+            label = label_widget
+        kind, order = self._sweep_fit_spec(prefix)
         show = getattr(self, f"{prefix}_sweep_fit_check", None)
         visible = show is None or show.isChecked()
         rows: list[dict[str, object]] = []
         fits: list[dict[str, object]] = []
-        empty = pd.DataFrame(columns=["Channel", "Fit Order", "Fit @ 50 Hz", "R2", "Points"])
-        if frame.empty or order <= 0:
+        empty = pd.DataFrame(columns=["Channel", "Fit", "Fit @ 50 Hz", "R2", "Points"])
+        cutoff = self._sweep_fit_cutoff_hz(prefix)
+        if frame.empty or kind == "none":
             if label is not None:
-                label.setText("" if order <= 0 or frame.empty else "fit hidden")
+                label.setText("" if kind == "none" or frame.empty else "fit hidden")
+            return empty, fits
+        frame = self._sweep_frame_for_fit(prefix, frame)
+        if frame.empty:
+            if label is not None:
+                label.setText(f"no points below {cutoff:g} Hz")
             return empty, fits
 
         value_name = f"Fit @ {SWEEP_FIT_REFERENCE_HZ:g} Hz"
-        curves = getattr(self, f"{prefix}_sweep_fit_curves", [])
+        curves = getattr(self, curves_attribute, [])
         for index, channel in enumerate(channel_labels):
             if channel_column in frame:
                 subset = frame.loc[frame[channel_column] == channel]
@@ -1760,7 +1934,7 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             if subset.empty:
                 continue
             fit = self._fit_sweep_curve(
-                subset[frequency_column].to_numpy(), subset[value_column].to_numpy(), order
+                subset[frequency_column].to_numpy(), subset[value_column].to_numpy(), kind, order
             )
             if fit is None:
                 continue
@@ -1778,28 +1952,89 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             rows.append(
                 {
                     "Channel": channel,
-                    "Fit Order": int(order),
+                    "Fit": str(fit["description"]),
                     value_name: float(fit["at_reference"]),
                     "R2": float(fit["r_squared"]),
                     "Points": int(fit["points"]),
                 }
             )
-        setattr(self, f"{prefix}_sweep_fit_curves", curves)
+        setattr(self, curves_attribute, curves)
 
         summary = pd.DataFrame(rows)
         if label is not None:
-            if summary.empty:
-                label.setText(f"order {order}: not enough swept points")
-            else:
-                values = summary[value_name]
-                if len(values) == 1:
-                    label.setText(f"{value_name}: {values.iloc[0]:.2f} dB")
-                else:
-                    label.setText(
-                        f"{value_name}: mean {values.mean():.2f} dB "
-                        f"({values.min():.2f} .. {values.max():.2f})"
-                    )
+            label.setText(self._sweep_fit_summary_text(prefix, summary, value_name, kind, cutoff))
         return summary, fits
+
+    def _converter_groups(self, channels: Sequence[str]) -> list[tuple[str, list[str]]]:
+        """Split fitted channels into the two ADS1299 converters.
+
+        Each converter is its own chip with its own SRB1/SRB2 routing, and a run that
+        used SRB2 on one converter and not the other has genuinely different
+        common-mode behaviour on each. Averaging them into one figure hides that, so
+        the 50 Hz value is reported per converter as well as overall.
+
+        Membership is decided by **position in the recorded channel list**, not by how
+        many channels happen to have produced a fit. The monitor channel never
+        produces one, so counting the fitted channels would silently collapse a
+        12-channel recording into 11 and lose the split exactly when it is wanted.
+        """
+
+        names = [str(name) for name in channels]
+        order = [str(name) for name in getattr(self, "_last_enabled_names", ()) or ()]
+        per_device = 6  # two 6-channel ADS1299s on this board
+        if len(order) < per_device * 2:
+            # No recorded ordering to work from: fall back to the fitted order, and
+            # only when there are enough channels for the split to be meaningful.
+            if len(names) < per_device * 2:
+                return []
+            order = names
+        first = [name for name in names if name in set(order[:per_device])]
+        second = [name for name in names if name in set(order[per_device:])]
+        groups: list[tuple[str, list[str]]] = []
+        if first:
+            groups.append((f"ADS1 (CH 1-{per_device})", first))
+        if second:
+            last = max(len(order), per_device + 1)
+            groups.append((f"ADS2 (CH {per_device + 1}-{min(last, len(order))})", second))
+        return groups
+
+    def _sweep_fit_summary_text(
+        self,
+        prefix: str,
+        summary: pd.DataFrame,
+        value_name: str,
+        kind: str,
+        cutoff: Optional[float],
+    ) -> str:
+        """One-line summary: the reference value overall and per converter."""
+
+        del prefix  # the wording is the same for every sweep
+        suffix = f", <{cutoff:g} Hz only" if cutoff is not None else ""
+        if summary.empty or value_name not in summary:
+            return f"{kind}{suffix}: not enough swept points"
+        values = pd.to_numeric(summary[value_name], errors="coerce").dropna()
+        if values.empty:
+            return f"{kind}{suffix}: no curve reaches {SWEEP_FIT_REFERENCE_HZ:g} Hz"
+        if len(values) == 1:
+            overall = f"{value_name}: {values.iloc[0]:.2f} dB"
+        else:
+            overall = (
+                f"{value_name}: mean {values.mean():.2f} dB "
+                f"({values.min():.2f} .. {values.max():.2f})"
+            )
+        by_channel = dict(
+            zip(
+                summary["Channel"].astype(str),
+                pd.to_numeric(summary[value_name], errors="coerce"),
+            )
+        )
+        parts = [overall + suffix]
+        for title, names in self._converter_groups(list(summary["Channel"])):
+            group = [by_channel[name] for name in names if name in by_channel]
+            group = [value for value in group if value == value]  # drop nan
+            if group:
+                parts.append(f"{title}: {np.mean(group):.2f} dB (n={len(group)})")
+        return "  |  ".join(parts)
 
     def _refresh_cmrr_reference_figure(self, monitor_name: str, common_mode_vrms: float) -> None:
         """Plot what the reference input really measured, in Vrms.
@@ -1859,11 +2094,20 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
 
         self.cmrr_reference_df = pd.DataFrame(rows).sort_values("Frequency (Hz)").reset_index(drop=True)
         self.cmrr_reference_fit_hz = float("nan")
-        order = self._sweep_fit_order("cmrr")
+        # The same fit the operator chose for the CMRR curves, because this figure is
+        # the generator-voltage counterpart of those: the loss curve here explains the
+        # Vcm those curves were divided by, so the two should be read with the same
+        # model. "No fit" leaves the measured points alone.
+        fit_kind, fit_order = self._sweep_fit_spec("cmrr")
+        reference_frame = self.cmrr_reference_df
+        cutoff = self._sweep_fit_cutoff_hz("cmrr")
+        if cutoff is not None:
+            reference_frame = reference_frame.loc[reference_frame["Frequency (Hz)"] < cutoff]
         fit = self._fit_sweep_curve(
-            self.cmrr_reference_df["Frequency (Hz)"].to_numpy(),
-            self.cmrr_reference_df["Reference (Vrms)"].to_numpy(),
-            max(order, 2),
+            reference_frame["Frequency (Hz)"].to_numpy(),
+            reference_frame["Reference (Vrms)"].to_numpy(),
+            fit_kind,
+            max(fit_order, 2),
         )
         self.cmrr_reference_plot.plot(
             self.cmrr_reference_df["Frequency (Hz)"],
@@ -1888,7 +2132,7 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
                 np.asarray(fit["frequencies"]),
                 np.asarray(fit["values"]),
                 pen=pg.mkPen((16, 120, 90), width=SWEEP_FIT_WIDTH, style=Qt.PenStyle.DashLine),
-                name=f"fit (R^2 {float(fit['r_squared']):.3f})",
+                name=f"{fit['description']} fit (R^2 {float(fit['r_squared']):.3f})",
             )
             self.cmrr_reference_df["Reference fit (Vrms)"] = np.interp(
                 self.cmrr_reference_df["Frequency (Hz)"].to_numpy(),
@@ -2015,7 +2259,39 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             "cmrr", None, "Frequency (Hz)", "CMRR (dB)", self._last_enabled_names
         )
         self.cmrr_sweep_fit_df = summary
+        # The second reference's fits, when "both" is in force. Fitted separately
+        # because its Vcm - and therefore its CMRR - is a different number at every
+        # frequency, but through the same chosen fit kind so the two columns of the
+        # 50 Hz table are comparable.
+        alt_frame = getattr(self, "cmrr_sweep_df_alt", pd.DataFrame())
+        if alt_frame.empty:
+            self.cmrr_sweep_fit_df_alt = pd.DataFrame()
+            self._clear_plot(self.cmrr_fit_alt_plot)
+        else:
+            alt_summary, alt_fits = self._draw_sweep_fit(
+                "cmrr",
+                self.cmrr_fit_alt_plot,
+                "Frequency (Hz)",
+                "CMRR (dB)",
+                self._last_enabled_names,
+                frame=alt_frame,
+                curves_key="cmrr_sweep_fit_curves_alt",
+                label_widget=None,
+            )
+            self.cmrr_sweep_fit_df_alt = alt_summary
+            self._label_alt_fit_figure(alt_fits)
         self._refresh_cmrr_fit_figures(fits)
+
+    def _label_alt_fit_figure(self, fits: Sequence[dict[str, object]]) -> None:
+        """Finish the second-reference fit figure: zoom, legend, title."""
+
+        title_item = getattr(self.cmrr_fit_alt_plot, "_sweep_title_item", None)
+        if title_item is not None:
+            title_item.setText(f"Fitted curves - {self._cmrr_reference_title(1)}")
+        self.cmrr_fit_alt_plot.setXRange(0.0, SWEEP_X_MAX_HZ, padding=0.0)
+        if fits:
+            legend = self.cmrr_fit_alt_plot.addLegend(offset=(-10, 10))
+            legend.setBrush(pg.mkBrush(255, 255, 255, 190))
 
     def _refresh_cmrr_fit_figures(self, fits: Sequence[dict[str, object]]) -> None:
         """Draw the fit-only figure, the mean-of-fits figure and the 50 Hz table.
@@ -2098,12 +2374,11 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
 
         value_name = f"Fit @ {SWEEP_FIT_REFERENCE_HZ:g} Hz"
         frame = self.cmrr_sweep_fit_df
-        if frame.empty:
+        if frame.empty or value_name not in frame:
             return
-        table = frame[["Channel", value_name, "R2", "Points"]].copy()
-        mean_value = float(table[value_name].mean())
-        table.loc[len(table)] = ["Mean of fits", mean_value, float(table["R2"].mean()), int(table["Points"].sum())]
-        self._populate_table(self.cmrr_50hz_table, table)
+        merged = self._cmrr_50hz_table_frame()
+        if not merged.empty:
+            self._populate_table(self.cmrr_50hz_table, merged)
 
     def _redraw_crosstalk_sweep_fit(self, prefix: str = "crosstalk") -> None:
         # _draw_sweep_fit returns (summary_frame, fits); assigning the tuple here
@@ -2188,6 +2463,9 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         self.cmrr_vcm_mode_combo.addItem(
             "CM monitor frequencies, voltage from the bias curve", VCM_MONITOR_CURVE
         )
+        self.cmrr_vcm_mode_combo.addItem(
+            "Both: measured and bias-curve reference, side by side", VCM_BOTH
+        )
         self.cmrr_vcm_mode_combo.setToolTip(
             "Flat: one number for the whole sweep.\n"
             "Sinc3: that number reduced with frequency by the ADS1299 digital filter at the "
@@ -2197,7 +2475,10 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             "Monitor + bias curve: frequency and timing from the monitor channel, but the "
             "voltage taken from the fitted bias reference curve. This is the one to use when a "
             "bias network attenuates the stimulus: the sweep still knows where it is, and the "
-            "voltage is the value the generator really delivered."
+            "voltage is the value the generator really delivered.\n"
+            "Both: computes the last two from the same recording and keeps both. The measured "
+            "reference gets its own figures, the bias-curve reference gets its own, and the "
+            "50 Hz table carries a column for each so the two answers can be compared directly."
         )
         self.cmrr_vcm_mode_combo.currentIndexChanged.connect(self._on_vcm_mode_changed)
         vcm_row.addWidget(self.cmrr_vcm_mode_combo, 1)
@@ -2240,6 +2521,27 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             "CMRR fit",
             "dB",
         )
+        # Only shown in the "both" mode: the second reference gets its own measured
+        # and fitted figures rather than sharing an axis with the first, because the
+        # whole point is to see the two answers next to each other.
+        self.cmrr_sweep_alt_plot = self._make_sweep_figure(
+            figures,
+            "Measured CMRR per channel - second reference",
+            "Frequency",
+            "Hz",
+            "CMRR",
+            "dB",
+        )
+        self.cmrr_fit_alt_plot = self._make_sweep_figure(
+            figures,
+            "Fitted curves - second reference",
+            "Frequency",
+            "Hz",
+            "CMRR fit",
+            "dB",
+        )
+        self.cmrr_sweep_alt_plot.setVisible(False)
+        self.cmrr_fit_alt_plot.setVisible(False)
         self.cmrr_fit_mean_plot = self._make_sweep_figure(
             figures,
             "Mean of the fitted curves with the channel spread",
@@ -2291,6 +2593,9 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         heading.setStyleSheet("font-weight: 600; color: #1e293b;")
         layout.addWidget(heading)
         plot = pg.PlotWidget()
+        # Kept so a figure whose meaning depends on a mode choice (the second Vcm
+        # reference) can rename itself instead of showing a stale generic title.
+        plot._sweep_title_item = heading
         plot.setMinimumHeight(SWEEP_PLOT_HEIGHT)
         plot.setLabel("bottom", bottom_label, units=bottom_units)
         plot.setLabel("left", left_label, units=left_units)
@@ -3590,9 +3895,20 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
     def _on_vcm_mode_changed(self, *_args) -> None:
         mode = self.cmrr_vcm_mode()
         if self._bias_dialog is not None:
-            self._bias_dialog.set_use_curve(mode == VCM_MONITOR_CURVE)
+            self._bias_dialog.set_use_curve(mode in (VCM_MONITOR_CURVE, VCM_BOTH))
         self._refresh_bias_curve_controls()
         self._mark_sweep_stale_for("cmrr")
+        # The previous run's second-reference figures no longer describe the selected
+        # mode, so they go with it rather than lingering beside a "stale" label.
+        self.cmrr_sweep_df_alt = pd.DataFrame()
+        self.cmrr_sweep_fit_df_alt = pd.DataFrame()
+        self.cmrr_reference_titles = ()
+        self._clear_plot(getattr(self, "cmrr_sweep_alt_plot", None))
+        self._clear_plot(getattr(self, "cmrr_fit_alt_plot", None))
+        for name in ("cmrr_sweep_alt_plot", "cmrr_fit_alt_plot"):
+            plot = getattr(self, name, None)
+            if plot is not None:
+                plot.setVisible(False)
 
     def cmrr_vcm_mode(self) -> str:
         combo = getattr(self, "cmrr_vcm_mode_combo", None)
@@ -3673,16 +3989,24 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         steps,
         monitor_name: str,
         metadata_vrms: float,
+        mode: Optional[str] = None,
     ) -> tuple[Optional[object], float, str]:
-        """Resolve the four modes into (lookup, flat scalar, explanation).
+        """Resolve one mode into (lookup, flat scalar, explanation).
 
         ``lookup`` wins when present: it maps frequency -> Vrms for this recording.
         ``flat`` is used only when there is no lookup. ``explanation`` goes on screen,
         because which of these is in force changes CMRR by tens of dB and that must
         never be implicit.
+
+        ``mode`` is explicit so the "both" mode can resolve each of its two
+        references through this same path instead of duplicating the logic.
         """
 
-        mode = self.cmrr_vcm_mode()
+        if mode is None:
+            mode = self.cmrr_vcm_mode()
+        if mode == VCM_BOTH:
+            # A "both" request is two requests; the caller resolves each of them.
+            raise ValueError("VCM_BOTH must be resolved through _cmrr_vcm_sources()")
         sample_rate = self.dataset.sample_rate if self.dataset else 1.0
         amplitude = float(self.common_mode_spin.value())
         if amplitude <= 0 < metadata_vrms:
@@ -3779,6 +4103,37 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         note += ". Points outside that range are dropped, not extrapolated."
         return curve.voltage_lookup(scale=scale), amplitude, note
 
+    def _cmrr_vcm_sources(
+        self,
+        monitor_values: Optional[np.ndarray],
+        steps,
+        monitor_name: str,
+        metadata_vrms: float,
+    ) -> list[dict[str, object]]:
+        """One entry per reference that has to be computed.
+
+        Every mode produces exactly one; "both" produces two, in the order they are
+        titled, so the first is always the one the measured figures belong to.
+        """
+
+        mode = self.cmrr_vcm_mode()
+        modes = list(VCM_BOTH_MODES) if mode == VCM_BOTH else [mode]
+        sources: list[dict[str, object]] = []
+        for one in modes:
+            lookup, voltage, note = self._cmrr_vcm_source(
+                monitor_values, steps, monitor_name, metadata_vrms, one
+            )
+            sources.append(
+                {
+                    "mode": one,
+                    "title": VCM_SHORT_TITLES.get(one, VCM_MODE_LABELS.get(one, one)),
+                    "lookup": lookup,
+                    "voltage": float(voltage),
+                    "note": note,
+                }
+            )
+        return sources
+
     def compute_cmrr_sweep_view(self) -> None:
         if self._last_selection_matrix is None or not self._last_enabled_names:
             QMessageBox.information(self, "CMRR Sweep", "Select a valid time region first.")
@@ -3802,41 +4157,155 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         # monitor modes, which take the voltage from the recording itself.
         spin_vrms = float(self.common_mode_spin.value())
         base_vrms = spin_vrms if spin_vrms > 0 else (metadata_vrms if steps else 0.0)
+        del base_vrms  # kept for the flat/sinc3 modes, which read the spin box directly
         self.cmrr_vcm_scale = 1.0
-        common_mode_lookup, common_mode_voltage, vcm_note = self._cmrr_vcm_source(
-            monitor_values, steps, monitor_name, metadata_vrms
-        )
-        self.cmrr_vcm_note = vcm_note
+        sources = self._cmrr_vcm_sources(monitor_values, steps, monitor_name, metadata_vrms)
+        self.cmrr_reference_titles = tuple(str(source["title"]) for source in sources)
+        self.cmrr_vcm_note = " ".join(str(source["note"]) for source in sources)
         label = getattr(self, "cmrr_vcm_label", None)
         if label is not None:
-            label.setText(vcm_note)
-        if common_mode_voltage <= 0 and common_mode_lookup is None:
-            QMessageBox.information(
-                self,
-                "CMRR Sweep",
-                "Enter a positive common-mode voltage in Vrms, or choose a CM voltage mode that "
-                "reads it from the recording.",
-            )
-            return
+            label.setText(self.cmrr_vcm_note)
+        # Every reference must be usable, or the comparison would silently be one
+        # half of what was asked for.
+        for source in sources:
+            if float(source["voltage"]) <= 0 and source["lookup"] is None:
+                QMessageBox.information(
+                    self,
+                    "CMRR Sweep",
+                    "Enter a positive common-mode voltage in Vrms, or choose a CM voltage mode "
+                    "that reads it from the recording.",
+                )
+                return
 
         self._clear_cmrr_sweep_plot()
         self.cmrr_bias_overlay = None
         if getattr(self, "cmrr_reference_note_label", None) is not None:
             self.cmrr_reference_note_label.setText("")
+
+        # The primary reference keeps the original figures; a second reference (the
+        # "both" mode) gets its own, so the two answers are never drawn on top of
+        # each other.
+        self.cmrr_sweep_df_alt = pd.DataFrame()
+        self.cmrr_sweep_fit_df_alt = pd.DataFrame()
+        self._clear_plot(self.cmrr_sweep_alt_plot)
+        self._clear_plot(self.cmrr_fit_alt_plot)
+        summary_parts: list[str] = []
+        primary_done = False
+        for position, source in enumerate(sources):
+            plot = self.cmrr_sweep_plot if position == 0 else self.cmrr_sweep_alt_plot
+            frame, accepted_total, rejected_total, plotted_channels = self._compute_cmrr_for_reference(
+                source, monitor_values, monitor_name, steps, plot
+            )
+            if position == 0:
+                self.cmrr_sweep_df = frame
+                primary_done = True
+            else:
+                self.cmrr_sweep_df_alt = frame
+            if frame.empty:
+                continue
+            suffix = "" if len(sources) == 1 else f" [{source['title']}]"
+            summary_parts.append(
+                f"{plotted_channels} ch{suffix} | {accepted_total} ok | {rejected_total} rej"
+            )
+
+        # The extra figures only exist to show the second reference; hiding them keeps
+        # the tab unchanged for every other mode.
+        both = len(sources) > 1
+        self.cmrr_sweep_alt_plot.setVisible(both)
+        self.cmrr_fit_alt_plot.setVisible(both)
+        if both:
+            self._name_alt_figures()
+
+        if not summary_parts:
+            self.cmrr_sweep_info_label.setText(f"0 ch | 0 ok | 0 rej")
+            self.cmrr_sweep_fit_df = pd.DataFrame()
+            if not primary_done:
+                self.cmrr_sweep_df = pd.DataFrame()
+            self._redraw_cmrr_sweep_fit()
+            return
+
+        correction_tag = "corr on" if self.cmrr_correction_check.isChecked() else "corr off"
+        if steps:
+            source_tag = f"generator plan ({len(steps)} steps)"
+        elif monitor_values is not None:
+            source_tag = f"from {monitor_name}"
+        else:
+            source_tag = "auto"
+        primary = sources[0]
+        if primary["lookup"] is not None:
+            source_tag += f" | Vcm {self._vcm_used_summary()}"
+        else:
+            source_tag += (
+                f" | Vcm {VCM_MODE_LABELS.get(str(primary['mode']), '?')} "
+                f"{float(primary['voltage']):.4g} Vrms"
+            )
+        if both:
+            source_tag += f" | also {sources[1]['title']}"
+        self.cmrr_sweep_info_label.setText(
+            "  ||  ".join(summary_parts) + f" | {correction_tag} | f {source_tag}"
+        )
+
+        self._refresh_cmrr_reference_figure(monitor_name, float(primary["voltage"]))
+        self._redraw_cmrr_sweep_fit()
+
+    def _name_alt_figures(self) -> None:
+        """Put the second reference's name on its two figures.
+
+        The titles are generic by default because the figure only means something in
+        the "both" mode; naming them stops the two sets being read the wrong way
+        round.
+        """
+
+        title = self._cmrr_reference_title(1)
+        for plot, prefix in (
+            (getattr(self, "cmrr_sweep_alt_plot", None), "Measured CMRR per channel"),
+            (getattr(self, "cmrr_fit_alt_plot", None), "Fitted curves"),
+        ):
+            item = getattr(plot, "_sweep_title_item", None)
+            if item is not None:
+                item.setText(f"{prefix} - {title}")
+
+    def _clear_plot(self, plot) -> None:
+        """Empty a plot without removing the curves other code holds references to."""
+
+        if plot is None:
+            return
+        try:
+            plot.clear()
+        except AttributeError:
+            return
+
+    def _compute_cmrr_for_reference(
+        self,
+        source: dict[str, object],
+        monitor_values: Optional[np.ndarray],
+        monitor_name: str,
+        steps,
+        plot,
+    ) -> tuple[pd.DataFrame, int, int, int]:
+        """Run the whole channel sweep for one Vcm reference.
+
+        Returns (combined frame, accepted windows, rejected windows, channels plotted).
+        """
+
+        common_mode_lookup = source["lookup"]
+        common_mode_voltage = float(source["voltage"])
         combined_frames: list[pd.DataFrame] = []
         accepted_total = 0
         rejected_total = 0
         plotted_channels = 0
+        sample_rate = self.dataset.sample_rate if self.dataset else 1.0
 
         for channel_index, channel_name in enumerate(self._last_enabled_names):
-            if monitor_values is not None and channel_name == monitor_name:                # The monitor channel measures the stimulus itself, so a CMRR
+            if monitor_values is not None and channel_name == monitor_name:
+                # The monitor channel measures the stimulus itself, so a CMRR
                 # number for it would be meaningless.
                 continue
             signal_values = self._last_selection_matrix[:, channel_index]
             if steps:
                 result = compute_planned_cmrr_sweep(
                     values=signal_values,
-                    sample_rate=self.dataset.sample_rate if self.dataset else 1.0,
+                    sample_rate=sample_rate,
                     steps=steps,
                     common_mode_v_rms=common_mode_voltage,
                     signal_scale_to_volts=1e-6,
@@ -3898,33 +4367,8 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             self.cmrr_sweep_curves.append(curve)
 
         if not combined_frames:
-            self.cmrr_sweep_df = pd.DataFrame()
-            self.cmrr_sweep_info_label.setText(f"0 ch | 0 ok | {rejected_total} rej")
-            self.cmrr_sweep_fit_df = pd.DataFrame()
-            return
-
-        self.cmrr_sweep_df = pd.concat(combined_frames, ignore_index=True)
-        correction_tag = "corr on" if self.cmrr_correction_check.isChecked() else "corr off"
-        if steps:
-            source_tag = f"generator plan ({len(steps)} steps)"
-        elif monitor_values is not None:
-            source_tag = f"from {monitor_name}"
-        else:
-            source_tag = "auto"
-        if common_mode_lookup is not None:
-            source_tag += f" | Vcm {self._vcm_used_summary()}"
-        else:
-            source_tag += f" | Vcm {VCM_MODE_LABELS.get(self.cmrr_vcm_mode(), '?')} {common_mode_voltage:.4g} Vrms"
-        self.cmrr_sweep_info_label.setText(
-            self._sweep_info_text(
-                "cmrr",
-                f"{plotted_channels} ch | {correction_tag} | f {source_tag}",
-                accepted_total,
-                rejected_total,
-            )
-        )
-        self._refresh_cmrr_reference_figure(monitor_name, common_mode_voltage)
-        self._redraw_cmrr_sweep_fit()
+            return pd.DataFrame(), accepted_total, rejected_total, 0
+        return pd.concat(combined_frames, ignore_index=True), accepted_total, rejected_total, plotted_channels
 
     def _vcm_used_summary(self) -> str:
         """Short description of the Vcm the curve actually supplied."""
@@ -4129,14 +4573,24 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
         if label is None:
             return
         if self.recording_name:
-            label.setText(f"Recording: {self.recording_name}")
+            parts = [f"Recording: {self.recording_name}"]
         elif self.dataset is not None and self.dataset.file_path is not None:
-            label.setText(f"Recording: {self.dataset.file_path.stem}")
+            parts = [f"Recording: {self.dataset.file_path.stem}"]
         else:
-            label.setText("Recording: -")
+            parts = ["Recording: -"]
+        # The sampling rate is the one number every FFT axis, filter corner and time
+        # base in this window derives from, so it belongs on screen rather than
+        # buried in the header. It is the ADS1299 output data rate - the rate each
+        # channel is sampled at - not a figure divided by the converter count.
+        dataset = getattr(self, "dataset", None)
+        rate = getattr(dataset, "sample_rate", None) if dataset is not None else None
+        if rate:
+            parts.append(f"{rate:g} Hz per channel")
+        label.setText("   |   ".join(parts))
         label.setToolTip(
             "This name comes from the recording header (the name you gave it in the live recorder) "
-            "and is used by default when exporting."
+            "and is used by default when exporting. The rate shown is the ADS1299 output data "
+            "rate recorded in the file."
         )
         measurement_label = getattr(self, "measurement_label", None)
         if measurement_label is not None:
@@ -4457,14 +4911,36 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             writer.heading("CMRR sweep", keep_with_next=0.42)
             writer.image(
                 self._plot_pixmap(self.cmrr_sweep_plot, aspect=SWEEP_FIGURE_ASPECT),
-                "Measured CMRR versus frequency, one curve per channel",
+                f"Measured CMRR versus frequency, one curve per channel "
+                f"({self._cmrr_reference_title(0)})",
+                max_height=SWEEP_FIGURE_MAX_HEIGHT,
+            )
+        # The second reference, when the "both" mode produced one. Same block shape as
+        # the first so the two can be compared page against page.
+        alt_measurements = getattr(self, "cmrr_sweep_df_alt", pd.DataFrame())
+        if cmrr_figures and not alt_measurements.empty:
+            writer.heading(f"CMRR sweep - {self._cmrr_reference_title(1)}", keep_with_next=0.42)
+            writer.image(
+                self._plot_pixmap(self.cmrr_sweep_alt_plot, aspect=SWEEP_FIGURE_ASPECT),
+                f"Measured CMRR versus frequency ({self._cmrr_reference_title(1)}), one curve "
+                f"per channel",
                 max_height=SWEEP_FIGURE_MAX_HEIGHT,
             )
         if cmrr_figures and not self.cmrr_sweep_fit_df.empty:
             writer.heading("CMRR fitted curves", keep_with_next=0.42)
             writer.image(
                 self._plot_pixmap(self.cmrr_fit_plot, aspect=SWEEP_FIGURE_ASPECT),
-                "Polynomial fit of each channel in log10(frequency), without the measured points",
+                f"Fit of each channel ({self._sweep_fit_spec('cmrr')[0]}) in log10(frequency), "
+                f"without the measured points - {self._cmrr_reference_title(0)}",
+                max_height=SWEEP_FIGURE_MAX_HEIGHT,
+            )
+        alt_fits = getattr(self, "cmrr_sweep_fit_df_alt", pd.DataFrame())
+        if cmrr_figures and not alt_fits.empty:
+            writer.heading(f"CMRR fitted curves - {self._cmrr_reference_title(1)}", keep_with_next=0.42)
+            writer.image(
+                self._plot_pixmap(self.cmrr_fit_alt_plot, aspect=SWEEP_FIGURE_ASPECT),
+                f"Fit of each channel ({self._sweep_fit_spec('cmrr')[0]}) in log10(frequency) - "
+                f"{self._cmrr_reference_title(1)}",
                 max_height=SWEEP_FIGURE_MAX_HEIGHT,
             )
         if cmrr_figures and not self.cmrr_mean_fit_df.empty:
@@ -4484,31 +4960,94 @@ class ScientificSignalAnalyzerWindow(QMainWindow):
             )
         if cmrr_figures and not self.cmrr_sweep_fit_df.empty:
             writer.heading(f"CMRR at {SWEEP_FIT_REFERENCE_HZ:g} Hz", keep_with_next=0.14)
-            writer.paragraph(
-                [
-                    f"Taken from each channel's fitted curve, not from a swept point, so no "
-                    f"measurement sits exactly on {SWEEP_FIT_REFERENCE_HZ:g} Hz."
-                ],
-                size=8.5,
-            )
+            both = not getattr(self, "cmrr_sweep_fit_df_alt", pd.DataFrame()).empty
+            text = [
+                f"Taken from each channel's fitted curve, not from a swept point, so no "
+                f"measurement sits exactly on {SWEEP_FIT_REFERENCE_HZ:g} Hz. The fit itself is "
+                f"the one chosen under Curve fit, and the per-converter rows exist because SRB1 "
+                f"and SRB2 are routed per chip - the two converters are separate measurements."
+            ]
+            if both:
+                text.append(
+                    f"Both common-mode references are shown: "
+                    f"{self._cmrr_reference_title(0)} and {self._cmrr_reference_title(1)}. They "
+                    f"were computed from the same recording, so the difference between the two "
+                    f"columns is the bias network's attenuation and nothing else."
+                )
+            writer.paragraph(text, size=8.5)
             writer.table(self._cmrr_50hz_frame(), caption="Fitted CMRR at the reference frequency")
         return writer.close()
 
-    def _cmrr_50hz_frame(self) -> pd.DataFrame:
-        """The 50 Hz table as a frame, with the mean of the channel fits appended."""
+    def _cmrr_50hz_table_frame(self) -> pd.DataFrame:
+        """The 50 Hz table, with one column per reference when both were computed.
+
+        One builder for the on-screen table and the report, so the two can never
+        disagree about what the fit produced.
+        """
 
         value_name = f"Fit @ {SWEEP_FIT_REFERENCE_HZ:g} Hz"
-        frame = self.cmrr_sweep_fit_df
-        if frame.empty or value_name not in frame:
+        primary = self.cmrr_sweep_fit_df
+        if primary.empty or value_name not in primary:
             return pd.DataFrame()
-        table = frame[["Channel", value_name, "R2", "Points"]].copy()
-        table.loc[len(table)] = [
-            "Mean of fits",
-            float(frame[value_name].mean()),
-            float(frame["R2"].mean()),
-            int(frame["Points"].sum()),
-        ]
-        return table.rename(columns={value_name: f"CMRR @ {SWEEP_FIT_REFERENCE_HZ:g} Hz (dB)", "R2": "R^2"})
+        alt = getattr(self, "cmrr_sweep_fit_df_alt", pd.DataFrame())
+        both = not alt.empty and value_name in alt
+
+        columns = ["Channel"]
+        primary_title = f"CMRR @ 50 Hz - {self._cmrr_reference_title(0)} (dB)"
+        table = pd.DataFrame({"Channel": primary["Channel"].astype(str)})
+        table[primary_title] = pd.to_numeric(primary[value_name], errors="coerce")
+        if both:
+            alt_title = f"CMRR @ 50 Hz - {self._cmrr_reference_title(1)} (dB)"
+            lookup = dict(
+                zip(alt["Channel"].astype(str), pd.to_numeric(alt[value_name], errors="coerce"))
+            )
+            table[alt_title] = [lookup.get(name, np.nan) for name in table["Channel"]]
+        table["R^2"] = pd.to_numeric(primary["R2"], errors="coerce")
+        table["Points"] = pd.to_numeric(primary["Points"], errors="coerce")
+
+        value_columns = [primary_title] + ([alt_title] if both else [])
+        extra_rows = []
+        extra_rows.append(
+            self._cmrr_50hz_summary_row("Mean of fits", table, value_columns)
+        )
+        # Per converter as well: SRB1/SRB2 routing is per chip, so the two converters
+        # are separate measurements and one average would describe neither of them.
+        names = list(table["Channel"])
+        for title, members in self._converter_groups(names):
+            subset = table[table["Channel"].isin(members)]
+            if subset.empty:
+                continue
+            extra_rows.append(self._cmrr_50hz_summary_row(title, subset, value_columns))
+        if extra_rows:
+            table = pd.concat([table, pd.DataFrame(extra_rows)], ignore_index=True)
+        return table
+
+    @staticmethod
+    def _cmrr_50hz_summary_row(
+        title: str, frame: pd.DataFrame, value_columns: Sequence[str]
+    ) -> dict[str, object]:
+        row: dict[str, object] = {"Channel": title, "R^2": np.nan, "Points": int(len(frame))}
+        for column in value_columns:
+            values = pd.to_numeric(frame[column], errors="coerce").dropna()
+            row[column] = float(values.mean()) if not values.empty else np.nan
+        return row
+
+    def _cmrr_reference_title(self, position: int) -> str:
+        """How each reference is named in the table and the report."""
+
+        titles = getattr(self, "cmrr_reference_titles", ())
+        if position < len(titles):
+            return str(titles[position])
+        if position == 0 and self.cmrr_vcm_mode() == VCM_BOTH:
+            return VCM_SHORT_TITLES[VCM_BOTH_MODES[0]]
+        if position == 0:
+            return VCM_MODE_LABELS.get(self.cmrr_vcm_mode(), "reference")
+        return VCM_SHORT_TITLES.get(VCM_BOTH_MODES[1], "second reference")
+
+    def _cmrr_50hz_frame(self) -> pd.DataFrame:
+        """The 50 Hz table for the report."""
+
+        return self._cmrr_50hz_table_frame()
 
     def _write_png(self, base: Path, options: ExportOptions) -> list[str]:
         written: list[str] = []

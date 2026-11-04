@@ -40,6 +40,40 @@ public:
     void readRegisters(uint8_t startAddress, uint8_t count, uint8_t* data);
     void writeRegister(uint8_t address, uint8_t value);
 
+    // Batched frame reads.
+    //
+    // Both converters share the bus and use identical SPISettings, so locking the
+    // mutex and re-applying the transaction once per chip is pure overhead on the
+    // conversion critical path. These let a caller bracket the whole pair with one
+    // lock: begin once, read each device, end once.
+    //
+    // The CS pulses stay strictly sequential. Both devices drive the same MISO line,
+    // so asserting two chip selects together would put two drivers on it.
+    //
+    // Not static: the transaction uses this instance's SPISettings. Every instance on
+    // the bus holds identical settings (setSpiClock is applied to all of them), so
+    // whichever one brackets the batch is authoritative.
+    void beginSharedTransaction();
+    void endSharedTransaction();
+    bool readDataFrameLocked(int32_t channels[8], uint32_t& status);
+
+    // Writes a register and reads it back, retrying a few times. Returns false only
+    // when the value still does not match after every attempt.
+    //
+    // This exists because a WREG that is clocked marginally - which is what a long
+    // shared SCLK at 4 MHz and above produces - can land a *wrong value* rather than
+    // none at all. A wrong data-rate bit reads back as a plausible slower rate and a
+    // wrong CHnSET reads back as a plausible different montage, so neither is visible
+    // without a readback. Callers must not be in RDATAC: the readback is an RREG.
+    bool writeRegisterVerified(uint8_t address, uint8_t value, uint8_t attempts = 3);
+
+    // Number of verified writes that never matched, and the last register that
+    // failed. Configuration code reports these so "the settings did not apply" has a
+    // name and a count instead of being inferred from the data.
+    uint32_t verifyFailureCount() const;
+    uint8_t lastVerifyFailureRegister() const;
+    void clearVerifyFailures();
+
     // Diagnostics: returns the exact bytes clocked in during an RREG command
     // (trace[0] = during opcode, trace[1] = during register count,
     // trace[2] = during the data byte) without any validation.
@@ -125,7 +159,8 @@ private:
     uint8_t gain;
     uint8_t activeChannels;
     uint8_t config1Cache;
-    bool clockOutput;
+    uint32_t verifyFailures = 0;
+    uint8_t lastVerifyFailRegister = 0;    bool clockOutput;
     uint8_t channelSettings[8];
     uint8_t biasSenseP;
     uint8_t biasSenseN;

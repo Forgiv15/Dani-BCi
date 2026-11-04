@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -58,6 +59,7 @@ from PyQt6.QtWidgets import (
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -239,16 +241,44 @@ RECONNECT_DELAY_MS = 2000
 # the driver and then ignored, because the bytes travel over RFCOMM at the radio's
 # own rate. Any budget computed from the baud combo is therefore wrong for a
 # Bluetooth port, and using it would throttle the sample rate for a limit that does
-# not exist. This is the figure the budget uses instead: deliberately conservative
-# for ESP32 classic SPP (measured rates are usually higher), and about twice what
-# 12 channels at 500 SPS needs.
-BLUETOOTH_SPP_BYTES_PER_SECOND = 32 * 1024
+# not exist. This is the figure the budget uses instead. It was 32 KiB/s, which came
+# from the Arduino library's 330-byte write path; through the library queue that path
+# is pipelined and measured 88-99 KiB/s on this board, so 80 KiB/s is used as a
+# realistic planning figure with a little headroom. It is deliberately still only a
+# warning: the operator may ask for more and watch what actually arrives.
+BLUETOOTH_SPP_BYTES_PER_SECOND = 80 * 1024
 UI_INTERVAL_MS = 33
 FFT_INTERVAL_TICKS = 4
 VERIFY_TIMEOUT_MS = 4000
 REPAIR_TIMEOUT_MS = 6000
 # Corner of the running average shown as "DC" under every channel badge.
 DC_CUTOFF_HZ = 0.1
+# -- noise measurement -------------------------------------------------------
+# The noise figure is the RMS of the last NOISE_WINDOW_SECONDS of stream inside a
+# band, which is what "input referred noise in this bandwidth" means for a
+# biopotential front end. Ten seconds is long enough for the estimate to settle at
+# the 0.1 Hz end and short enough that it follows a change in the setup.
+NOISE_WINDOW_SECONDS = 10.0
+# (low, high) in Hz. 0.1-100 and 0.5-100 are the usual EEG bands; 0.1-250 follows the
+# whole usable range of a 500 SPS stream.
+NOISE_BANDS = ((0.1, 100.0), (0.5, 100.0), (0.1, 250.0))
+NOISE_INTERVAL_CHOICES = ((500, "every 500 ms"), (200, "every 200 ms"))
+DEFAULT_NOISE_INTERVAL_MS = 500
+# Noise mode pins the spectrum to exactly two decades so runs can be compared by
+# eye. The unit is the one the FFT axis already uses: microvolts RMS.
+NOISE_FFT_FLOOR_UV = 1e-3
+NOISE_FFT_CEILING_UV = 1e-1
+# Horizontal (across-frequency) averaging of the spectrum, in bins. Time smoothing
+# averages successive updates; this averages neighbouring bins, which is what makes a
+# noisy average trace readable.
+FFT_FREQ_SMOOTHING_CHOICES = (
+    ("Off", 1),
+    ("3 bins", 3),
+    ("5 bins", 5),
+    ("9 bins", 9),
+    ("17 bins", 17),
+)
+DEFAULT_FFT_FREQ_SMOOTHING_BINS = 1
 # How long a channel may report exactly zero before it is called out.
 STALL_SECONDS = 2.0
 # Fraction of the ADC full scale above which an input counts as saturated, and
@@ -744,6 +774,241 @@ class AccelerometerPanel(QWidget):
             painter.drawText(footer_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, self._note)
         painter.end()
 
+class NoisePanel(QWidget):
+    """Per-channel input noise in fixed bands over the last ten seconds.
+
+    The figure is the RMS of the stream inside a band, which is what "input referred
+    noise" means for a front end and the number a datasheet quotes. One windowed
+    rFFT of the last ten seconds serves every band, so the bands need no separate
+    filter stage and the whole table costs a single transform.
+
+    Channels are combined by averaging their band *power* (the RMS of the RMS
+    values), which is the meaningful average for noise that is uncorrelated between
+    channels; averaging in the time domain would have cancelled part of it.
+    """
+
+    AVERAGE_KEY = -1
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(230)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._rows: list[int] = []
+        self._labels: list[str] = []
+        self._measured_seconds = 0.0
+        self._sample_rate = 0.0
+        self._last_update = time.monotonic()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        title = QLabel("Input noise")
+        title.setStyleSheet("font-weight: 600;")
+        title.setToolTip(
+            "RMS of the raw stream inside each band, before the display filters: "
+            "the bands are the filter."
+        )
+        header.addWidget(title)
+        header.addSpacing(8)
+        header.addWidget(QLabel("Update"))
+        self.interval_combo = QComboBox()
+        for value, label in NOISE_INTERVAL_CHOICES:
+            self.interval_combo.addItem(label, value)
+        self.interval_combo.setCurrentIndex(
+            max(0, self.interval_combo.findData(DEFAULT_NOISE_INTERVAL_MS))
+        )
+        self.interval_combo.setMaximumWidth(140)
+        header.addWidget(self.interval_combo)
+        header.addStretch(1)
+        self.status_label = QLabel("collecting...")
+        self.status_label.setStyleSheet("color: #64748b; font-size: 11px;")
+        header.addWidget(self.status_label)
+        layout.addLayout(header)
+
+        self.table = QTableWidget(0, 1 + len(NOISE_BANDS))
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(22)
+        self.table.setWordWrap(False)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setShowGrid(True)
+        layout.addWidget(self.table, 1)
+
+        self.note_label = QLabel("")
+        self.note_label.setWordWrap(True)
+        self.note_label.setStyleSheet("color: #64748b; font-size: 11px;")
+        layout.addWidget(self.note_label)
+        self._refresh_headers()
+
+    # -- configuration -----------------------------------------------------
+
+    def interval_ms(self) -> int:
+        return max(50, int(self.interval_combo.currentData() or DEFAULT_NOISE_INTERVAL_MS))
+
+    def set_interval_ms(self, value: int) -> None:
+        position = self.interval_combo.findData(int(value))
+        if position >= 0:
+            self.interval_combo.setCurrentIndex(position)
+
+    def _refresh_headers(self) -> None:
+        headers = ["Channel"] + [f"{low:g}-{high:g} Hz (uVrms)" for low, high in NOISE_BANDS]
+        self.table.setHorizontalHeaderLabels(headers)
+
+    def reset(self) -> None:
+        self._measured_seconds = 0.0
+        self.table.setRowCount(0)
+        self._rows = []
+        self.status_label.setText("collecting...")
+        self.note_label.setText("")
+
+    # -- measurement -------------------------------------------------------
+
+    @staticmethod
+    def band_rms(block: np.ndarray, sample_rate: float, low_hz: float, high_hz: float) -> Optional[np.ndarray]:
+        """RMS per column of a detrended, windowed block inside a frequency band.
+
+        Uses Parseval's relation so the answer does not depend on the window:
+        ``ms = 2 * sum(|X_k|^2) / (N * sum(w^2))`` over the positive bins of the
+        band (the factor 2 folds the negative frequencies in). Returns None when the
+        band contains no bin.
+        """
+
+        if block.ndim != 2 or block.shape[0] < 32 or sample_rate <= 0:
+            return None
+        count = block.shape[0]
+        centred = block - np.mean(block, axis=0, keepdims=True)
+        weights = np.hanning(count)
+        window_power = float(np.sum(weights * weights))
+        if window_power <= 0:
+            return None
+        spectrum = np.fft.rfft(centred * weights[:, None], axis=0)
+        power = spectrum.real * spectrum.real + spectrum.imag * spectrum.imag
+        frequencies = np.fft.rfftfreq(count, 1.0 / float(sample_rate))
+        selected = (frequencies >= float(low_hz)) & (frequencies <= float(high_hz))
+        if not np.any(selected):
+            return None
+        total = np.sum(power[selected], axis=0)
+        mean_square = 2.0 * total / (count * window_power)
+        return np.sqrt(np.maximum(mean_square, 0.0))
+
+    def update_noise(
+        self,
+        block: Optional[np.ndarray],
+        sample_rate: float,
+        channels: Sequence[int],
+        labels: Sequence[str],
+        force: bool = False,
+    ) -> None:
+        """Recompute the table if the refresh interval has elapsed."""
+
+        now = time.monotonic()
+        if not force and (now - self._last_update) * 1000.0 < self.interval_ms():
+            return
+        self._last_update = now
+
+        if block is None or block.size == 0 or sample_rate <= 0:
+            self.status_label.setText("waiting for data")
+            return
+
+        wanted = [index for index in channels if 0 <= index < block.shape[1]]
+        if not wanted:
+            self.table.setRowCount(0)
+            self._rows = []
+            self.status_label.setText("no channels selected")
+            return
+
+        target = int(round(NOISE_WINDOW_SECONDS * sample_rate))
+        usable = min(block.shape[0], target)
+        self._measured_seconds = usable / float(sample_rate)
+        self._sample_rate = float(sample_rate)
+
+        segment = np.asarray(block[-usable:], dtype=np.float64)
+        if not np.all(np.isfinite(segment)):
+            segment = np.nan_to_num(segment)
+        selected = segment[:, wanted]
+
+        columns = [self.band_rms(selected, sample_rate, low, high) for low, high in NOISE_BANDS]
+
+        self._sync_rows(wanted, labels)
+        self._fill_rows(columns)
+
+        nyquist = float(sample_rate) / 2.0
+        clipped = [
+            f"{high:g} Hz (limited to {nyquist:g} Hz by the sample rate)"
+            for low, high in NOISE_BANDS
+            if high > nyquist + 1e-6
+        ]
+        self.note_label.setText(
+            "Band above Nyquist: " + "; ".join(clipped) if clipped else ""
+        )
+        if self._measured_seconds < NOISE_WINDOW_SECONDS - 1e-6:
+            self.status_label.setText(
+                f"last {self._measured_seconds:.1f} s of {NOISE_WINDOW_SECONDS:g} s"
+            )
+        else:
+            self.status_label.setText(f"last {NOISE_WINDOW_SECONDS:g} s")
+
+    def _sync_rows(self, channels: Sequence[int], labels: Sequence[str]) -> None:
+        """Rebuild the table when the selection changes; the average stays on top.
+
+        The average is the figure being watched, so it sits in the first row: with
+        twelve channels the bottom of the table is normally scrolled out of view.
+        """
+
+        names = [channel_label(index) if index >= len(labels) else labels[index] for index in channels]
+        if self._rows == list(channels) and self.table.rowCount() == len(channels) + 1:
+            for position, name in enumerate(names):
+                item = self.table.item(position + 1, 0)
+                if item is not None and item.text() != name:
+                    item.setText(name)
+            return
+
+        self._rows = list(channels)
+        self._labels = names
+        self.table.setRowCount(len(names) + 1)
+        bold = QFont(self.table.font())
+        bold.setBold(True)
+        average_item = QTableWidgetItem("Average")
+        average_item.setFont(bold)
+        self.table.setItem(0, 0, average_item)
+        for column in range(len(NOISE_BANDS)):
+            cell = QTableWidgetItem("--")
+            cell.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            cell.setFont(bold)
+            self.table.setItem(0, column + 1, cell)
+        for position, name in enumerate(names, start=1):
+            self.table.setItem(position, 0, QTableWidgetItem(name))
+            for column in range(len(NOISE_BANDS)):
+                cell = QTableWidgetItem("--")
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.table.setItem(position, column + 1, cell)
+
+    def _fill_rows(self, columns: Sequence[Optional[np.ndarray]]) -> None:
+        rows = len(self._rows)
+        if rows == 0:
+            return
+        for position, values in enumerate(columns):
+            column = position + 1
+            if values is None or values.size != rows:
+                for row in range(rows + 1):
+                    item = self.table.item(row, column)
+                    if item is not None:
+                        item.setText("--")
+                continue
+            for row in range(rows):
+                item = self.table.item(row + 1, column)
+                if item is not None:
+                    item.setText(f"{float(values[row]):.4g}")
+            # RMS of the per-channel RMS values: power averaging.
+            mean_square = float(np.mean(np.square(values)))
+            item = self.table.item(0, column)
+            if item is not None:
+                item.setText(f"{np.sqrt(mean_square):.4g}")
+
 class TrackGutter(QWidget):
     """Left gutter of one trace row: channel badge, DC value and amplitude labels."""
 
@@ -1203,6 +1468,8 @@ class SpectrumPanel(QWidget):
         self._end_hz = 0.0
         self._nyquist_hz = 0.0
         self._grid_lines: list[pg.InfiniteLine] = []
+        self._noise_mode = False
+        self._noise_previous: Optional[tuple[bool, int]] = None
 
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setMenuEnabled(False)
@@ -1251,6 +1518,18 @@ class SpectrumPanel(QWidget):
         for label, value in SMOOTHING_CHOICES:
             self.smoothing_combo.addItem(label, value)
 
+        self.freq_smoothing_combo = QComboBox()
+        for label, value in FFT_FREQ_SMOOTHING_CHOICES:
+            self.freq_smoothing_combo.addItem(label, value)
+        self.freq_smoothing_combo.setCurrentIndex(
+            max(0, self.freq_smoothing_combo.findData(DEFAULT_FFT_FREQ_SMOOTHING_BINS))
+        )
+        self.freq_smoothing_combo.setToolTip(
+            "Horizontal averaging across neighbouring frequency bins. Off keeps the raw bins; "
+            "wider windows make the average trace much easier to read."
+        )
+        self.freq_smoothing_combo.setMaximumWidth(72)
+
         self.scale_combo = QComboBox()
         for label, value in SPECTRUM_SCALE_CHOICES:
             self.scale_combo.addItem(label, value)
@@ -1289,6 +1568,8 @@ class SpectrumPanel(QWidget):
         first_row.addWidget(self.window_combo)
         first_row.addWidget(QLabel("Smooth"))
         first_row.addWidget(self.smoothing_combo)
+        first_row.addWidget(QLabel("Freq avg"))
+        first_row.addWidget(self.freq_smoothing_combo)
         first_row.addWidget(self.pause_check)
         first_row.addStretch(1)
 
@@ -1323,6 +1604,8 @@ class SpectrumPanel(QWidget):
         self.points_combo.currentIndexChanged.connect(self._reset_smoothing)
         self.window_combo.currentIndexChanged.connect(self._reset_smoothing)
         self.smoothing_combo.currentIndexChanged.connect(self._reset_smoothing)
+        # Frequency averaging is applied at draw time, so it only needs a repaint.
+        self.freq_smoothing_combo.currentIndexChanged.connect(self._refresh_amplitude_axis)
 
     # -- channel selection -------------------------------------------------
 
@@ -1384,9 +1667,10 @@ class SpectrumPanel(QWidget):
             self._update_peak_label()
 
     def _on_mouse_moved(self, position) -> None:
-        if self._bins is None or self._bins[0].size == 0:
+        display = self._display_bins()
+        if display is None or display[0].size == 0:
             return
-        frequencies, amplitudes = self._bins
+        frequencies, amplitudes = display
         view_box = self.plot_widget.getPlotItem().vb
         if not view_box.sceneBoundingRect().contains(position):
             self._set_cursor_visible(False)
@@ -1414,10 +1698,11 @@ class SpectrumPanel(QWidget):
         self._set_readout(f"{float(frequencies[index]):.2f} Hz    {best_value:.3f} uVrms    {name}")
 
     def _update_peak_label(self) -> None:
-        if self._bins is None or self._bins[0].size == 0:
+        display = self._display_bins()
+        if display is None or display[0].size == 0:
             self.readout_label.setText("")
             return
-        frequencies, amplitudes = self._bins
+        frequencies, amplitudes = display
         best_index = None
         best_value = 0.0
         for values in amplitudes.values():
@@ -1437,6 +1722,39 @@ class SpectrumPanel(QWidget):
         self._signature = None
         self._bins = None
 
+    # -- frequency averaging -----------------------------------------------
+
+    def freq_smoothing_bins(self) -> int:
+        return max(1, int(self.freq_smoothing_combo.currentData() or 1))
+
+    @staticmethod
+    def _average_bins(values: np.ndarray, width: int) -> np.ndarray:
+        """Centred moving average along the frequency axis.
+
+        Convolving the data *and* a window of ones and dividing keeps the ends at
+        full height instead of letting them fade towards zero, which a plain
+        'same' convolution would do.
+        """
+        if width <= 1 or values.size < 3:
+            return values
+        width = int(min(width, values.size if values.size % 2 else values.size - 1))
+        if width <= 1:
+            return values
+        kernel = np.ones(width, dtype=float)
+        total = np.convolve(values, kernel, mode="same")
+        counts = np.convolve(np.ones(values.size, dtype=float), kernel, mode="same")
+        return total / np.maximum(counts, 1.0)
+
+    def _display_bins(self) -> Optional[tuple[np.ndarray, dict[int, np.ndarray]]]:
+        """The bins as drawn and read out, with the horizontal average applied."""
+        if self._bins is None:
+            return None
+        frequencies, stored = self._bins
+        width = self.freq_smoothing_bins()
+        if width <= 1:
+            return frequencies, stored
+        return frequencies, {key: self._average_bins(values, width) for key, values in stored.items()}
+
     # -- configuration -----------------------------------------------------
 
     def apply_settings(self, view: dict) -> None:
@@ -1449,6 +1767,9 @@ class SpectrumPanel(QWidget):
         smoothing = float(view.get("fft_smoothing", 0.0))
         smooth_index = min(range(len(SMOOTHING_CHOICES)), key=lambda i: abs(SMOOTHING_CHOICES[i][1] - smoothing))
         self.smoothing_combo.setCurrentIndex(smooth_index)
+        freq_bins = int(view.get("fft_freq_smoothing_bins", DEFAULT_FFT_FREQ_SMOOTHING_BINS) or 1)
+        freq_index = self.freq_smoothing_combo.findData(freq_bins)
+        self.freq_smoothing_combo.setCurrentIndex(freq_index if freq_index >= 0 else 0)
         scale = float(view.get("fft_scale_mode", 0.0) or 0.0)
         scale_index = min(range(len(SPECTRUM_SCALE_CHOICES)), key=lambda i: abs(SPECTRUM_SCALE_CHOICES[i][1] - scale))
         self.scale_combo.setCurrentIndex(scale_index)
@@ -1588,12 +1909,15 @@ class SpectrumPanel(QWidget):
         self._update_frequency_axis(end_hz, nyquist)
         self.plot_widget.setXRange(0.0, end_hz, padding=0.0)
 
-        combined = np.concatenate(list(stored.values()))
+        display = self._display_bins()
+        drawn = display[1] if display is not None else stored
+
+        combined = np.concatenate(list(drawn.values()))
         self._data_max = float(np.max(combined)) if combined.size else None
         low, high = self._apply_amplitude_axis()
 
         for channel_index, curve in self.curves.items():
-            values = stored.get(channel_index)
+            values = drawn.get(channel_index)
             if values is None:
                 curve.hide()
                 continue
@@ -1602,7 +1926,7 @@ class SpectrumPanel(QWidget):
 
         if average:
             self.average_curve.setData(
-                frequencies[positive], self._plot_values(stored[self.AVERAGE_KEY], low, high)
+                frequencies[positive], self._plot_values(drawn[self.AVERAGE_KEY], low, high)
             )
             self.average_curve.show()
         else:
@@ -1616,6 +1940,8 @@ class SpectrumPanel(QWidget):
 
     def _amplitude_bounds(self) -> tuple[float, float]:
         """Amplitude window implied by the Scale/Log controls (works without data)."""
+        if self._noise_mode:
+            return NOISE_FFT_FLOOR_UV, NOISE_FFT_CEILING_UV
         fixed = float(self.scale_combo.currentData() or 0.0)
         data_max = self._data_max
         if self.log_check.isChecked():
@@ -1676,9 +2002,10 @@ class SpectrumPanel(QWidget):
         return clipped
 
     def _redraw_stored(self) -> None:
-        if self._bins is None:
+        display = self._display_bins()
+        if display is None:
             return
-        frequencies, stored = self._bins
+        frequencies, stored = display
         low, high = self._amplitude_bounds()
         for channel_index, curve in self.curves.items():
             values = stored.get(channel_index)
@@ -1694,6 +2021,47 @@ class SpectrumPanel(QWidget):
         self._apply_amplitude_axis()
         self._redraw_stored()
         self._place_readout()
+
+    def set_noise_mode(self, enabled: bool) -> None:
+        """Pin the spectrum to two decades while the noise tab is in front.
+
+        The noise figures are read off the floor of the spectrum, so the axis is
+        locked instead of following the strongest bin: two runs at different gains
+        or with different amounts of mains pickup then stay directly comparable.
+        """
+        enabled = bool(enabled)
+        if enabled == self._noise_mode:
+            return
+        self._noise_mode = enabled
+        if enabled:
+            self._noise_previous = (self.log_check.isChecked(), self.scale_combo.currentIndex())
+            blocker = QSignalBlocker(self.log_check)
+            self.log_check.setChecked(True)
+            del blocker
+            self.log_check.setEnabled(False)
+            self.scale_combo.setEnabled(False)
+            self.log_check.setToolTip("Noise mode always uses the logarithmic axis")
+            self.scale_combo.setToolTip(
+                f"Noise mode locks the axis to {NOISE_FFT_FLOOR_UV:g} ... "
+                f"{NOISE_FFT_CEILING_UV:g} uVrms (two decades)"
+            )
+        else:
+            previous = self._noise_previous or (False, self.scale_combo.currentIndex())
+            self.log_check.setEnabled(True)
+            self.scale_combo.setEnabled(True)
+            self.log_check.setToolTip(
+                "Logarithmic amplitude axis with one grid line per decade: 1 uVrms up to the highest "
+                "decade of the selected scale (10^3 for 1000 uVrms, 10^2 for 100 uVrms)."
+            )
+            self.scale_combo.setToolTip("Upper end of the amplitude axis (Auto follows the strongest bin)")
+            blocker = QSignalBlocker(self.log_check)
+            self.log_check.setChecked(bool(previous[0]))
+            del blocker
+            self.scale_combo.setCurrentIndex(int(previous[1]))
+        self._refresh_amplitude_axis()
+
+    def noise_mode(self) -> bool:
+        return self._noise_mode
 
     def set_sample_rate(self, sample_rate: float) -> None:
         """Keep the frequency axis meaningful before the first data block."""
@@ -1783,7 +2151,7 @@ class HardwareSettingsDialog(QDialog):
         self.board_combo.setCurrentIndex(max(self.board_combo.findData(self._board_channels), 0))
         form.addWidget(self.board_combo)
         form.addSpacing(12)
-        form.addWidget(QLabel("Data rate"))
+        form.addWidget(QLabel("ADS1299 rate"))
         self.rate_combo = QComboBox()
         for rate, code in SAMPLE_RATES:
             self.rate_combo.addItem(f"{rate} SPS", code)
@@ -2419,14 +2787,20 @@ class HardwareSettingsDialog(QDialog):
         self._update_rate_note()
 
     def _update_rate_note(self) -> None:
+        # The selected rate IS the ADS1299 output data rate; every converter runs its
+        # own inputs at it. With one packet per converter per conversion, each channel
+        # is published once per conversion, so the per-channel rate equals the data
+        # rate and the packet rate is that times the number of converters.
         rate = SAMPLE_RATE_BY_CODE.get(self._rate_code, 250)
         decimation = max(int(self._decimation), 1)
-        packets = rate / decimation
-        per_channel = packets / 2.0 if self._board_channels > 8 else packets
+        per_channel = rate / decimation
+        converters = 2 if self._board_channels > 8 else 1
+        packets = per_channel * converters
         corner = sinc3_corner_hz(rate)
         average_corner = boxcar_corner_hz(rate, decimation)
         parts = [
-            f"per channel: {per_channel:g} Hz",
+            f"ADS1299 {rate:g} SPS",
+            f"per channel {per_channel:g} Hz",
             f"{packets:g} packets/s",
             f"ADC sinc3 -3 dB: {corner:g} Hz",
             f"noise bandwidth: {noise_bandwidth_hz(rate):g} Hz",
@@ -2438,25 +2812,26 @@ class HardwareSettingsDialog(QDialog):
                 f"MCU average /{decimation}: -3 dB at {average_corner:g} Hz, "
                 f"null at {boxcar_null_hz(rate, decimation):g} Hz"
             )
-        parts.append(f"SPI {self._spi_clock_hz / 1e6:g} MHz serves {max_sample_rate_from_spi(self._spi_clock_hz, 2)} SPS")
+        spi_limit = max_sample_rate_from_spi(self._spi_clock_hz, 2)
+        parts.append(f"SPI {self._spi_clock_hz / 1e6:g} MHz serves {spi_limit} SPS")
         if self._link_limit:
-            parts.append(f"serial carries {self._link_limit} packets/s")
+            parts.append(f"link carries {self._link_limit} packets/s")
         # Judged against the limit the window actually reports, not a hardcoded
-        # 921600: assuming the slowest link made a 2 Mbaud port look over budget when
+        # 921600: assuming the slowest link made a 3 Mbaud port look over budget when
         # it was not, which is what pushed the data rate and the decimation around.
         serial_limit = self._link_limit or max_sustained_packet_rate(921600)
-        fits = packets <= serial_limit and rate <= max_sample_rate_from_spi(self._spi_clock_hz, 2)
-        if not fits:
-            reasons = []
-            if packets > serial_limit:
-                reasons.append(f"{packets:g} packets/s exceeds the link's {serial_limit} packets/s")
-            spi_limit = max_sample_rate_from_spi(self._spi_clock_hz, 2)
-            if rate > spi_limit:
-                reasons.append(f"{rate:g} SPS exceeds the bus limit of {spi_limit} SPS")
-            parts.append("OVER BUDGET: " + "; ".join(reasons))
-        self.rate_note.setText("  |  ".join(parts))
+        problems = []
+        if packets > serial_limit:
+            problems.append(f"{packets:g} packets/s exceeds the link's {serial_limit}")
+        if rate > spi_limit:
+            needed = next(
+                (hz for hz, _l in SPI_CLOCK_CHOICES if max_sample_rate_from_spi(hz, 2) >= rate),
+                ADS_SPI_CLOCK_MAX_HZ,
+            )
+            problems.append(f"{rate:g} SPS exceeds the bus limit of {spi_limit} (needs {needed / 1e6:g} MHz)")
+        self.rate_note.setText("  |  ".join(parts + (["OVER BUDGET: " + "; ".join(problems)] if problems else [])))
         self.rate_note.setStyleSheet(
-            "color: #b91c1c; font-size: 11px;" if not fits else "color: #475569; font-size: 11px;"
+            "color: #b45309; font-size: 11px;" if problems else "color: #475569; font-size: 11px;"
         )
 
     def _set_selection(self, checked: bool) -> None:
@@ -3175,6 +3550,7 @@ class LiveRecorderWindow(QMainWindow):
         self.accel_ring = RingBuffer(int(BUFFER_SECONDS * 20.0), 3)
         self._last_aux_counts: Optional[np.ndarray] = None
         self._accel_zero_ticks = 0
+        self._accel_tab_moving = False
         # Slowly tracked mean of the raw signal: the part below ~0.1 Hz that the
         # display filters remove. alpha comes from the sample rate in _rebuild_buffers.
         self._dc_state: Optional[np.ndarray] = None
@@ -3326,12 +3702,21 @@ class LiveRecorderWindow(QMainWindow):
 
         right = QSplitter(Qt.Orientation.Vertical)
         self.spectrum_panel = SpectrumPanel()
-        # The reference channel takes the bottom quarter instead of the
-        # accelerometer: motion is still reported in the dock, while a stimulus
-        # input that is 1000x larger than the EEG channels needs its own axes.
+        # The bottom quarter is one of three views. The reference channel gets a
+        # large stimulus that would flatten an EEG trace, the accelerometer reports
+        # whether the board moved, and the noise table is the measurement mode -
+        # they are alternatives, not neighbours, so they share the space as tabs.
         self.reference_panel = ReferenceChannelPanel()
+        self.accel_panel = AccelerometerPanel()
+        self.noise_panel = NoisePanel()
+        self.bottom_tabs = QTabWidget()
+        self.bottom_tabs.setDocumentMode(True)
+        self.bottom_tabs.addTab(self.reference_panel, "Reference channel")
+        self.bottom_tabs.addTab(self.accel_panel, "Accelerometer")
+        self.bottom_tabs.addTab(self.noise_panel, "Noise")
+        self.bottom_tabs.currentChanged.connect(self._on_bottom_tab_changed)
         right.addWidget(self.spectrum_panel)
-        right.addWidget(self.reference_panel)
+        right.addWidget(self.bottom_tabs)
         right.setSizes([470, 260])
         splitter.addWidget(right)
         splitter.setSizes([560, 520])
@@ -3389,7 +3774,7 @@ class LiveRecorderWindow(QMainWindow):
         baud_row = QHBoxLayout()
         baud_row.addWidget(QLabel("Baud"))
         self.baud_combo = QComboBox()
-        for baud in (115200, 230400, 460800, 921600, 2000000):
+        for baud in (115200, 230400, 460800, 921600, 2000000, 3000000):
             self.baud_combo.addItem(str(baud), baud)
         baud_row.addWidget(self.baud_combo)
         baud_row.addStretch(1)
@@ -4058,7 +4443,7 @@ class LiveRecorderWindow(QMainWindow):
             # An older firmware reports none of this.
             label.setText("")
             return
-        capacity = 512
+        capacity = number("QCAP") or 512
         peak = number("QPEAK")
         write_ms = number("WRITE_MS")
         rate_kb = number("RATE_KB")
@@ -4458,6 +4843,8 @@ class LiveRecorderWindow(QMainWindow):
         self._update_accel_scale_label()
         # Reference channel: rebuild the list, then restore the saved choice.
         self._rebuild_reference_combo()
+        self.noise_panel.set_interval_ms(int(self.view.noise_interval_ms or DEFAULT_NOISE_INTERVAL_MS))
+        self.set_bottom_tab(str(self.view.bottom_tab or "reference"))
         self.reference_panel.set_channel(str(self.view.reference_channel or ""))
         self.reference_panel.set_fft_scale(self.view.reference_fft_scale_uv)
         fft_scale_mv = max(float(self.view.reference_fft_scale_uv) / 1000.0, 0.001)
@@ -4511,6 +4898,8 @@ class LiveRecorderWindow(QMainWindow):
         self.spectrum_panel.log_check.toggled.connect(self._on_view_changed)
         self.spectrum_panel.channel_combo.currentIndexChanged.connect(self._on_view_changed)
         self.spectrum_panel.end_combo.currentIndexChanged.connect(self._on_view_changed)
+        self.spectrum_panel.freq_smoothing_combo.currentIndexChanged.connect(self._on_view_changed)
+        self.noise_panel.interval_combo.currentIndexChanged.connect(self._on_noise_interval_changed)
         self.record_visible_check.toggled.connect(self._on_record_scope_changed)
         self.accel_scale_combo.currentIndexChanged.connect(self._on_accel_settings_changed)
         self.accel_threshold_spin.valueChanged.connect(self._on_accel_settings_changed)
@@ -4614,10 +5003,16 @@ class LiveRecorderWindow(QMainWindow):
         self.view.fft_points = int(self.spectrum_panel.points_combo.currentData() or 1024)
         self.view.fft_window = self.spectrum_panel.window_combo.currentText()
         self.view.fft_smoothing = float(self.spectrum_panel.smoothing_combo.currentData() or 0.0)
-        self.view.fft_scale_mode = float(self.spectrum_panel.scale_combo.currentData() or 0.0)
-        self.view.fft_log_scale = self.spectrum_panel.log_check.isChecked()
+        if not self.spectrum_panel.noise_mode():
+            # In noise mode the axis is locked, so the widgets no longer hold the
+            # user's own preference - leave the stored value alone.
+            self.view.fft_scale_mode = float(self.spectrum_panel.scale_combo.currentData() or 0.0)
+            self.view.fft_log_scale = self.spectrum_panel.log_check.isChecked()
         self.view.fft_channel = self.spectrum_panel.channel_mode()
         self.view.fft_end_hz = self.spectrum_panel.end_frequency()
+        self.view.fft_freq_smoothing_bins = self.spectrum_panel.freq_smoothing_bins()
+        self.view.bottom_tab = self.bottom_tab_key()
+        self.view.noise_interval_ms = self.noise_panel.interval_ms()
         self.view.record_visible_only = self.record_visible_check.isChecked()
         self.view.accel_full_scale_g = float(self.accel_scale_combo.currentData() or 2.0)
         self.view.accel_motion_threshold_g = float(self.accel_threshold_spin.value())
@@ -5177,37 +5572,34 @@ class LiveRecorderWindow(QMainWindow):
     def _build_accel_group(self) -> QWidget:
         group = QGroupBox("Accelerometer")
         layout = QGridLayout(group)
-        # The accelerometer moved out of the main view to leave room for the
-        # reference channel; it lives here as a compact widget.
-        self.accel_panel = AccelerometerPanel()
-        self.accel_panel.setMinimumHeight(110)
-        layout.addWidget(self.accel_panel, 0, 0, 1, 2)
-        layout.addWidget(QLabel("Full scale"), 1, 0)
+        # The panel itself now lives in the bottom-right tabs; this group keeps the
+        # controls that define what "moved" means.
+        layout.addWidget(QLabel("Full scale"), 0, 0)
         self.accel_scale_combo = QComboBox()
         for value in (0.5, 1.0, 2.0, 4.0):
             self.accel_scale_combo.addItem(f"+/- {value:g} g", value)
-        layout.addWidget(self.accel_scale_combo, 1, 1)
-        layout.addWidget(QLabel("Motion alarm"), 2, 0)
+        layout.addWidget(self.accel_scale_combo, 0, 1)
+        layout.addWidget(QLabel("Motion alarm"), 1, 0)
         self.accel_threshold_spin = QDoubleSpinBox()
         self.accel_threshold_spin.setRange(0.005, 2.0)
         self.accel_threshold_spin.setSingleStep(0.01)
         self.accel_threshold_spin.setDecimals(3)
         self.accel_threshold_spin.setSuffix(" g")
-        layout.addWidget(self.accel_threshold_spin, 2, 1)
-        layout.addWidget(QLabel("Baseline"), 3, 0)
+        layout.addWidget(self.accel_threshold_spin, 1, 1)
+        layout.addWidget(QLabel("Baseline"), 2, 0)
         self.accel_baseline_spin = QDoubleSpinBox()
         self.accel_baseline_spin.setRange(0.3, 10.0)
         self.accel_baseline_spin.setSingleStep(0.5)
         self.accel_baseline_spin.setDecimals(1)
         self.accel_baseline_spin.setSuffix(" s")
-        layout.addWidget(self.accel_baseline_spin, 3, 1)
+        layout.addWidget(self.accel_baseline_spin, 2, 1)
         self.accel_calibrate_button = QPushButton("Calibrate from rest")
         self.accel_calibrate_button.setToolTip("With the board lying still, set the scale so the current reading equals 1 g")
         self.accel_calibrate_button.clicked.connect(self._calibrate_accelerometer)
-        layout.addWidget(self.accel_calibrate_button, 4, 0, 1, 2)
+        layout.addWidget(self.accel_calibrate_button, 3, 0, 1, 2)
         self.accel_scale_label = QLabel("")
         self.accel_scale_label.setStyleSheet("color: #64748b; font-size: 11px;")
-        layout.addWidget(self.accel_scale_label, 5, 0, 1, 2)
+        layout.addWidget(self.accel_scale_label, 4, 0, 1, 2)
         return group
 
     def _on_accel_settings_changed(self, *_args) -> None:
@@ -5236,6 +5628,75 @@ class LiveRecorderWindow(QMainWindow):
 
     def _update_accel_scale_label(self) -> None:
         self.accel_scale_label.setText(f"{self.view.accel_counts_per_g:,.0f} counts per g")
+
+    # -- bottom-right view ---------------------------------------------------
+
+    BOTTOM_TABS = ("reference", "accelerometer", "noise")
+
+    def bottom_tab_key(self) -> str:
+        index = int(self.bottom_tabs.currentIndex())
+        if 0 <= index < len(self.BOTTOM_TABS):
+            return self.BOTTOM_TABS[index]
+        return self.BOTTOM_TABS[0]
+
+    def set_bottom_tab(self, key: str) -> None:
+        """Select a tab without writing settings (this runs while they are loading)."""
+        key = str(key or "").strip().lower()
+        index = self.BOTTOM_TABS.index(key) if key in self.BOTTOM_TABS else 0
+        blocker = QSignalBlocker(self.bottom_tabs)
+        self.bottom_tabs.setCurrentIndex(index)
+        del blocker
+        self.spectrum_panel.set_noise_mode(self.BOTTOM_TABS[index] == "noise")
+
+    def _on_bottom_tab_changed(self, *_args) -> None:
+        key = self.bottom_tab_key()
+        # The noise tab exists to read the spectrum floor, so it pins the FFT
+        # axis; every other tab gives the axis back to the user.
+        self.spectrum_panel.set_noise_mode(key == "noise")
+        if getattr(self, "view", None) is not None:
+            self._save_settings()
+        if key == "noise":
+            self._render_noise_panel(force=True)
+
+    def _on_noise_interval_changed(self, *_args) -> None:
+        self._save_settings()
+        self._render_noise_panel(force=True)
+
+    def _update_accel_tab_label(self) -> None:
+        """Flag motion on the tab itself, so it is visible from the other tabs."""
+        moving = bool(self.accel_panel.is_moving)
+        if moving == self._accel_tab_moving:
+            return
+        self._accel_tab_moving = moving
+        index = self.BOTTOM_TABS.index("accelerometer")
+        self.bottom_tabs.setTabText(index, "Accelerometer  (moving)" if moving else "Accelerometer")
+
+    def _render_noise_panel(self, force: bool = False) -> None:
+        if self.sample_rate <= 0:
+            return
+        visible = list(self.view.visible_channels)
+        if len(visible) < self.channel_count:
+            visible.extend([True] * (self.channel_count - len(visible)))
+        mask = self._real_channel_mask()
+        reference_index = self.reference_channel_index()
+        channels = [
+            index
+            for index in range(self.channel_count)
+            if index < mask.size and mask[index] and visible[index] and index != reference_index
+        ]
+        window = int(round(NOISE_WINDOW_SECONDS * self.sample_rate))
+        # Raw, not display: the display chain is high/low-passed (0.1-150 Hz by
+        # default), so measuring the 0.1-250 Hz band on it would report a filter's
+        # stopband as an absence of noise. The bands are the filter.
+        block = self.raw_ring.last(window)
+        self.noise_panel.update_noise(
+            block,
+            self.sample_rate,
+            channels,
+            [channel_label(index) for index in range(self.channel_count)],
+            force=force,
+        )
+
     def _render_reference_panel(self) -> None:
         index = self.reference_channel_index()
         self.reference_panel.set_fft_scale(self.view.reference_fft_scale_uv)
@@ -5363,6 +5824,7 @@ class LiveRecorderWindow(QMainWindow):
             return
         self._rebuild_buffers()
         self.accel_panel.reset()
+        self.noise_panel.reset()
         self._set_streaming(True)
         self._send(b"b")
 
@@ -5449,78 +5911,38 @@ class LiveRecorderWindow(QMainWindow):
         return f"the {baud / 1000:.0f} kbit/s USB link"
 
     def _ensure_link_budget(self, baud: int) -> bool:
-        """Make the saved rate fit both links, adjusting it if it does not.
+        """Warn when the chosen rate and decimation do not fit - never change them.
 
-        Raising SCLK is tried first because it costs nothing, then a larger
-        decimation (which keeps the sinc3 corner where the operator wanted it),
-        and only then a lower data rate.
+        This used to silently raise the decimation and lower the data rate to fit the
+        link, which made an operator's choice impossible to keep: asking for a rate
+        the app considered too high quietly produced a different configuration. The
+        settings are now the operator's; a mismatch is reported and sent anyway, and
+        what actually arrives is visible in the packet counters. The firmware still
+        refuses a configuration the *bus* cannot carry, so an unachievable rate fails
+        loudly instead of streaming garbage.
         """
 
         data_rate = self.hardware.data_rate_hz
+        packets = self.hardware.output_packet_rate_hz
         fits, reason = rate_fits_link(
-            data_rate, self.hardware.output_packet_rate_hz, baud, self.hardware.spi_clock_hz, 2
+            data_rate, packets, baud, self.hardware.spi_clock_hz, 2
         )
         if fits:
             self._rate_downgrade_note = ""
             return True
 
-        notes: list[str] = []
         spi_limit = max_sample_rate_from_spi(self.hardware.spi_clock_hz, 2)
+        hint = ""
         if data_rate > spi_limit:
-            for hz, _label in SPI_CLOCK_CHOICES:
-                if max_sample_rate_from_spi(hz, 2) >= data_rate:
-                    if hz != self.hardware.spi_clock_hz:
-                        self.hardware.spi_clock_hz = hz
-                        notes.append(f"SPI clock raised to {hz / 1e6:g} MHz so {data_rate:g} SPS fits the bus")
-                    break
-            else:
-                if self.hardware.spi_clock_hz != ADS_SPI_CLOCK_MAX_HZ:
-                    self.hardware.spi_clock_hz = ADS_SPI_CLOCK_MAX_HZ
-                    notes.append(f"SPI clock raised to {ADS_SPI_CLOCK_MAX_HZ / 1e6:g} MHz (the maximum)")
-
-        serial_limit = max_sustained_packet_rate(baud)
-        if data_rate / max(self.hardware.decimation, 1) > serial_limit:
-            for factor in DECIMATION_CHOICES:
-                if data_rate / factor <= serial_limit:
-                    if factor != self.hardware.decimation:
-                        notes.append(
-                            f"decimation raised to /{factor} so {data_rate / factor:g} packets/s fits "
-                            f"{self._link_description(baud)}"
-                        )
-                        self.hardware.decimation = factor
-                    break
-
-        spi_limit = max_sample_rate_from_spi(self.hardware.spi_clock_hz, 2)
-        if data_rate > spi_limit:
-            # SAMPLE_RATES is ordered fastest-first, so the first entry that fits
-            # is the fastest usable rate.
-            fallback = None
-            for rate, code in SAMPLE_RATES:
-                if rate <= spi_limit and rate / max(self.hardware.decimation, 1) <= serial_limit:
-                    fallback = (rate, code)
-                    break
-            if fallback is not None:
-                notes.append(f"data rate lowered to {fallback[0]:g} SPS")
-                self.hardware.sample_rate_code = fallback[1]
-
-        fits, reason = rate_fits_link(
-            self.hardware.data_rate_hz,
-            self.hardware.output_packet_rate_hz,
-            baud,
-            self.hardware.spi_clock_hz,
-            2,
-        )
-        if not fits:
-            message = f"The board configuration does not fit the link: {reason}."
-            self._log("in", f"[settings] {message}", "error")
-            self._set_apply_summary(message, error=True)
-            return False
-
-        message = "; ".join(notes) + "." if notes else ""
-        self._rate_downgrade_note = message
-        if message:
-            self._log("in", f"[settings] {message}", "info")
-            self._set_apply_summary(message)
+            needed = next(
+                (hz for hz, _label in SPI_CLOCK_CHOICES if max_sample_rate_from_spi(hz, 2) >= data_rate),
+                ADS_SPI_CLOCK_MAX_HZ,
+            )
+            hint = f" Raise the SPI clock to at least {needed / 1e6:g} MHz."
+        note = f"Over budget: {reason}. Sent anyway - watch the packet counters.{hint}"
+        self._rate_downgrade_note = note
+        self._log("in", f"[settings] {note}", "warning")
+        self._set_apply_summary(note)
         self._save_settings()
         self._update_hardware_labels()
         if abs(self.sample_rate - self.hardware.sample_rate_hz) > 1e-9:
@@ -6602,9 +7024,13 @@ class LiveRecorderWindow(QMainWindow):
 
         self._render_reference_panel()
 
+        if self.bottom_tab_key() == "noise":
+            self._render_noise_panel()
+
         latest_accel = self.accel_ring.last(1)
         if latest_accel is not None and self.streaming:
             self.accel_panel.set_reading(latest_accel[-1])
+            self._update_accel_tab_label()
 
         if self._ui_ticks % 4 == 0:
             self._flash_phase = not self._flash_phase
@@ -6655,7 +7081,7 @@ class LiveRecorderWindow(QMainWindow):
         corrupt = self._as_int(self.board_dx.get("corrupt"))
         missed = self._as_int(self.board_dx.get("miss"))
         spi_max = self._as_int(self.board_dx.get("spi_max_us"))
-        period_us = 1e6 / max(self.hardware.packet_rate_hz, 1.0)
+        period_us = 1e6 / max(self.hardware.data_rate_hz, 1.0)
         if board_rate > 0 and abs(board_rate - self.sample_rate) > 0.05 * self.sample_rate:
             late = self._as_int(self.board_dx.get("late"))
             gap_max = self._as_int(self.board_dx.get("gap_max_us"))
@@ -6723,6 +7149,8 @@ class LiveRecorderWindow(QMainWindow):
             parts.append(link)
         if self.recording is not None:
             parts.append("recording")
+        if self.streaming and self.accel_panel.is_moving:
+            parts.append("board moving")
         self.statusBar().showMessage(" | ".join(parts))
 
     def _board_health_text(self) -> str:
@@ -6737,8 +7165,13 @@ class LiveRecorderWindow(QMainWindow):
         late = self._as_int(dx.get("late"))
         corrupt = self._as_int(dx.get("corrupt"))
         spi_max = self._as_int(dx.get("spi_max_us"))
+        spi_lock_max = self._as_int(dx.get("spi_lock_max_us"))
         gap_max = self._as_int(dx.get("gap_max_us"))
-        period_us = 1e6 / max(self.hardware.packet_rate_hz, 1.0)
+        # The budget for one SPI read is the CONVERSION period, not the packet period:
+        # one read serves one conversion, and a conversion yields two packets. Using
+        # the packet rate halved the apparent budget and reported a healthy read as
+        # over-running.
+        period_us = 1e6 / max(self.hardware.data_rate_hz, 1.0)
         if missed:
             parts.append(f"missed {missed}")
         if late:
@@ -6748,7 +7181,13 @@ class LiveRecorderWindow(QMainWindow):
         if corrupt:
             parts.append(f"corrupt {corrupt}")
         if spi_max and period_us and spi_max > 0.8 * period_us:
-            parts.append(f"SPI {spi_max}/{period_us:.0f} us (too slow)")
+            # Say which half of the read was expensive: waiting for the bus and using
+            # it have different causes and different fixes.
+            if spi_lock_max and spi_lock_max > 0.5 * spi_max:
+                detail = f"waiting {spi_lock_max} us for the bus"
+            else:
+                detail = "transfer time"
+            parts.append(f"SPI {spi_max}/{period_us:.0f} us too slow ({detail})")
         core = dx.get("core")
         prio = dx.get("prio")
         if core is not None and prio is not None:
@@ -6918,6 +7357,15 @@ class LiveRecorderWindow(QMainWindow):
         if generator_output.mode != OUTPUT_OFF:
             metadata["Generator Output"] = generator_output.describe()
         self.recording = OpenBCIRecording(path, labels, channel_numbers, self.sample_rate, metadata)
+        # Say explicitly what the rate in the header means, so a file is
+        # self-describing: it is the ADS1299 output data rate and therefore the rate
+        # every channel is sampled at, not a figure divided by the number of
+        # converters.
+        self.recording.metadata.setdefault("ADS1299 Output Data Rate", f"{self.hardware.data_rate_hz:g} SPS")
+        self.recording.metadata.setdefault(
+            "Converters", "2 (one packet each per conversion)" if self.hardware.board_channels > 8 else "1"
+        )
+        self.recording.metadata.setdefault("Decimation", f"/{int(self.hardware.decimation)}")
         try:
             self.recording.start()
         except OSError as exc:
@@ -7160,7 +7608,7 @@ class LiveRecorderWindow(QMainWindow):
             lines.append(f"Name {health.get('name', '?')}, TX power {health.get('txdbm', '?')} dBm")
         if self.board_dx:
             dx = self.board_dx
-            period_us = 1e6 / max(self.hardware.packet_rate_hz, 1.0)
+            period_us = 1e6 / max(self.hardware.data_rate_hz, 1.0)
             lines.append("")
             lines.append(
                 f"Acquisition: {dx.get('ch_rate', '?')} Hz per channel, "
@@ -7168,7 +7616,8 @@ class LiveRecorderWindow(QMainWindow):
             )
             lines.append(
                 f"  missed conversions {dx.get('miss', '?')}, corrupt frames {dx.get('corrupt', '?')}, "
-                f"worst SPI read {dx.get('spi_max_us', '?')} us of {period_us:.0f} us"
+                f"worst SPI read {dx.get('spi_max_us', '?')} us of {period_us:.0f} us "
+                f"(of which {dx.get('spi_lock_max_us', '?')} us waiting for the bus)"
             )
             lines.append(
                 f"  USB headroom {dx.get('usb_free', '?')} bytes, radio buffer {dx.get('bt_buf', '?')} bytes"

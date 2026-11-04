@@ -137,7 +137,7 @@ def clamp_decimation(value: object) -> int:
 DEFAULT_HIGH_PASS_HZ = 0.1
 DEFAULT_LOW_PASS_HZ = 150.0
 # Bumped whenever a stored settings file needs to adopt a new default.
-SETTINGS_VERSION = 5
+SETTINGS_VERSION = 6
 
 # Reference ("SRB") routing, as the silicon actually implements it.
 #
@@ -201,31 +201,17 @@ def gain_scalar_from_ordinal(ordinal: int) -> int:
     return GAIN_SCALARS[-1]
 
 
-# USB CDC-ACM is not a physical UART: the "baud rate" is nominal and the throughput
-# is set by the endpoint and host driver. These describe the achievable floor.
-USB_CDC_PACKETS_PER_SECOND = 12000
-USB_CDC_BAUD_THRESHOLD = 1_000_000
-
-
 def max_sustained_packet_rate(baud: int) -> int:
     """Packets per second the serial link can carry with 10% headroom.
 
-    Over USB this is CDC-ACM, not a UART: the ESP32's USB serial does not run at
-    "baud" in any physical sense, and the figure is limited by the endpoint and the
-    host driver rather than by a bit clock. Deriving it from the nominal baud rate
-    made the app believe 2 Mbaud carried only ~5.4 k packets/s and force extra
-    decimation for rates that the link handles comfortably. A real CDC link carries
-    several hundred kB/s, so the baud-derived figure is kept only as a floor for
-    genuinely slow links.
+    This board reaches the host through a UART bridge (CP2102N), not native USB, so
+    the baud rate is real wire time: 8N1 is 10 bits per byte, and 33 bytes per packet.
+    At 3 Mbaud that is 300 kB/s, or about 8.2 k packets/s once 10% is kept back.
     """
 
     baud = max(int(baud), 9600)
     usable_bits = (baud // 10) * 9
-    derived = usable_bits // (PACKET_LENGTH * 10)
-    if baud >= USB_CDC_BAUD_THRESHOLD:
-        # CDC: the byte budget is a packet-count question, not a bit-rate one.
-        derived = max(derived, USB_CDC_PACKETS_PER_SECOND)
-    return max(derived, 1)
+    return max(usable_bits // (PACKET_LENGTH * 10), 1)
 
 
 def spi_frame_microseconds(spi_clock_hz: int = ADS_SPI_CLOCK_HZ, device_count: int = 2) -> float:
@@ -260,22 +246,28 @@ def supported_packet_rates(baud: int) -> list[tuple[int, int]]:
 
 
 def sample_rate_for(code: int, board_channels: int, decimation: int = 1) -> float:
-    """Per-channel sample rate after the firmware's block averaging.
+    """Per-channel sample rate of one ADS1299, after the firmware's block averaging.
 
-    The converters produce ``SAMPLE_RATE`` samples/s; the firmware averages
-    ``decimation`` of them into one packet, and in Cyton+Daisy mode one packet
-    carries one of the two chips, so the rate a single channel ends up with is
-    ``rate / (decimation * 2)``.
+    This is the rate the converters actually run at divided by the averaging factor.
+    It deliberately does **not** depend on the board profile: every ADS1299 samples
+    its own inputs at the selected data rate, and the firmware publishes one packet
+    per converter per conversion, so each channel is published once per conversion
+    whether one converter or two are fitted.
     """
 
-    rate = float(SAMPLE_RATE_BY_CODE.get(int(code), 250)) / max(int(decimation), 1)
-    return rate / 2.0 if int(board_channels) > 8 else rate
-
-
-def output_packet_rate(code: int, decimation: int = 1) -> float:
-    """Packets per second the firmware publishes for one data-rate code."""
-
+    del board_channels  # kept for call-site compatibility; the rate does not depend on it
     return float(SAMPLE_RATE_BY_CODE.get(int(code), 250)) / max(int(decimation), 1)
+
+
+def output_packet_rate(code: int, decimation: int = 1, converters: int = 2) -> float:
+    """Packets per second the firmware publishes for one data-rate code.
+
+    One packet per converter per conversion (Cyton+Daisy), or one per conversion on
+    a single-converter board.
+    """
+
+    per_converter = float(SAMPLE_RATE_BY_CODE.get(int(code), 250)) / max(int(decimation), 1)
+    return per_converter * max(int(converters), 1)
 
 
 def rate_fits_link(
@@ -1203,7 +1195,8 @@ class HardwareSettings:
 
     @property
     def output_packet_rate_hz(self) -> float:
-        return output_packet_rate(self.sample_rate_code, self.decimation)
+        converters = 2 if int(self.board_channels) > 8 else 1
+        return output_packet_rate(self.sample_rate_code, self.decimation, converters)
 
     @property
     def sinc_corner_hz(self) -> float:
@@ -1644,6 +1637,11 @@ class ViewSettings:
     # own scale, is excluded from the main views and forced to PGA x1.
     reference_channel: str = ""
     reference_fft_scale_uv: float = 1000.0
+    # Which of the three lower-right views is in front (reference / accelerometer /
+    # noise) and how often the noise table is refreshed.
+    bottom_tab: str = "reference"
+    noise_interval_ms: int = 500
+    fft_freq_smoothing_bins: int = 1
     notch_50: bool = False
     notch_100: bool = False
     notch_q: float = 30.0
@@ -1689,7 +1687,7 @@ class AppSettings:
     hardware: HardwareSettings = field(default_factory=HardwareSettings)
     view: ViewSettings = field(default_factory=ViewSettings)
     last_port: str = ""
-    baud_rate: int = 921600
+    baud_rate: int = 3_000_000
     session_name: str = "session"
     output_dir: str = "recordings"
     auto_connect: bool = True
@@ -1734,7 +1732,7 @@ class AppSettings:
             hardware=HardwareSettings.from_dict(hardware_payload),
             view=ViewSettings.from_dict(view_payload),
             last_port=str(connection.get("last_port", "")),
-            baud_rate=int(connection.get("baud_rate", 115200)),
+            baud_rate=int(connection.get("baud_rate", 3_000_000)),
             session_name=str(recording.get("session_name", "session")),
             output_dir=str(recording.get("output_dir", "recordings")),
             auto_connect=bool(connection.get("auto_connect", True)),
@@ -1757,7 +1755,7 @@ class AppSettings:
             # Version 4 changed the boot defaults: 921600 baud, a logarithmic
             # FFT axis on auto scale, recording only the ticked channels, and
             # 500 SPS (250 Hz per channel) at gain x24 with a normal input.
-            self.baud_rate = 921600
+            self.baud_rate = 3_000_000
             self.view.fft_log_scale = True
             self.view.fft_scale_mode = 0.0
             self.view.record_visible_only = True
@@ -1776,6 +1774,13 @@ class AppSettings:
             ]
             self.hardware.spi_clock_hz = ADS_SPI_CLOCK_HZ
             self.hardware.decimation = 1
+        if self.version < 6:
+            # Version 6 moved the USB link to 3 Mbaud (the firmware now boots at
+            # that rate) and changed the sample-rate figure to mean the ADS1299
+            # output data rate itself, not the per-channel rate after the
+            # Cyton+Daisy interleave. Both are adopted so an existing settings file
+            # cannot leave the app talking to a board at the wrong baud.
+            self.baud_rate = 3_000_000
         self.hardware.sync_reference()
         self.version = SETTINGS_VERSION
 

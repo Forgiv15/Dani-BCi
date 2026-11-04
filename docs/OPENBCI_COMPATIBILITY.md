@@ -320,7 +320,7 @@ selector or an existing command.
 
 | Command | Meaning |
 |---------|---------|
-| `:s` | Status line: `[SD] EVENT PRESENT RECORDING FILE NAME CHANNELS RATE TOTAL_MB FREE_MB FREE_BYTES EST_SEC SAMPLES DROPPED BYTES DONE=1` |
+| `:s` | Status line: `[SD] EVENT PRESENT RECORDING FILE NAME CHANNELS RATE TOTAL_MB FREE_MB FREE_BYTES EST_SEC SAMPLES DROPPED BYTES QUEUED QPEAK QCAP QBUF BUFKB WRITE_MS RATE_KB SPIKHZ HEAP HEAPBLK DONE=1` |
 | `:b` | Start recording to the card. Starts the data stream if it is not already running |
 | `:e` | Stop and close the file |
 | `:p` | Toggle (what the GPIO35 button does) |
@@ -335,10 +335,16 @@ card's free space, and the FAT walk behind it is slow enough to disturb a runnin
 measurement. Only `status` and `saved` measure it (`sdCapacityCached()`); the
 automatic action replies reuse the cached value.
 
-`QUEUED` / `QPEAK` / `QBUF` / `BUFKB` expose the RAM write buffering, and
+`QUEUED` / `QPEAK` / `QCAP` / `QBUF` / `BUFKB` expose the RAM write buffering, and
 `WRITE_MS` / `RATE_KB` / `SPIKHZ` the card's own performance: a `QPEAK` close to
-512 together with a non-zero `DROPPED` means the card cannot keep up with the
-sample rate.
+`QCAP` together with a non-zero `DROPPED` means the card cannot keep up with the
+sample rate. `QCAP` is chosen at recording start from the free heap and the largest
+free block (512, 384, 256, 192, 128, 96, 64 or 32 entries of 68 bytes), so it
+differs between a recording made over USB and one made over Bluetooth.
+`HEAP` / `HEAPBLK` are the free heap and the largest contiguous block, which is what
+actually decides whether the queue can be allocated.
+`FREE_BYTES` is 64-bit: a 16 GB card does not fit in 32 bits, and the old clamp to
+`0xFFFFFFFF` read like an error.
 
 `#BT ... peak= rate= need=` reports the radio side: `need` is what the live link
 must carry at the current data rate (33 bytes per packet), `rate` what it is
@@ -660,6 +666,13 @@ In 16-channel mode the 8 channel slots alternate: odd sample numbers carry the
 board (ADS1) channels, even sample numbers carry the daisy (ADS2) channels. This
 matches the official Cyton+Daisy wire format, so the stock GUI reconstructs both
 halves without any parser changes.
+
+**Cost of that compatibility:** 33 bytes carry 24 bytes of slot data, and two
+packets are emitted per conversion, so a conversion costs 66 bytes on the wire for
+36 bytes of real signal. Over the 3 Mbaud cable that framing is what caps the
+achievable rate at ~4 500 SPS per converter (4 000 in practice). The arithmetic,
+and what a packed format or a different link would buy, is in
+[PLATFORM_AND_LINK_ANALYSIS.md](PLATFORM_AND_LINK_ANALYSIS.md).
 
 ## Practical setup checklist
 
